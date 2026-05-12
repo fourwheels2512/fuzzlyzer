@@ -1,0 +1,62 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
+*.egg-info/
+*.egg
+dist/
+build/
+wheels/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment / secrets
+.env
+.env.*
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Run artifacts (results are user-specific; do not commit by default)
+pramana_test_results.json
+
+# Internal launch / marketing artifacts (not for public repo)
+.launch/
+
+# Nested vendor checkout (its own git repo)
+superpowers/
+
+# topofuzz local artifacts
+runs/
+.cache/
+*.pem
+!keys/*.pub.pem
+
+# uv lock state lives at workspace root only; per-package locks not used
+packages/*/uv.lock
+
