@@ -1,6 +1,14 @@
-"""fuzzeval — shared eval infrastructure for topofuzz (and siblings)."""
+"""fuzzeval — shared eval infrastructure for topofuzz (and siblings).
+
+Public API. Note: :func:`percentile_cluster_bootstrap` is a §17a contract
+pin that lands in step 8; calling it before then raises
+``NotImplementedError``. Importing it (and the rest of the package) at
+module load is intentionally cheap so callers can wire the surface today
+and rely on the implementation as it lands.
+"""
 
 from fuzzeval.cache import JudgeCache, LLMCache
+from fuzzeval.canonical import canonical_hash
 from fuzzeval.costest import CostEstimate, CostLine, estimate
 from fuzzeval.judge import BinaryScore, ContinuousScore, Judge, JudgeResult
 from fuzzeval.stats import (
@@ -23,6 +31,7 @@ __all__ = [
     "JudgeResult",
     "LLMCache",
     "__version__",
+    "canonical_hash",
     "estimate",
     "percentile_bootstrap",
     "percentile_cluster_bootstrap",

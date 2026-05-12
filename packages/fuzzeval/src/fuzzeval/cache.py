@@ -7,43 +7,74 @@ forward-compat placeholder per §16; v0.5 always uses "local".
 Diskcache is imported lazily so `import fuzzeval.cache` works on a
 verify-only install. Construction of LLMCache/JudgeCache raises ImportError
 with the install hint if the [cache] extra is missing.
+
+**Eviction policy.** Both caches accept ``size_limit_bytes`` (default
+``DEFAULT_SIZE_LIMIT_BYTES`` = 4 GiB). Diskcache uses ``least-recently-
+stored`` eviction once the limit is crossed; entries written earlier in
+a long run can disappear without warning. Step-5 callers driving large
+sweeps should size this deliberately and surface the limit in the run
+report so users understand a re-run may be a cache miss.
 """
 
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import rfc8785
-
+from fuzzeval.canonical import canonical_hash
 from fuzzeval.judge import BinaryScore, ContinuousScore, JudgeResult
 
 if TYPE_CHECKING:
     from diskcache import Cache as _Cache
 
 
+# §7 cache-key producer contract — pin one place so step-5+ runners
+# cannot drift. Every field consumed below is sourced as follows:
+#
+#   ir_canonical_hash       ← Topology.canonical_hash()
+#   node_id                 ← Node.id (str)
+#   llm_config_hash         ← LLMConfig.canonical_hash()
+#   prompt_hash             ← canonical_hash(<rendered_prompt_str>)
+#                              — exact bytes the runner sent to the LLM,
+#                                AFTER variable substitution. attempt_id
+#                                is intentionally OUT (retries reuse).
+#   model_served_version    ← response.model from the LiteLLM response
+#                              (NOT request.model — Anthropic/LiteLLM
+#                              aliases route requests but the served
+#                              model id is what callers should key on).
+#   tenant_id               ← LLMCache(tenant_id="local") for v0.5.
+#
+# `attempt_id` is omitted so retries do not re-bill. See BLUEPRINT §7.
+#
+# Routing through fuzzeval.canonical.canonical_hash keeps every hash in
+# the chain (Topology, LLMConfig, _canonical_key) on the same JCS+SHA-256
+# recipe. A divergence here would silently re-bucket cache identity and
+# corrupt the §7 invariant — caught in test_canonical_chain_consistency.
+
+
 def _canonical_key(identity: dict, tenant_id: str) -> str:
-    """Stable hash of (tenant_id, identity) using RFC 8785 JCS canonicalization.
+    """Stable hash of (tenant_id, identity) for cache keying.
 
-    JCS (RFC 8785) is required per BLUEPRINT_v5plus.md §16 forward-compat. Using
-    `json.dumps(sort_keys=True)` here would silently diverge on float / unicode
-    edge cases, causing cache misses between platforms that should hit.
+    Wraps :func:`fuzzeval.canonical.canonical_hash` so the JCS recipe
+    matches :meth:`topofuzz.ir.Topology.canonical_hash` and
+    :meth:`topofuzz.ir.LLMConfig.canonical_hash`.
 
-    `identity` must hold only JSON-serializable values (str/int/float/bool/None,
-    list, dict). Pass non-serializable values (bytes, sets, numpy scalars) at
-    your peril — caller error is surfaced with a clear TypeError.
+    `identity` must hold only JSON-serializable values
+    (str/int/float/bool/None, list, dict). Non-serializable values
+    (bytes, sets, numpy scalars) surface as a clear TypeError from the
+    shared helper.
     """
-    try:
-        blob = rfc8785.dumps({"tenant_id": tenant_id, "identity": identity})
-    except (TypeError, ValueError) as e:
-        raise TypeError(
-            f"Cache identity must be JSON-serializable; got: {e}"
-        ) from e
-    return hashlib.sha256(blob).hexdigest()
+    return canonical_hash({"tenant_id": tenant_id, "identity": identity})
 
 
-def _open(path: Path) -> _Cache:
+# Default eviction-cap. 4 GiB is generous enough that a typical
+# `lending_4role` × 50-eval sweep (~14 variants × 50 = 700 LLM calls,
+# ≤10 KB each ≈ 7 MB) never evicts; user-supplied massive sweeps should
+# override via the constructor's ``size_limit_bytes`` arg.
+DEFAULT_SIZE_LIMIT_BYTES = 4 * 1024 * 1024 * 1024
+
+
+def _open(path: Path, *, size_limit_bytes: int) -> _Cache:
     try:
         from diskcache import Cache
     except ImportError as e:
@@ -51,8 +82,12 @@ def _open(path: Path) -> _Cache:
             "fuzzeval.cache requires the [cache] extra: "
             "`pip install fuzzeval[cache]`"
         ) from e
+    if size_limit_bytes < 1:
+        raise ValueError(
+            f"size_limit_bytes must be a positive int; got {size_limit_bytes!r}"
+        )
     path.mkdir(parents=True, exist_ok=True)
-    return Cache(str(path))
+    return Cache(str(path), size_limit=size_limit_bytes)
 
 
 class LLMCache:
@@ -70,9 +105,15 @@ class LLMCache:
     responsibility and v1.0 will tighten this in the multi-tenant path.
     """
 
-    def __init__(self, root: Path, tenant_id: str = "local") -> None:
+    def __init__(
+        self,
+        root: Path,
+        tenant_id: str = "local",
+        *,
+        size_limit_bytes: int = DEFAULT_SIZE_LIMIT_BYTES,
+    ) -> None:
         self._tenant_id = tenant_id
-        self._cache = _open(Path(root) / "llm")
+        self._cache = _open(Path(root) / "llm", size_limit_bytes=size_limit_bytes)
 
     def get(self, identity: dict) -> bytes | None:
         v = self._cache.get(_canonical_key(identity, self._tenant_id))
@@ -104,9 +145,15 @@ class JudgeCache:
     Separate from LLMCache so rubric changes don't invalidate agent rollouts.
     """
 
-    def __init__(self, root: Path, tenant_id: str = "local") -> None:
+    def __init__(
+        self,
+        root: Path,
+        tenant_id: str = "local",
+        *,
+        size_limit_bytes: int = DEFAULT_SIZE_LIMIT_BYTES,
+    ) -> None:
         self._tenant_id = tenant_id
-        self._cache = _open(Path(root) / "judge")
+        self._cache = _open(Path(root) / "judge", size_limit_bytes=size_limit_bytes)
 
     def get(self, identity: dict) -> JudgeResult | None:
         v = self._cache.get(_canonical_key(identity, self._tenant_id))

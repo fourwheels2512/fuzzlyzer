@@ -91,6 +91,103 @@ class TestDefaults:
         assert t.tds_version == "0.5.0"
 
 
+class TestLLMConfigCanonicalHash:
+    def test_is_deterministic_64char_hex(self):
+        a = LLMConfig(model="anthropic/claude-opus-4-7", temperature=0.0, seed=1)
+        b = LLMConfig(model="anthropic/claude-opus-4-7", temperature=0.0, seed=1)
+        h = a.canonical_hash()
+        assert h == b.canonical_hash()
+        assert len(h) == 64
+        int(h, 16)  # raises ValueError if not hex
+
+    def test_changes_on_model_change(self):
+        a = LLMConfig(model="m1", temperature=0.0)
+        b = LLMConfig(model="m2", temperature=0.0)
+        assert a.canonical_hash() != b.canonical_hash()
+
+    def test_changes_on_temperature_change(self):
+        a = LLMConfig(model="m", temperature=0.0)
+        b = LLMConfig(model="m", temperature=0.3)
+        assert a.canonical_hash() != b.canonical_hash()
+
+    def test_changes_on_seed_change(self):
+        a = LLMConfig(model="m", seed=1)
+        b = LLMConfig(model="m", seed=2)
+        assert a.canonical_hash() != b.canonical_hash()
+
+    def test_negative_zero_hashes_identically_to_zero(self):
+        # rfc8785 normalises -0.0 → 0; this must hold here too so a
+        # config-layer subtraction producing -0.0 doesn't tank cache hits.
+        pos = LLMConfig(model="m", temperature=0.0)
+        neg = LLMConfig(model="m", temperature=-0.0)
+        assert pos.canonical_hash() == neg.canonical_hash()
+
+    def test_golden_hash_for_known_config(self):
+        # Regression pin: if pydantic emits fields in a new order, or
+        # rfc8785 changes number canonicalisation, this fails before
+        # signatures from older runs go stale. To re-bless intentionally:
+        # print LLMConfig(...).canonical_hash() and paste the new value.
+        c = LLMConfig(model="anthropic/claude-opus-4-7", temperature=0.0, seed=42)
+        assert (
+            c.canonical_hash()
+            == "a35e2625e0cffe5a35064eb4d7bba3ce709e056a3d154525a04c58b4964f3364"
+        )
+
+
+class TestLLMConfigFiniteValidator:
+    def test_nan_temperature_rejected(self):
+        with pytest.raises(ValidationError, match="finite"):
+            LLMConfig(model="m", temperature=float("nan"))
+
+    def test_pos_inf_temperature_rejected(self):
+        with pytest.raises(ValidationError, match="finite"):
+            LLMConfig(model="m", temperature=float("inf"))
+
+    def test_neg_inf_temperature_rejected(self):
+        with pytest.raises(ValidationError, match="finite"):
+            LLMConfig(model="m", temperature=float("-inf"))
+
+    def test_negative_zero_accepted(self):
+        # -0.0 is finite. Pinning this contract so a stricter validator
+        # tweak doesn't accidentally exclude users hitting -0.0 via
+        # config-layer arithmetic.
+        c = LLMConfig(model="m", temperature=-0.0)
+        assert c.temperature == 0.0
+
+    def test_bool_temperature_rejected(self):
+        # RT polish-audit MAJ-3: bool is a subclass of int in Python and
+        # Pydantic v2 silently coerces it. `temperature=True` would
+        # JCS-encode as `true` while `temperature=1.0` encodes as `1.0`,
+        # producing two distinct canonical hashes for logically-equivalent
+        # configs and silently missing the §7 cache.
+        with pytest.raises(ValidationError, match="bool"):
+            LLMConfig(model="m", temperature=True)  # type: ignore[arg-type]
+        with pytest.raises(ValidationError, match="bool"):
+            LLMConfig(model="m", temperature=False)  # type: ignore[arg-type]
+
+
+class TestCanonicalHashChainConsistency:
+    """Single canonical-hash recipe across LLMConfig, Topology, and the
+    LLMCache key producer (RT audit M4: divergence would silently
+    re-bucket cache keys and corrupt the §7 invariant)."""
+
+    def test_topology_hash_matches_shared_helper(self):
+        # If Topology.canonical_hash ever diverges from the shared
+        # fuzzeval.canonical helper, the §7 cache identity gets two
+        # different hash universes overnight. This test pins that they
+        # produce byte-identical output for the same input.
+        from fuzzeval.canonical import canonical_hash as shared
+
+        topo = _sample_topology()
+        assert topo.canonical_hash() == shared(topo.model_dump(mode="json"))
+
+    def test_llm_config_hash_matches_shared_helper(self):
+        from fuzzeval.canonical import canonical_hash as shared
+
+        cfg = LLMConfig(model="m", temperature=0.0, seed=1)
+        assert cfg.canonical_hash() == shared(cfg.model_dump(mode="json"))
+
+
 class TestCanonicalHash:
     def test_is_deterministic_64char_hex(self):
         a = _sample_topology()

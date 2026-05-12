@@ -32,7 +32,7 @@ v0.5 documents this gap; the Weekend 2 runner is expected to detect
 ``Send`` returns at call time and error out. Users who know they need
 ``Send`` should track v1.0 issue (see _OOS_TRACKER).
 
-``langgraph`` is imported lazily so ``tsf[verify]`` users do not pull it.
+``langgraph`` is imported lazily so ``topofuzz[verify]`` users do not pull it.
 """
 
 from __future__ import annotations

@@ -15,11 +15,11 @@ them.
 
 from __future__ import annotations
 
-import hashlib
+import math
 from typing import Literal
 
-import rfc8785
-from pydantic import BaseModel, ConfigDict, model_validator
+from fuzzeval.canonical import canonical_hash as _canonical_hash
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 
 class LLMConfig(BaseModel):
@@ -30,6 +30,49 @@ class LLMConfig(BaseModel):
     max_tokens: int = 4096
     # None where the provider has no `seed` parameter (e.g. Anthropic).
     seed: int | None = None
+
+    @field_validator("temperature", mode="before")
+    @classmethod
+    def _reject_bool_temperature(cls, v: object) -> object:
+        # `bool` is a subclass of `int` in Python; without this guard,
+        # `LLMConfig(temperature=True)` is accepted and JCS-encodes as
+        # `true` while `temperature=1.0` JCS-encodes as `1.0` — two
+        # logically-equivalent configs producing different canonical
+        # hashes, which silently misses the §7 cache. Reject at the
+        # boundary so the bug surfaces here, not as a downstream cache
+        # miss. (RT polish-audit MAJ-3.)
+        if isinstance(v, bool):
+            raise ValueError(
+                f"LLMConfig.temperature must be a float; got bool {v!r}. "
+                "bool is silently coerced by Pydantic and produces "
+                "ambiguous JCS encoding."
+            )
+        return v
+
+    @field_validator("temperature")
+    @classmethod
+    def _reject_non_finite_temperature(cls, v: float) -> float:
+        # NaN / +/-Inf construct fine (they're floats) but `canonical_hash`
+        # crashes on them because rfc8785 cannot represent them in JCS.
+        # Raise at construction so the bug surfaces here, not several
+        # layers later in the §7 cache-key build. Negative-zero is fine —
+        # rfc8785 normalises it to "0" and Python `==` treats it as 0.0,
+        # so `decoding_param_swap` and the IR hash are consistent.
+        if not math.isfinite(v):
+            raise ValueError(
+                f"LLMConfig.temperature must be finite; got {v!r}. "
+                "NaN / Inf are not representable in JCS canonical hash."
+            )
+        return v
+
+    def canonical_hash(self) -> str:
+        """SHA-256 of the RFC 8785 (JCS) canonicalization of this config.
+
+        Used by the §7 cache key (``llm_config_hash`` component). Goes
+        through the shared :func:`fuzzeval.canonical.canonical_hash` so
+        the recipe stays in lockstep with :meth:`Topology.canonical_hash`.
+        """
+        return _canonical_hash(self.model_dump(mode="json"))
 
 
 class Node(BaseModel):
@@ -107,9 +150,11 @@ class Topology(BaseModel):
     def canonical_hash(self) -> str:
         """SHA-256 of the RFC 8785 (JCS) canonicalization of this topology.
 
-        Deterministic regardless of dict insertion order or platform. The
-        basis for signatures (§11) and cache keys (§7).
+        Deterministic regardless of dict insertion order or platform.
+        The basis for signatures (§11) and cache keys (§7). Goes through
+        :func:`fuzzeval.canonical.canonical_hash` so the hashing recipe
+        is shared with :meth:`LLMConfig.canonical_hash` and the cache
+        key producer in :mod:`fuzzeval.cache` — a divergence here would
+        silently re-bucket cache identity and corrupt the §7 invariant.
         """
-        return hashlib.sha256(
-            rfc8785.dumps(self.model_dump(mode="json"))
-        ).hexdigest()
+        return _canonical_hash(self.model_dump(mode="json"))

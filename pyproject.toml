@@ -16,7 +16,7 @@ dev = [
     "diskcache>=5.6",
     # Required by topofuzz.adapter tests (Weekend 1 step 3). Pulls
     # langchain-core transitively (~50MB). Adapter itself lazy-imports
-    # langgraph so tsf[verify] users don't need it at runtime. Upper bound
+    # langgraph so topofuzz[verify] users don't need it at runtime. Upper bound
     # is pinned to <2 because the adapter touches private API surface
     # (`StateGraph._builder.branches`, `BranchSpec.ends`, the `xray=1`
     # flatten contract) that has shifted across major versions.

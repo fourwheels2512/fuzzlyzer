@@ -8,7 +8,7 @@ from typing import TypedDict
 import pytest
 
 # Skip the whole file if langgraph somehow isn't installed (e.g. running
-# against the bare tsf[verify] dep set). The adapter itself doesn't need
+# against the bare topofuzz[verify] dep set). The adapter itself doesn't need
 # langgraph at import time, but every test builds a real StateGraph.
 pytest.importorskip("langgraph")
 
@@ -27,7 +27,7 @@ def _noop(state):
 
 
 def test_adapter_module_does_not_eagerly_import_langgraph():
-    # `tsf[verify]` users install topofuzz without langgraph; importing
+    # `topofuzz[verify]` users install topofuzz without langgraph; importing
     # `topofuzz.adapter` (e.g. for the from_langgraph re-export from a
     # higher-level entry point) must not pull langgraph into sys.modules.
     # Verified in a fresh subprocess so the test runner's preloaded
