@@ -1,0 +1,6 @@
+[tool.uv.workspace]
+members = ["packages/topofuzz", "packages/modelbrew-core"]
+
+[tool.uv.sources]
+modelbrew-core = { workspace = true }
+topofuzz = { workspace = true }
