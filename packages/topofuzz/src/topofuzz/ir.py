@@ -39,7 +39,17 @@ class Node(BaseModel):
     role: str
     kind: Literal["agent", "router", "aggregator", "human"] = "agent"
     llm_config: LLMConfig | None = None
-    # Excluded from order_swap variant generation (§6).
+    # Excluded from ALL variant generators (§6). A pinned node keeps its
+    # slot index in order_swap, is not eligible for role_swap pairing,
+    # and does not get its temperature perturbed by decoding_param_swap.
+    #
+    # NOTE: BLUEPRINT_v5plus.md §6 text mentions `pinned` only for
+    # `order_swap`. We deliberately extend it to all three generators
+    # because the §6a influence-remediation flow tells users to "pin its
+    # position" to freeze the agent — if pinning only stopped order_swap,
+    # a user following that remediation would still see variance from the
+    # role/decoding generators and the recommendation would self-falsify.
+    # See step-4 audit M-RT-4 for the reasoning trace.
     pinned: bool = False
 
 
