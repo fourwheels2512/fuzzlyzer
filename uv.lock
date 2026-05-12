@@ -4,7 +4,7 @@ requires-python = ">=3.11"
 
 [manifest]
 members = [
-    "modelbrew-core",
+    "fuzzeval",
     "topofuzz",
 ]
 
@@ -791,6 +791,36 @@ wheels = [
 ]
 
 [[package]]
+name = "fuzzeval"
+version = "0.1.0.dev0"
+source = { editable = "packages/fuzzeval" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "pydantic" },
+    { name = "rfc8785" },
+]
+
+[package.optional-dependencies]
+cache = [
+    { name = "diskcache" },
+]
+stats = [
+    { name = "numpy" },
+    { name = "scipy" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cryptography", specifier = ">=42" },
+    { name = "diskcache", marker = "extra == 'cache'", specifier = ">=5.6" },
+    { name = "numpy", marker = "extra == 'stats'", specifier = ">=1.26" },
+    { name = "pydantic", specifier = ">=2.5" },
+    { name = "rfc8785", specifier = ">=0.1" },
+    { name = "scipy", marker = "extra == 'stats'", specifier = ">=1.13" },
+]
+provides-extras = ["stats", "cache"]
+
+[[package]]
 name = "google-auth"
 version = "2.52.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1547,32 +1577,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/d6/54/cfe61301667036ec9
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b3/38/89ba8ad64ae25be8de66a6d463314cf1eb366222074cfda9ee839c56a4b4/mdurl-0.1.2-py3-none-any.whl", hash = "sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8", size = 9979, upload-time = "2022-08-14T12:40:09.779Z" },
 ]
-
-[[package]]
-name = "modelbrew-core"
-version = "0.1.0.dev0"
-source = { editable = "packages/modelbrew-core" }
-dependencies = [
-    { name = "cryptography" },
-    { name = "pydantic" },
-    { name = "rfc8785" },
-]
-
-[package.optional-dependencies]
-stats = [
-    { name = "numpy" },
-    { name = "scipy" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "cryptography", specifier = ">=42" },
-    { name = "numpy", marker = "extra == 'stats'", specifier = ">=1.26" },
-    { name = "pydantic", specifier = ">=2.5" },
-    { name = "rfc8785", specifier = ">=0.1" },
-    { name = "scipy", marker = "extra == 'stats'", specifier = ">=1.13" },
-]
-provides-extras = ["stats"]
 
 [[package]]
 name = "more-itertools"
@@ -2856,7 +2860,7 @@ version = "0.5.0.dev0"
 source = { editable = "packages/topofuzz" }
 dependencies = [
     { name = "cryptography" },
-    { name = "modelbrew-core" },
+    { name = "fuzzeval" },
     { name = "pydantic" },
     { name = "rfc8785" },
     { name = "rich" },
@@ -2885,13 +2889,13 @@ requires-dist = [
     { name = "anthropic", marker = "extra == 'full'", specifier = ">=0.34" },
     { name = "cryptography", specifier = ">=42" },
     { name = "diskcache", marker = "extra == 'full'", specifier = ">=5.6" },
+    { name = "fuzzeval", editable = "packages/fuzzeval" },
     { name = "google-genai", marker = "extra == 'full'", specifier = ">=0.3" },
     { name = "jinja2", marker = "extra == 'full'", specifier = ">=3.1" },
     { name = "keyring", marker = "extra == 'full'", specifier = ">=25" },
     { name = "langgraph", marker = "extra == 'full'", specifier = ">=0.2" },
     { name = "litellm", marker = "extra == 'full'", specifier = ">=1.40" },
     { name = "matplotlib", marker = "extra == 'full'", specifier = ">=3.8" },
-    { name = "modelbrew-core", editable = "packages/modelbrew-core" },
     { name = "numpy", marker = "extra == 'full'", specifier = ">=1.26" },
     { name = "openai", marker = "extra == 'full'", specifier = ">=1.40" },
     { name = "pydantic", specifier = ">=2.5" },

@@ -1,7 +1,7 @@
 [project]
-name = "modelbrew-core"
+name = "fuzzeval"
 version = "0.1.0.dev0"
-description = "Shared infrastructure for topofuzz and pramana-eval"
+description = "Shared eval infrastructure for topofuzz and other multi-agent eval tools"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
@@ -13,8 +13,8 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
-# Verify-path-safe deps only (no LangGraph, no LLM SDKs).
-# Heavy stats deps (numpy, scipy) live in the [stats] extra.
+# Verify-path-safe deps only (no LangGraph, no LLM SDKs, no numpy).
+# Heavy deps live in extras so `topofuzz[verify]` stays ~15MB.
 dependencies = [
     "cryptography>=42",
     "rfc8785>=0.1",
@@ -26,15 +26,18 @@ stats = [
     "numpy>=1.26",
     "scipy>=1.13",
 ]
+cache = [
+    "diskcache>=5.6",
+]
 
 [project.urls]
-Homepage = "https://github.com/topology-safety/modelbrew-core"
-Repository = "https://github.com/topology-safety/modelbrew-core"
-Issues = "https://github.com/topology-safety/modelbrew-core/issues"
+Homepage = "https://github.com/kirannayudu/fuzzeval"
+Repository = "https://github.com/kirannayudu/fuzzeval"
+Issues = "https://github.com/kirannayudu/fuzzeval/issues"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/modelbrew_core"]
+packages = ["src/fuzzeval"]
