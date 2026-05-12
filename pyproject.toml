@@ -6,8 +6,16 @@ fuzzeval = { workspace = true }
 topofuzz = { workspace = true }
 
 # Workspace-wide dev tooling. `uv sync` installs the `dev` group by default.
+# numpy + diskcache are here (not just in fuzzeval extras) so the test suite
+# always has them available without requiring `--extra` flags.
 [dependency-groups]
 dev = [
     "pytest>=8",
     "pytest-cov>=5",
+    "numpy>=1.26",
+    "diskcache>=5.6",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["packages/fuzzeval/tests"]
+addopts = ["-ra", "--strict-markers"]
