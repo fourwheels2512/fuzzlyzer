@@ -11,6 +11,7 @@ members = [
 [manifest.dependency-groups]
 dev = [
     { name = "diskcache", specifier = ">=5.6" },
+    { name = "langgraph", specifier = ">=1.0,<2" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-cov", specifier = ">=5" },
@@ -3105,11 +3106,11 @@ requires-dist = [
     { name = "google-genai", marker = "extra == 'full'", specifier = ">=0.3" },
     { name = "jinja2", marker = "extra == 'full'", specifier = ">=3.1" },
     { name = "keyring", marker = "extra == 'full'", specifier = ">=25" },
-    { name = "langgraph", marker = "extra == 'full'", specifier = ">=0.2" },
+    { name = "langgraph", marker = "extra == 'full'", specifier = ">=1.0,<2" },
     { name = "litellm", marker = "extra == 'full'", specifier = ">=1.40" },
     { name = "matplotlib", marker = "extra == 'full'", specifier = ">=3.8" },
     { name = "openai", marker = "extra == 'full'", specifier = ">=1.40" },
-    { name = "pydantic", specifier = ">=2.5" },
+    { name = "pydantic", specifier = ">=2.5,<3" },
     { name = "rfc8785", specifier = ">=0.1" },
     { name = "rich", specifier = ">=13" },
     { name = "structlog", marker = "extra == 'full'", specifier = ">=24" },

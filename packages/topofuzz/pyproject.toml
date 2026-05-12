@@ -21,7 +21,10 @@ dependencies = [
     "rich>=13",
     "cryptography>=42",
     "rfc8785>=0.1",
-    "pydantic>=2.5",
+    # Upper bound: Pydantic v3 may change field-emission order or tuple
+    # serialization, both of which would shift `canonical_hash`. Bump
+    # deliberately and re-bless the golden hash test together.
+    "pydantic>=2.5,<3",
 ]
 
 [project.optional-dependencies]
@@ -34,7 +37,10 @@ verify = []
 # fuzzeval[stats,cache] so they aren't duplicated here.
 full = [
     "fuzzeval[stats,cache]>=0.1,<0.2",
-    "langgraph>=0.2",
+    # Match the dev-group pin (root pyproject.toml). The adapter touches
+    # `compiled.builder`, `BranchSpec.ends`, and the `xray=1` flatten
+    # contract — all of which moved between LangGraph 0.x and 1.x.
+    "langgraph>=1.0,<2",
     "litellm>=1.40",
     "anthropic>=0.34",
     "openai>=1.40",
