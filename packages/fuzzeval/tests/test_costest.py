@@ -58,3 +58,19 @@ def test_estimate_is_deterministic_on_same_inputs():
 def test_unknown_model_falls_back_to_default_rate():
     r = estimate(_sample_rows(), "single", 50, 8, agent_model="nonexistent/model")
     assert r.total_cold_usd > 0  # no crash, fallback rate applied
+
+
+def test_estimate_magnitude_regression():
+    """Pin the static-rate output magnitude so a typo in a constant
+    (`_TOKENS_PER_CALL`, `_RATE_USD_PER_1K`, `_AGENT_CALLS_PER_ROW`) doesn't
+    silently 10x the bill. With current statics:
+      50 rows × 8 variants × 4 agents × 2_500 tok × 0.045/1K = $180 base cold
+      50 × 8 × 1 × 2_500 × 0.045/1K = $45 judge cold
+    Total cold ≈ $225 ± $5 of float drift.
+    If this assertion fails, audit the changed constant — don't just widen
+    the band.
+    """
+    r = estimate(_sample_rows(), "single", 50, 8)
+    assert 220.0 <= r.total_cold_usd <= 230.0, (
+        f"cost magnitude drift detected: total_cold={r.total_cold_usd}"
+    )

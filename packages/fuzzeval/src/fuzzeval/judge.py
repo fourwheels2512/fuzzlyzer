@@ -8,7 +8,7 @@ modules (notably `cache`) can reference `JudgeResult` without circular imports.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, Union
+from typing import Protocol
 
 
 @dataclass(frozen=True)
@@ -26,7 +26,10 @@ class BinaryScore:
     rationale: str
 
 
-JudgeResult = Union[ContinuousScore, BinaryScore]
+# PEP 604 union — runtime-checkable so `isinstance(x, JudgeResult)` works.
+# Equivalent to typing.Union[ContinuousScore, BinaryScore] but cleaner and
+# drops a typing import. Python 3.10+ required (we require 3.11+).
+JudgeResult = ContinuousScore | BinaryScore
 
 
 class Judge(Protocol):

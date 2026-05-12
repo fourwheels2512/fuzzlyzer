@@ -1,7 +1,14 @@
 """Cost estimation: static-rate cold + warm-cache estimator.
 
-Step 2 implements data shapes + a static-rate estimator. Real dry-run (actual
-LLM probe calls via LiteLLM) is wired up in Weekend 2 step 6.
+**STEP 2 IS A PLACEHOLDER.** Numbers come from hardcoded heuristics
+(`_TOKENS_PER_CALL`, `_AGENT_CALLS_PER_ROW`, `_WARM_CACHE_HIT_RATE`) — they
+will be wildly off for topologies that aren't a 4-agent linear chain, or for
+inputs that aren't ~2.5K tokens. The `ci_band` of ±20% is decorative until
+real variance data is wired in step 6 (Weekend 2: cold + warm probe via
+LiteLLM replaces statics with measured rates per (model, prompt-shape)).
+
+Do not surface these numbers in user-facing budget UX yet — the BLUEPRINT
+§15 DoD #3 cost-estimator prompt depends on the step-6 measured version.
 
 Per BLUEPRINT_v5plus.md §17a:
     estimate(sample_rows, judge_mode, n_total_rows, n_variants) -> CostEstimate
@@ -38,9 +45,11 @@ _RATE_USD_PER_1K = {
 }
 _DEFAULT_RATE = 0.040
 
-# Static heuristics — replaced by measured values in step 6.
+# Static heuristics — replaced by measured values in step 6. The 4-agent
+# assumption is wrong for any topology that isn't the lending fixture; this
+# is acceptable for step 2 because no caller surfaces the output to the user.
 _TOKENS_PER_CALL = 2_500             # input + output, one agent
-_AGENT_CALLS_PER_ROW = 4             # 4-agent chain (lending fixture)
+_AGENT_CALLS_PER_ROW = 4             # 4-agent chain (lending fixture only!)
 _JUDGE_CALLS_PER_CELL = {"single": 1, "jury_of_3": 3}
 _WARM_CACHE_HIT_RATE = 0.85
 _WALLCLOCK_PER_CALL_S = 4.5

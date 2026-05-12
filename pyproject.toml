@@ -17,5 +17,5 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["packages/fuzzeval/tests"]
+testpaths = ["packages/fuzzeval/tests", "packages/topofuzz/tests"]
 addopts = ["-ra", "--strict-markers"]

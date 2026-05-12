@@ -37,6 +37,16 @@ def test_wilson_ci_99_wider_than_95():
     assert (hi99 - lo99) > (hi95 - lo95)
 
 
+def test_wilson_ci_n_equals_1_boundary():
+    """Smallest valid n; floats must not blow up at the boundary."""
+    lo0, hi0 = wilson_ci(0, 1, 0.95)
+    assert lo0 == 0.0
+    assert 0.0 < hi0 < 1.0
+    lo1, hi1 = wilson_ci(1, 1, 0.95)
+    assert 0.0 < lo1 < 1.0
+    assert hi1 == 1.0
+
+
 def test_wilson_ci_rejects_bad_inputs():
     with pytest.raises(ValueError):
         wilson_ci(50, 0, 0.95)
