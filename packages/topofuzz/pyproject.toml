@@ -28,19 +28,18 @@ dependencies = [
 # Kept as an extras name for forward-compat and documentation.
 verify = []
 
-# tsf[full]: adds LLM SDKs, stats, matplotlib, caching, etc. Required for
-# `topofuzz run` and `topofuzz report`. Pulls ~400MB.
+# tsf[full]: adds LLM SDKs, plotting, secrets/retry/logging. Pulls ~400MB.
+# Stats (numpy+scipy) and cache (diskcache) come transitively via
+# fuzzeval[stats,cache] so they aren't duplicated here.
 full = [
+    "fuzzeval[stats,cache]",
     "langgraph>=0.2",
     "litellm>=1.40",
     "anthropic>=0.34",
     "openai>=1.40",
     "google-genai>=0.3",
-    "scipy>=1.13",
-    "numpy>=1.26",
     "matplotlib>=3.8",
     "jinja2>=3.1",
-    "diskcache>=5.6",
     "keyring>=25",
     "tenacity>=8.4",
     "structlog>=24",

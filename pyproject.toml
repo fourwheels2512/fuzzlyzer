@@ -4,3 +4,10 @@ members = ["packages/topofuzz", "packages/fuzzeval"]
 [tool.uv.sources]
 fuzzeval = { workspace = true }
 topofuzz = { workspace = true }
+
+# Workspace-wide dev tooling. `uv sync` installs the `dev` group by default.
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+]
