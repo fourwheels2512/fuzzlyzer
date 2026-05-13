@@ -2,256 +2,616 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'none'; base-uri 'none'; form-action 'none';">
+<meta name="referrer" content="no-referrer">
 <title>topofuzz report — {{ run_id }}</title>
 <style>
+  :root {
+    --bg: #faf7f2;
+    --surface: #ffffff;
+    --border: #e7d8c2;
+    --border-soft: #f0eae0;
+    --ink: #2a2622;
+    --ink-strong: #1f1c19;
+    --muted: #897764;
+    --muted-soft: #6b5f54;
+    --accent: #c25024;
+    --accent-soft: #d97757;
+    --success: #5a8b6b;
+    --success-soft: #7ba889;
+    --warn: #8c4318;
+    --warn-bg: #fce8d8;
+    --warn-border: #ecbf9a;
+    --dev-bg: #fff6e2;
+    --dev-border: #ead9a0;
+    --dev-ink: #6c5a14;
+    --jury-bg: #e9eef9;
+    --jury-border: #b8c6e4;
+    --jury-ink: #2a3a6a;
+    --degraded-bg: #fbe2e2;
+    --degraded-border: #e0a0a0;
+    --degraded-ink: #7a1f1f;
+    --font-serif: "Source Serif Pro", "Source Serif 4", Georgia, "Times New Roman", serif;
+    --font-sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  html { background: var(--bg); }
   body {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    max-width: 960px;
-    margin: 2rem auto;
-    padding: 0 1rem;
-    color: #1a1a1a;
-    background: #fafafa;
-    line-height: 1.45;
+    font-family: var(--font-sans);
+    background: var(--bg);
+    color: var(--ink);
+    line-height: 1.55;
+    margin: 0;
+    -webkit-font-smoothing: antialiased;
   }
-  h1 { font-size: 1.4rem; margin: 0 0 .25rem 0; }
-  h2 { font-size: 1.05rem; margin: 2rem 0 .5rem 0; border-bottom: 1px solid #ddd; padding-bottom: .2rem; }
-  .banners { margin: .75rem 0 1rem 0; }
-  .banner {
-    display: inline-block;
-    padding: .15rem .55rem;
-    margin-right: .5rem;
-    border-radius: 3px;
-    font-weight: bold;
-    font-size: .85rem;
-    letter-spacing: .04em;
+  .container {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 48px 28px 96px;
   }
-  .banner-dev-key { background: #fff3b0; color: #6b5b00; border: 1px solid #d9c45a; }
-  .banner-rekor-deferred { background: #ffe7b3; color: #7a4a00; border: 1px solid #d99a4a; }
-  .banner-jury    { background: #d6e4ff; color: #1e3a8a; border: 1px solid #6f8fce; }
-  .banner-degraded { background: #ffd6d6; color: #7a1f1f; border: 1px solid #c95757; }
-  .wc-stable {
-    background: #e0f5e0;
-    border-left: 4px solid #3da06e;
-    padding: .5rem .75rem;
-    margin: .75rem 0;
-    color: #1f5f3a;
-    font-size: .9rem;
+  h1 {
+    font-family: var(--font-serif);
+    font-size: 32px;
+    font-weight: 500;
+    margin: 0 0 8px 0;
+    line-height: 1.2;
+    letter-spacing: -0.01em;
+    color: var(--ink-strong);
   }
-  .wc-card {
-    border: 1px solid #cfcfcf;
+  .subhead {
+    font-family: var(--font-serif);
+    font-size: 16px;
+    color: var(--muted-soft);
+    font-style: italic;
+    margin: 0 0 28px 0;
+    line-height: 1.5;
+  }
+  h2 {
+    font-family: var(--font-serif);
+    font-size: 20px;
+    font-weight: 500;
+    color: var(--ink-strong);
+    margin: 40px 0 4px 0;
+    letter-spacing: -0.005em;
+  }
+  h2 .section-tag {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--muted);
+    background: var(--border-soft);
+    padding: 3px 8px;
     border-radius: 4px;
-    margin: 1rem 0;
-    overflow: hidden;
-    background: #fff;
+    letter-spacing: 0.08em;
+    margin-left: 8px;
+    vertical-align: 4px;
+    text-transform: uppercase;
   }
-  .wc-head {
-    background: #f0f3f8;
-    padding: .4rem .65rem;
-    font-size: .9rem;
-    border-bottom: 1px solid #cfcfcf;
+  .explainer {
+    font-family: var(--font-serif);
+    color: var(--muted-soft);
+    font-style: italic;
+    margin: 0 0 16px 0;
+    font-size: 14px;
+    line-height: 1.55;
   }
-  .wc-tag {
-    display: inline-block;
-    background: #1a1a1a;
-    color: #fff;
-    padding: .05rem .4rem;
-    border-radius: 2px;
-    font-size: .75rem;
-    margin-right: .4rem;
-    letter-spacing: .04em;
+  .explainer .engineer-note {
+    font-family: var(--font-sans);
+    font-style: normal;
+    color: var(--muted);
+    font-size: 12px;
+    display: block;
+    margin-top: 4px;
   }
-  .wc-eval { font-weight: bold; }
-  .wc-flip { color: #555; margin-left: .6rem; font-size: .8rem; }
-  .wc-grid {
+
+  /* ----------------------------------------------------------------
+     §17 summary panel — class names nls-{verdict_word} preserved
+     because tests grep them (test_cli_report.py).
+     ---------------------------------------------------------------- */
+  .natural-language-summary {
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 24px 28px;
+    margin-bottom: 24px;
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--ink);
+    font-family: var(--font-serif);
+  }
+  .natural-language-summary strong { color: var(--accent); font-weight: 600; }
+  .natural-language-summary code {
+    font-family: var(--font-mono);
+    font-style: normal;
+    background: var(--border-soft);
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 13px;
+    color: var(--ink-strong);
+  }
+  .nls-stable {
+    background: linear-gradient(180deg, #ecf3ed 0%, #f3f8f4 100%);
+    border-color: #cfe1d3;
+  }
+  .nls-stable strong { color: var(--success); }
+  .nls-unstable {
+    background: linear-gradient(180deg, #f7eee1 0%, #faf2e6 100%);
+    border-color: var(--border);
+  }
+  .nls-unavailable {
+    background: #f4f1ec;
+    border-color: var(--border-soft);
+    color: var(--muted-soft);
+  }
+
+  /* Banner row --------------------------------------------------- */
+  .banners {
+    display: flex; gap: 8px; flex-wrap: wrap;
+    margin: 0 0 28px 0;
+    min-height: 0;
+  }
+  .banner {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.08em;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid;
+    font-family: var(--font-mono);
+    line-height: 1.4;
+  }
+  .banner-dev-key { background: var(--dev-bg); border-color: var(--dev-border); color: var(--dev-ink); }
+  .banner-rekor-deferred { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn); }
+  .banner-jury { background: var(--jury-bg); border-color: var(--jury-border); color: var(--jury-ink); }
+  .banner-degraded { background: var(--degraded-bg); border-color: var(--degraded-border); color: var(--degraded-ink); }
+
+  .warning {
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    border-left: 4px solid var(--accent);
+    border-radius: 8px;
+    padding: 12px 18px;
+    margin: 0 0 24px 0;
+    color: var(--warn);
+    font-size: 14px;
+    font-family: var(--font-serif);
+  }
+
+  /* Run-manifest 2-column meta grid ----------------------------- */
+  .meta {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 0;
+    grid-template-columns: repeat(2, 1fr);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    margin: 8px 0 0 0;
   }
-  .wc-side {
-    padding: .55rem .65rem;
-    border-right: 1px dashed #d8d8d8;
-    font-size: .82rem;
+  .meta-row {
+    display: flex;
+    padding: 12px 18px;
+    border-bottom: 1px solid var(--border-soft);
+    gap: 12px;
+  }
+  .meta-row:nth-child(odd) { border-right: 1px solid var(--border-soft); }
+  .meta-row:nth-last-child(-n+2) { border-bottom: none; }
+  .meta-key {
+    font-size: 13px;
+    color: var(--muted);
+    font-family: var(--font-serif);
+    font-style: italic;
+    min-width: 130px;
+    flex-shrink: 0;
+  }
+  .meta-val {
+    font-size: 13px;
+    color: var(--ink-strong);
+    font-weight: 500;
+    font-family: var(--font-mono);
     word-break: break-word;
     overflow-wrap: anywhere;
   }
-  .wc-side:last-child { border-right: none; }
-  .wc-side-head {
-    margin-bottom: .35rem;
-    padding-bottom: .25rem;
-    border-bottom: 1px solid #eee;
-    color: #333;
+
+  /* Chart-card wrapper for matplotlib figures ------------------- */
+  .chart-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 22px 26px;
+    margin: 8px 0 0 0;
   }
-  .wc-verdict-pass { color: #1f5f3a; font-weight: bold; }
-  .wc-verdict-fail { color: #7a1f1f; font-weight: bold; }
-  .wc-trace p { margin: .2rem 0; }
-  .wc-trace .nid { color: #1e3a8a; font-weight: bold; }
-  .wc-trace .role { color: #777; font-size: .76rem; }
-  .wc-rationale {
-    margin-top: .35rem;
-    padding-top: .25rem;
-    border-top: 1px solid #eee;
-    color: #555;
+  .chart-card figure { margin: 0; text-align: center; }
+  .chart-card figcaption {
+    color: var(--muted-soft);
+    font-size: 12px;
+    margin-top: 10px;
+    font-family: var(--font-serif);
+    font-style: italic;
+    line-height: 1.5;
+    text-align: left;
+  }
+  .chart-card svg { max-width: 100%; height: auto; }
+
+  /* Per-agent influence table ----------------------------------- */
+  .influence-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0 0 0;
+    font-size: 13px;
+    font-family: var(--font-mono);
+  }
+  .influence-table th, .influence-table td {
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border-soft);
+    color: var(--ink);
+  }
+  .influence-table th {
+    font-family: var(--font-serif);
+    font-style: italic;
+    font-weight: normal;
+    color: var(--muted);
+    background: var(--border-soft);
+    font-size: 12px;
+  }
+  .influence-table tr:last-child td { border-bottom: none; }
+  .influence-table .agent-name {
+    font-family: var(--font-serif);
+    font-weight: 500;
+    font-style: normal;
+    color: var(--ink-strong);
+    font-size: 14px;
+  }
+
+  /* §10a worst-case cards --------------------------------------- */
+  .wc-disabled {
+    background: linear-gradient(180deg, #ecf3ed 0%, #f3f8f4 100%);
+    border: 1px solid #cfe1d3;
+    border-left: 4px solid var(--success);
+    border-radius: 10px;
+    padding: 14px 20px;
+    margin: 8px 0 0 0;
+    color: #1f5f3a;
+    font-size: 14px;
+    font-family: var(--font-serif);
+    line-height: 1.55;
+  }
+  .wc-summary-line {
+    color: var(--muted-soft);
+    font-size: 13px;
+    margin: 8px 0 16px 0;
+    font-family: var(--font-serif);
     font-style: italic;
   }
-  .warning {
-    background: #fff0d6;
-    border-left: 4px solid #d99700;
-    padding: .5rem .75rem;
-    margin: .75rem 0;
-    color: #6b4400;
-    font-size: .85rem;
+  .wc-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    margin: 0 0 16px 0;
+    overflow: hidden;
   }
-  table.meta { border-collapse: collapse; margin: .5rem 0; }
-  table.meta td { padding: .15rem .75rem .15rem 0; vertical-align: top; }
-  table.meta td.k { color: #555; }
-  figure { margin: 1rem 0; text-align: center; }
-  figcaption { color: #555; font-size: .85rem; margin-top: .3rem; }
-  svg { max-width: 100%; height: auto; }
-  ul.evals { columns: 3; font-size: .85rem; color: #555; }
-  footer { margin-top: 2rem; color: #777; font-size: .8rem; border-top: 1px solid #ddd; padding-top: .5rem; }
-  .natural-language-summary {
-    margin: .75rem 0 1rem 0;
-    padding: .6rem .8rem;
+  .wc-head {
+    background: #faf2e6;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  .wc-tag {
+    background: var(--accent); color: #fff;
+    font-family: var(--font-mono);
+    font-size: 11px; font-weight: 600;
+    letter-spacing: 0.08em;
+    padding: 3px 9px;
     border-radius: 4px;
-    font-size: .92rem;
-    line-height: 1.5;
   }
-  .nls-stable { background: #e0f5e0; border-left: 4px solid #3da06e; color: #1f5f3a; }
-  .nls-unstable { background: #ffe7d6; border-left: 4px solid #c46a2e; color: #7a3f1f; }
-  .nls-unavailable { background: #f0f0f0; border-left: 4px solid #999; color: #555; }
-  .natural-language-summary code {
-    background: rgba(0,0,0,.06);
-    padding: 0 .25rem;
-    border-radius: 2px;
-    font-size: .9em;
+  .wc-eval {
+    font-family: var(--font-serif);
+    font-weight: 500;
+    font-size: 15px;
+    color: var(--ink-strong);
+  }
+  .wc-flip {
+    font-size: 13px;
+    color: var(--muted);
+    font-style: italic;
+    font-family: var(--font-serif);
+  }
+  .wc-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+  .wc-side {
+    padding: 16px 20px;
+    font-size: 13px;
+  }
+  .wc-side:first-child {
+    border-right: 1px solid var(--border-soft);
+  }
+  .wc-side-head {
+    font-family: var(--font-serif);
+    font-size: 13px;
+    color: var(--ink);
+    line-height: 1.5;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-soft);
+    margin-bottom: 10px;
+  }
+  .wc-side-head code {
+    font-family: var(--font-mono);
+    background: var(--border-soft);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 11px;
+  }
+  .wc-verdict-pass { color: var(--success); font-weight: 600; }
+  .wc-verdict-fail { color: var(--accent); font-weight: 600; }
+  .wc-trace {
+    line-height: 1.7;
+    color: var(--ink);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+  }
+  .wc-trace p { margin: 2px 0; }
+  .wc-trace .nid {
+    font-family: var(--font-mono);
+    color: var(--jury-ink);
+    font-size: 11px;
+    font-weight: 600;
+    background: var(--jury-bg);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+  .wc-trace .role {
+    font-family: var(--font-mono);
+    color: var(--muted);
+    font-size: 10px;
+    letter-spacing: 0.02em;
+  }
+  .wc-rationale {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border-soft);
+    font-family: var(--font-serif);
+    font-style: italic;
+    color: var(--muted-soft);
+    font-size: 12px;
+    line-height: 1.55;
+  }
+
+  /* Eval-ids footer list + page footer -------------------------- */
+  ul.evals {
+    columns: 3;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--muted-soft);
+    padding-left: 18px;
+    margin: 12px 0 0 0;
+  }
+  ul.evals li { margin: 2px 0; break-inside: avoid; }
+  .evals-truncated {
+    font-family: var(--font-serif);
+    font-style: italic;
+    font-size: 12px;
+    color: var(--muted);
+    margin: 8px 0 0 0;
+  }
+  footer.page {
+    margin-top: 48px;
+    padding-top: 18px;
+    border-top: 1px solid var(--border);
+    font-family: var(--font-serif);
+    font-style: italic;
+    font-size: 12px;
+    color: var(--muted);
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  footer.page .page-disclaimer {
+    flex-basis: 100%;
+    margin: 12px 0 0 0;
+    font-size: 11px;
+    line-height: 1.55;
+    color: var(--muted);
+    font-family: var(--font-serif);
+    font-style: italic;
+  }
+
+  /* Tooltip pattern --------------------------------------------- */
+  .term {
+    border-bottom: 1px dotted var(--muted);
+    cursor: help;
+    position: relative;
+  }
+  .term:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 3px;
+  }
+  .term:hover::after,
+  .term:focus::after {
+    content: attr(data-tip);
+    position: absolute;
+    left: 0; bottom: 100%;
+    background: var(--ink-strong);
+    color: #faf7f2;
+    font-family: var(--font-sans);
+    font-style: normal;
+    font-size: 12px;
+    line-height: 1.45;
+    font-weight: normal;
+    padding: 8px 12px;
+    border-radius: 6px;
+    width: max-content;
+    max-width: 280px;
+    z-index: 10;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    margin-bottom: 4px;
+    white-space: normal;
+  }
+
+  @media (max-width: 640px) {
+    .container { padding: 28px 18px 64px; }
+    .meta { grid-template-columns: 1fr; }
+    .meta-row:nth-child(odd) { border-right: none; }
+    .meta-row:nth-last-child(-n+2) { border-bottom: 1px solid var(--border-soft); }
+    .meta-row:last-child { border-bottom: none; }
+    .wc-grid { grid-template-columns: 1fr; }
+    .wc-side:first-child { border-right: none; border-bottom: 1px solid var(--border-soft); }
+    ul.evals { columns: 2; }
   }
 </style>
 </head>
 <body>
-<h1>topofuzz run — {{ run_id }}</h1>
-<!-- SUMMARY-SECTION-BEGIN -->
-{% if summary and summary.summary_html %}
-<div class="natural-language-summary nls-{{ summary.verdict_word }}">
-{{ summary.summary_html | safe }}
-</div>
-{% endif %}
-<!-- SUMMARY-SECTION-END -->
-<div class="banners">
-  {% if show_dev_key %}<span class="banner banner-dev-key">[DEV-KEY]</span>{% endif %}
-  {% if show_rekor_deferred %}<span class="banner banner-rekor-deferred">[REKOR-DEFERRED]</span>{% endif %}
-  {% if show_jury %}<span class="banner banner-jury">[JURY]</span>{% endif %}
-  {% if show_degraded %}<span class="banner banner-degraded">[DEGRADED]</span>{% endif %}
-</div>
+<div class="container">
+  <h1>topofuzz run — {{ run_id }}</h1>
+  <p class="subhead">Topology
+    <span class="term" tabindex="0" data-tip="A topology is the recipe describing how the agents in your multi-agent system are wired together — which agent talks first, who hands off to whom." aria-label="A topology is the recipe describing how the agents in your multi-agent system are wired together — which agent talks first, who hands off to whom.">{{ topology_name }}</span>,
+    tested across {{ n_variants }} orderings on {{ n_eval_rows }} eval rows.
+  </p>
 
-{% if matrix_warning %}<div class="warning">⚠ {{ matrix_warning }}</div>{% endif %}
-
-<table class="meta">
-  <tr><td class="k">topology</td><td>{{ topology_name }}</td></tr>
-  <tr><td class="k">status</td><td>{{ status }}</td></tr>
-  <tr><td class="k">judge model</td><td>{{ judge_model }}</td></tr>
-  <tr><td class="k">rubric hash</td><td>{{ rubric_hash or '(none)' }}</td></tr>
-  <tr><td class="k">variants</td><td>{{ n_variants }}</td></tr>
-  <tr><td class="k">eval rows</td><td>{{ n_eval_rows }}</td></tr>
-  <tr><td class="k">kickoff</td><td>{{ kickoff_iso }}</td></tr>
-</table>
-
-<h2>Per-agent influence (§6a)</h2>
-<figure>
-  {{ influence_svg | safe }}
-  <figcaption>P(answer flips | agent moved between two variants) − P(answer flips | agent in same slot). Negative = stabilising. 95% CI via percentile bootstrap (n=1000) over evals.</figcaption>
-</figure>
-{% if influence_rows %}
-<table class="meta">
-  <tr><td class="k">agent</td><td class="k">influence</td><td class="k">95% CI</td><td class="k">note</td></tr>
-{% for r in influence_rows %}
-  <tr>
-    <td>{{ r.node_id }}</td>
-    <td>{% if r.influence is none %}—{% else %}{{ '%.3f' % r.influence }}{% endif %}</td>
-    <td>{% if r.ci_lower is none or r.ci_upper is none %}—{% else %}[{{ '%.3f' % r.ci_lower }}, {{ '%.3f' % r.ci_upper }}]{% endif %}</td>
-    <td>{% if r.degenerate_reason %}{{ r.degenerate_reason }}{% endif %}</td>
-  </tr>
-{% endfor %}
-</table>
-{% endif %}
-
-<!-- WORSTCASE-SECTION-BEGIN -->
-<h2>Worst-case viewer (§10a)</h2>
-{% if worstcase.disabled %}
-<div class="wc-stable">
-  {% if worstcase.disabled_reason == 'no instability detected' %}
-  No instability detected — your topology produced consistent answers across all orderings.
-  {% elif worstcase.disabled_reason == 'matrix empty' or worstcase.disabled_reason == 'no continuous-judge cells' %}
-  Worst-case section unavailable — no continuous-judge cells to rank.
-  {% elif worstcase.disabled_reason == 'no valid differing-verdict pair' %}
-  Worst-case section unavailable — no valid differing-verdict pair (data may be partial).
-  {% else %}
-  Worst-case section unavailable
-  {% if worstcase.disabled_reason %}<span style="color:#777;font-size:.78rem;">({{ worstcase.disabled_reason }})</span>{% endif %}
+  <!-- SUMMARY-SECTION-BEGIN -->
+  {% if summary and summary.summary_html %}
+  <div class="natural-language-summary nls-{{ summary.verdict_word }}">
+  {{ summary.summary_html | safe }}
+  </div>
   {% endif %}
-</div>
-{% else %}
-<p style="color:#555;font-size:.85rem;margin:.25rem 0 .75rem 0;">
-  Top {{ worstcase.cases | length }} eval rows with the most cross-ordering verdict disagreements.
-  Each card shows the two variants that produced the largest score gap on a flipping pair.
-</p>
-{% for case in worstcase.cases %}
-<div class="wc-card">
-  <div class="wc-head">
-    <span class="wc-tag">WORST #{{ loop.index }}</span>
-    <span class="wc-eval">eval_id = {{ case.eval_id }}</span>
-    <span class="wc-flip">{{ case.flip_count }} of {{ case.n_pairs }} variant pairs disagree</span>
+  <!-- SUMMARY-SECTION-END -->
+
+  <div class="banners">
+    {% if show_dev_key %}<span class="banner banner-dev-key term" tabindex="0" data-tip="Signed with a developer key on this machine. Not a third-party-verifiable signature — anyone with read access to ~/.topofuzz/dev.pem can produce an indistinguishable signature. For attestations external parties should trust, use a release key plus a transparency log (re-run with --rekor)." aria-label="Developer key warning. Signed with a developer key on this machine. Not a third-party-verifiable signature — anyone with read access to the developer key file can produce an indistinguishable signature. For attestations external parties should trust, use a release key plus a transparency log.">[DEV-KEY]</span>{% endif %}
+    {% if show_rekor_deferred %}<span class="banner banner-rekor-deferred term" tabindex="0" data-tip="We tried to post proof to the public Sigstore transparency log so anyone can verify these numbers. The submission was deferred — re-run with --rekor to retry. Note: Sigstore Rekor entries are permanent and globally public." aria-label="Rekor submission deferred. We tried to post proof to the public Sigstore transparency log so anyone can verify these numbers. The submission was deferred — re-run the rekor flag to retry. Note: Sigstore Rekor entries are permanent and globally public.">[REKOR-DEFERRED]</span>{% endif %}
+    {% if show_jury %}<span class="banner banner-jury term" tabindex="0" data-tip="Each cell was judged by three independent LLM vendors instead of one. Reduces single-vendor bias in the scores." aria-label="Jury of three judges. Each cell was judged by three independent LLM vendors instead of one. Reduces single-vendor bias in the scores.">[JURY]</span>{% endif %}
+    {% if show_degraded %}<span class="banner banner-degraded term" tabindex="0" data-tip="The run finished but with degraded outputs — some cells failed or were partial." aria-label="Run completed in degraded state. The run finished but with degraded outputs — some cells failed or were partial.">[DEGRADED]</span>{% endif %}
   </div>
-  <div class="wc-grid">
-    {% for side in [case.variant_a, case.variant_b] %}
-    <div class="wc-side">
-      <div class="wc-side-head">
-        <strong>Variant {{ 'A' if loop.index == 1 else 'B' }}:</strong>
-        <code title="{{ side.variant_id }}">{{ side.variant_id_short }}</code><br>
-        {% if side.ordering %}Ordering: {{ side.ordering | join(' → ') }}<br>{% endif %}
-        Score: {{ '%.3f' % side.score }} ·
-        Verdict:
-        {% if side.verdict %}<span class="wc-verdict-pass">PASS</span>{% else %}<span class="wc-verdict-fail">FAIL</span>{% endif %}
-      </div>
-      <div class="wc-trace">
-        {% if side.node_outputs %}
-        {% for n in side.node_outputs %}
-        <p><span class="nid">{{ n.node_id }}</span> <span class="role">[{{ n.role }}]</span>: {{ n.response_text }}</p>
-        {% endfor %}
-        {% else %}
-        <p style="color:#888;font-size:.78rem;">(no per-node trace available for this cell)</p>
-        {% endif %}
-      </div>
-      {% if side.rationale %}<div class="wc-rationale">Judge: {{ side.rationale }}</div>{% endif %}
+
+  {% if matrix_warning %}<div class="warning">⚠ {{ matrix_warning }}</div>{% endif %}
+
+  <h2>What we tested <span class="section-tag">Run manifest</span></h2>
+  <p class="explainer">The setup that produced these numbers. None of this changes the result — it records what code, what data, and what judge ran.</p>
+  <div class="meta">
+    <div class="meta-row"><div class="meta-key">topology</div><div class="meta-val">{{ topology_name }}</div></div>
+    <div class="meta-row"><div class="meta-key">status</div><div class="meta-val">{{ status }}</div></div>
+    <div class="meta-row"><div class="meta-key">judge model</div><div class="meta-val">{{ judge_model }}</div></div>
+    <div class="meta-row"><div class="meta-key">rubric hash</div><div class="meta-val">{{ rubric_hash or '(none)' }}</div></div>
+    <div class="meta-row"><div class="meta-key">variants</div><div class="meta-val">{{ n_variants }}</div></div>
+    <div class="meta-row"><div class="meta-key">eval rows</div><div class="meta-val">{{ n_eval_rows }}</div></div>
+    <div class="meta-row"><div class="meta-key">kickoff</div><div class="meta-val">{{ kickoff_iso }}</div></div>
+    <div class="meta-row"><div class="meta-key">generated</div><div class="meta-val">{{ generated_iso }}</div></div>
+  </div>
+
+  <h2>Per-agent influence <span class="section-tag">§6a</span></h2>
+  <p class="explainer">For each agent, how much the final answer changes when we move that agent around. Longer bar = bigger trouble-maker. Green = the agent stabilises answers.<span class="engineer-note">P(answer flips | agent moved between two variants) − P(answer flips | agent in same slot). 95% CI via percentile bootstrap (n=1000) over evals.</span></p>
+  <div class="chart-card">
+    <figure>
+      {{ influence_svg | safe }}
+    </figure>
+  </div>
+  {% if influence_rows %}
+  <table class="influence-table">
+    <tr>
+      <th>agent</th>
+      <th>influence</th>
+      <th>95% CI</th>
+      <th>note</th>
+    </tr>
+  {% for r in influence_rows %}
+    <tr>
+      <td class="agent-name">{{ r.node_id }}</td>
+      <td>{% if r.influence is none %}—{% else %}{{ '%.3f' % r.influence }}{% endif %}</td>
+      <td>{% if r.ci_lower is none or r.ci_upper is none %}—{% else %}[{{ '%.3f' % r.ci_lower }}, {{ '%.3f' % r.ci_upper }}]{% endif %}</td>
+      <td>{% if r.degenerate_reason %}{{ r.degenerate_reason }}{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </table>
+  {% endif %}
+
+  <!-- WORSTCASE-SECTION-BEGIN -->
+  <h2>Worst-case viewer <span class="section-tag">§10a</span></h2>
+  {% if worstcase.disabled %}
+  <div class="wc-disabled">
+    {% if worstcase.disabled_reason == 'no instability detected' %}
+    No instability detected — your topology produced consistent answers across all orderings.
+    {% elif worstcase.disabled_reason == 'matrix empty' or worstcase.disabled_reason == 'no continuous-judge cells' %}
+    Worst-case section unavailable — no continuous-judge cells to rank.
+    {% elif worstcase.disabled_reason == 'no valid differing-verdict pair' %}
+    Worst-case section unavailable — no valid differing-verdict pair (data may be partial).
+    {% else %}
+    Worst-case section unavailable
+    {% if worstcase.disabled_reason %}<span style="color: var(--muted); font-size: 12px;">({{ worstcase.disabled_reason }})</span>{% endif %}
+    {% endif %}
+  </div>
+  {% else %}
+  <p class="wc-summary-line">
+    Top {{ worstcase.cases | length }} eval rows with the most cross-ordering verdict disagreements. Each card shows the two variants that produced the largest score gap on a flipping pair.
+  </p>
+  {% for case in worstcase.cases %}
+  <div class="wc-card">
+    <div class="wc-head">
+      <span class="wc-tag">WORST #{{ loop.index }}</span>
+      <span class="wc-eval">eval_id = {{ case.eval_id }}</span>
+      <span class="wc-flip">{{ case.flip_count }} of {{ case.n_pairs }} variant pairs disagree</span>
     </div>
-    {% endfor %}
+    <div class="wc-grid">
+      {% for side in [case.variant_a, case.variant_b] %}
+      <div class="wc-side">
+        <div class="wc-side-head">
+          <strong>Variant {{ 'A' if loop.index == 1 else 'B' }}:</strong>
+          <code title="{{ side.variant_id }}">{{ side.variant_id_short }}</code><br>
+          {% if side.ordering %}Ordering: {{ side.ordering | join(' → ') }}<br>{% endif %}
+          Score: {{ '%.3f' % side.score }} ·
+          Verdict:
+          {% if side.verdict %}<span class="wc-verdict-pass">PASS</span>{% else %}<span class="wc-verdict-fail">FAIL</span>{% endif %}
+        </div>
+        <div class="wc-trace">
+          {% if side.node_outputs %}
+          {% for n in side.node_outputs %}
+          <p><span class="nid">{{ n.node_id }}</span> <span class="role">[{{ n.role }}]</span>: {{ n.response_text }}</p>
+          {% endfor %}
+          {% else %}
+          <p style="color: var(--muted); font-size: 12px;">(no per-node trace available for this cell)</p>
+          {% endif %}
+        </div>
+        {% if side.rationale %}<div class="wc-rationale">Judge: {{ side.rationale }}</div>{% endif %}
+      </div>
+      {% endfor %}
+    </div>
   </div>
+  {% endfor %}
+  {% endif %}
+  <!-- WORSTCASE-SECTION-END -->
+
+  <h2>Per-eval variance across orderings <span class="section-tag">§9</span></h2>
+  <p class="explainer">One bar per eval row. Tall bars mean the same input produced very different scores when we shuffled the agent order — the topology is more order-sensitive on those evals.<span class="engineer-note">Per-eval np.var across the variant axis (ddof=0). Higher = topology is more order-sensitive on that eval.</span></p>
+  <div class="chart-card">
+    <figure>
+      {{ voo_svg | safe }}
+    </figure>
+  </div>
+
+  <h2>Score matrix <span class="section-tag">variant × eval</span></h2>
+  <p class="explainer">Continuous judge scores for every (variant, eval) cell. Missing or failed cells render as gray.</p>
+  <div class="chart-card">
+    <figure>
+      {{ heatmap_svg | safe }}
+    </figure>
+  </div>
+
+  {% if eval_ids %}
+  <h2>Eval IDs <span class="section-tag">{{ eval_ids|length + eval_ids_truncated }} total</span></h2>
+  <ul class="evals">
+  {% for e in eval_ids %}<li>{{ e }}</li>{% endfor %}
+  </ul>
+  {% if eval_ids_truncated %}<p class="evals-truncated">… and {{ eval_ids_truncated }} more (see manifest.json for the full list).</p>{% endif %}
+  {% endif %}
+
+  <footer class="page">
+    <span>topofuzz {{ topofuzz_version }}</span>
+    <span>generated {{ generated_iso }}</span>
+    <p class="page-disclaimer">
+      topofuzz measures topology fragility under agent-order perturbation. Informational only — not a safety, security, or fitness certification, and not a guarantee about any third-party model. Reports may contain LLM judge outputs and your own eval data; review before sharing.
+    </p>
+  </footer>
 </div>
-{% endfor %}
-{% endif %}
-<!-- WORSTCASE-SECTION-END -->
-
-<h2>Per-eval variance across orderings</h2>
-<figure>
-  {{ voo_svg | safe }}
-  <figcaption>§9 metric #1 — per-eval np.var across the variant axis (ddof=0). Higher = topology is more order-sensitive on that eval.</figcaption>
-</figure>
-
-<h2>Score matrix (variant × eval)</h2>
-<figure>
-  {{ heatmap_svg | safe }}
-  <figcaption>Continuous judge scores. Missing/failed cells render as gray.</figcaption>
-</figure>
-
-{% if eval_ids %}
-<h2>Eval IDs ({{ eval_ids|length + eval_ids_truncated }})</h2>
-<ul class="evals">
-{% for e in eval_ids %}<li>{{ e }}</li>{% endfor %}
-</ul>
-{% if eval_ids_truncated %}<p style="font-size:.85rem;color:#888;">… and {{ eval_ids_truncated }} more (see manifest.json for the full list).</p>{% endif %}
-{% endif %}
-
-<footer>
-  topofuzz {{ topofuzz_version }} · generated {{ generated_iso }}
-</footer>
 </body>
 </html>
