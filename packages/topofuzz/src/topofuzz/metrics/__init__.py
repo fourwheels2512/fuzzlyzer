@@ -33,6 +33,13 @@ in-tree consumer):
 from __future__ import annotations
 
 from topofuzz.metrics.ecr import ECRResult, error_correction_rate
+from topofuzz.metrics.influence import (
+    AgentInfluence,
+    InfluenceComputation,
+    OrderingAlignmentError,
+    align_orderings_to_matrix,
+    compute_influence,
+)
 from topofuzz.metrics.kappa import (
     KappaResult,
     balanced_accuracy,
@@ -47,13 +54,18 @@ from topofuzz.metrics.voo import (
 )
 
 __all__ = [
+    "AgentInfluence",
     "ECRResult",
+    "InfluenceComputation",
     "KappaResult",
+    "OrderingAlignmentError",
     "ScoreMatrixResult",
+    "align_orderings_to_matrix",
     "balanced_accuracy",
     "classify_run_status",
     "cohens_kappa",
     "cohens_kappa_vs_truth",
+    "compute_influence",
     "error_correction_rate",
     "read_score_matrix",
     "variance_across_orderings",

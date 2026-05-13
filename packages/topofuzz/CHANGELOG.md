@@ -12,6 +12,33 @@ placeholder version and are not separately enumerated.
 
 ### Added
 
+- **Per-agent influence score (§6a)** (Weekend 5 step 15). New
+  `topofuzz.metrics.compute_influence` computes
+  `P(answer flips | A moved) − P(answer flips | A in same slot)`
+  for each agent across the variant×eval grid, with a 95% percentile
+  bootstrap CI over evals (B=1000, seed-pinned to 0 in the
+  attestation path for byte-stable signed reports). Signed values
+  surfaced — negative = stabilising — no clamping per the step-15
+  kickoff decision. Ranked descending; degenerate rows
+  (agent <2 variants, no moved pairs, no same-slot pairs) carry a
+  `degenerate_reason` and sink to the bottom in node_id lex order.
+- **`attestation.json` findings field**. The DSSE-signed payload
+  gains a `findings` dict (alongside `headline`); the first occupant
+  is `findings.per_agent_influence` — a ranked list of
+  `{node_id, influence, ci_lower, ci_upper, degenerate}` entries
+  (plus `degenerate_reason` when applicable). Old runs without
+  `variant_orderings` in their manifest emit `findings={}`.
+- **HTML report — per-agent influence panel**. New `<h2>` section
+  in `report.html` renders a horizontal bar chart (matplotlib, error
+  bars = 95% CI, blue = driver, green = stabilising) plus a textual
+  rows table; placeholder SVG when influence is not computable.
+  Capped at 32 rows to bound HTML footprint.
+- **Manifest carries `variant_orderings`**. New parallel field
+  alongside `variant_canonical_hashes` — a list of per-variant
+  node_id sequences in slot order — so `topofuzz report` and
+  `emit_run_attestation` can recompute influence post-hoc without
+  the live Topology objects. Older `manifest.json` files without
+  the field degrade gracefully (no crash; empty `findings`).
 - **`topofuzz scan FIXTURE_PATH` static risk badge** (Weekend 5 step 14,
   BLUEPRINT §5a). Zero-LLM-cost rule-based scanner walks the Topology
   IR and emits a `HIGH` / `MEDIUM` / `LOW` badge plus matched-patterns

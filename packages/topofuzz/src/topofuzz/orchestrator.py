@@ -188,6 +188,14 @@ def write_manifest(plan: RunPlan, *, cli_args: dict[str, Any]) -> Path:
         "variant_canonical_hashes": [
             v.canonical_hash() for v in plan.variants
         ],
+        # Per-variant node_id sequence in slot order — needed by §6a
+        # per-agent influence (step 15). Persisted at kickoff so the
+        # post-hoc report path can recompute without needing the live
+        # Topology objects. Parallel to ``variant_canonical_hashes``;
+        # rows are ordered identically.
+        "variant_orderings": [
+            [n.id for n in v.nodes] for v in plan.variants
+        ],
         "eval_ids": [r["id"] for r in plan.eval_rows],
         "max_cost_usd": plan.max_cost_usd,
         "judge_model": plan.judge_model,

@@ -80,7 +80,9 @@ __all__ = [
     "PAYLOAD_TYPE",
     "VerifyOutcome",
     "build_attestation_payload",
+    "compute_findings",
     "compute_headline",
+    "compute_influence_for_attestation",
     "compute_voo_for_attestation",
     "emit_attestation",
     "emit_run_attestation",
@@ -177,12 +179,19 @@ def build_attestation_payload(
     headline: dict[str, Any],
     run_sqlite_sha256: str,
     signed_at: str | None = None,
+    findings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the inner DSSE payload dict (before JCS canonicalization).
 
     ``signed_at`` defaults to the current UTC time formatted as
     ``YYYY-MM-DDTHH:MM:SS.ffffffZ``. Callers (mostly tests) can pass a
     fixed string for determinism.
+
+    ``findings`` is an optional dict of post-run analytics that don't
+    belong in ``headline`` (they may be empty, may carry CIs, may grow
+    in v0.6+). Step 15 (§6a per-agent influence) is the first occupant.
+    When omitted, defaults to an empty dict so consumers can always
+    read ``payload['findings']`` without a KeyError.
     """
     if signed_at is None:
         # ISO-8601 UTC with 'Z' suffix. Using datetime.now(tz=UTC) (not
@@ -196,6 +205,7 @@ def build_attestation_payload(
         "run_id": run_id,
         "manifest": manifest,
         "headline": headline,
+        "findings": dict(findings) if findings else {},
         "run_sqlite_sha256": run_sqlite_sha256,
         "signed_at": signed_at,
     }
@@ -527,6 +537,158 @@ def compute_voo_for_attestation(
     return out
 
 
+def compute_influence_for_attestation(
+    run_dir: Path,
+    run_id: str,
+    manifest: dict[str, Any],
+    *,
+    seed: int | None = 0,
+) -> list[dict[str, Any]] | None:
+    """Best-effort §6a per-agent influence for the attestation findings.
+
+    Returns ``None`` (and never raises) if any of the following are
+    true: numpy missing, ``topofuzz.metrics`` unavailable, manifest
+    has no ``variant_orderings`` (old run), score matrix can't be
+    read, or no agent has a computable influence row. The orchestrator
+    emits the attestation regardless — the only signal is the absence
+    of a ``findings.per_agent_influence`` field.
+
+    The output shape matches BLUEPRINT_v5plus.md §6a DoD #12:
+
+    .. code-block:: json
+
+        [
+          {"node_id": "A", "influence": 0.67, "ci_lower": 0.51,
+           "ci_upper": 0.79, "degenerate": false},
+          ...
+        ]
+
+    Ranked descending by signed influence (the
+    :class:`topofuzz.metrics.influence.AgentInfluence` row order); rows
+    with ``degenerate=true`` carry ``influence=null`` /
+    ``ci_lower=null`` / ``ci_upper=null`` plus a short
+    ``degenerate_reason`` string.
+
+    ``seed`` defaults to ``0`` so the signed attestation is
+    byte-stable across re-signs of the same run. Callers wanting a
+    fresh RNG can pass ``None`` but lose the rc1→GA byte-identical
+    promise that step 13's release pipeline depends on.
+    """
+    log = logging.getLogger(__name__)
+    if seed is None:
+        log.warning(
+            "compute_influence_for_attestation called with seed=None; the "
+            "signed payload will not be byte-stable across re-signs. Pass "
+            "seed=0 to preserve the rc1→GA byte-identical contract."
+        )
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    try:
+        import sqlite3
+
+        from topofuzz.metrics import (
+            OrderingAlignmentError,
+            align_orderings_to_matrix,
+            compute_influence,
+            read_score_matrix,
+        )
+    except ImportError as e:
+        log.warning(
+            "topofuzz.metrics unavailable; influence skipped in attestation: %s",
+            e,
+        )
+        return None
+
+    try:
+        sm = read_score_matrix(
+            run_dir,
+            run_id=run_id,
+            allow_empty_rubric_hash=True,
+        )
+    except (FileNotFoundError, ValueError, OSError, sqlite3.DatabaseError) as e:
+        log.warning(
+            "score matrix unreadable; influence skipped in attestation: %s",
+            e,
+        )
+        return None
+
+    matrix = sm.matrix
+    if matrix.size == 0 or matrix.shape[0] < 2 or matrix.shape[1] < 1:
+        return None
+
+    # Align variant_orderings (manifest insertion order) with the score
+    # matrix axis (canonical_hash lex). Strict alignment (audit RT-B-1
+    # / RT-B-2): duplicate hashes, variant-count mismatches, and unknown
+    # hashes all surface as a logged warning and a missing
+    # ``findings.per_agent_influence`` field — refusing is safer than
+    # signing a wrong-axis chart.
+    try:
+        aligned = align_orderings_to_matrix(manifest, sm.variant_ids)
+    except OrderingAlignmentError as e:
+        if e.reason != "missing":
+            # 'missing' is the expected pre-step-15 run case; everything
+            # else is a real signal the operator should see.
+            log.warning(
+                "influence skipped in attestation (%s): %s", e.reason, e
+            )
+        return None
+
+    try:
+        comp = compute_influence(matrix, aligned, seed=seed)
+    except (ValueError, ImportError) as e:
+        log.warning(
+            "influence computation failed in attestation path: %s", e
+        )
+        return None
+
+    out: list[dict[str, Any]] = []
+    for row in comp.results:
+        entry: dict[str, Any] = {
+            "node_id": row.node_id,
+            "influence": (
+                None if row.influence is None else float(row.influence)
+            ),
+            "ci_lower": (
+                None if row.ci_lower is None else float(row.ci_lower)
+            ),
+            "ci_upper": (
+                None if row.ci_upper is None else float(row.ci_upper)
+            ),
+            "degenerate": bool(row.degenerate),
+        }
+        if row.degenerate_reason:
+            entry["degenerate_reason"] = row.degenerate_reason
+        out.append(entry)
+    return out if out else None
+
+
+def compute_findings(
+    run_dir: Path,
+    run_id: str,
+    manifest: dict[str, Any],
+    *,
+    seed: int | None = 0,
+) -> dict[str, Any]:
+    """Assemble the attestation ``findings`` dict.
+
+    Today carries one key: ``per_agent_influence`` (step 15, §6a). Other
+    findings (worst-case viewer summary in §10a, natural-language
+    summary in §17) will land here in subsequent steps. Returns an
+    empty dict when no field is computable so the payload shape stays
+    stable across runs (a missing ``findings`` key would force readers
+    to defensive-default).
+    """
+    findings: dict[str, Any] = {}
+    influence = compute_influence_for_attestation(
+        run_dir, run_id, manifest, seed=seed
+    )
+    if influence is not None:
+        findings["per_agent_influence"] = influence
+    return findings
+
+
 def emit_run_attestation(
     *,
     run_dir: Path,
@@ -561,12 +723,14 @@ def emit_run_attestation(
         elapsed_s=elapsed_s,
         voo_per_eval=voo,
     )
+    findings = compute_findings(run_dir, run_id, manifest)
     sqlite_path = run_dir / "run.sqlite"
     sqlite_sha = sha256_file(sqlite_path) if sqlite_path.exists() else ""
     payload = build_attestation_payload(
         run_id=run_id,
         manifest=manifest,
         headline=headline,
+        findings=findings,
         run_sqlite_sha256=sqlite_sha,
     )
     return emit_attestation(payload, signer, run_dir / ATTESTATION_FILENAME)

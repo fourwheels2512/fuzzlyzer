@@ -46,6 +46,7 @@ def _make_run_dir(
     with_attestation: bool = False,
     n_variants: int = 2,
     n_evals: int = 3,
+    variant_orderings: list[list[str]] | None = None,
 ) -> Path:
     """Build a v0.5-shaped run_dir under ``tmp_path``.
 
@@ -59,6 +60,13 @@ def _make_run_dir(
     eval_ids = [f"eval-{i}" for i in range(n_evals)]
     variant_ids = [f"var{i:02d}" for i in range(n_variants)]
 
+    if variant_orderings is None:
+        # Default: every variant is the same single-agent ordering. With
+        # 2 variants × 1 agent, influence is degenerate (no same-slot
+        # AND moved pairs both exist) — the report renders a placeholder
+        # SVG and an empty rows table. Step-15 influence-panel tests
+        # override this to exercise the live-render path.
+        variant_orderings = [["A"] for _ in range(n_variants)]
     manifest = {
         "run_id": "run-test",
         "topology_canonical_hash": "topo-hash",
@@ -68,6 +76,7 @@ def _make_run_dir(
         "n_variants": n_variants,
         "n_eval_rows": n_evals,
         "variant_canonical_hashes": variant_ids,
+        "variant_orderings": variant_orderings,
         "eval_ids": eval_ids,
         "max_cost_usd": None,
         "judge_model": "google/gemini-2.5-pro",
@@ -406,6 +415,312 @@ def test_report_eval_ids_capped_in_html(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Verify-path safety: topofuzz.report is NOT loaded by importing topofuzz.cli
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Step 15 — §6a per-agent influence panel
+# ---------------------------------------------------------------------------
+
+
+def test_influence_panel_rendered_when_orderings_supplied(tmp_path: Path) -> None:
+    """A run with 4 variants × 3 evals and a dominant agent's orderings
+    produces a non-placeholder influence panel with at least one bar."""
+    orderings = [
+        ["A", "B", "C"],
+        ["A", "C", "B"],
+        ["B", "A", "C"],
+        ["B", "C", "A"],
+    ]
+    run_dir = _make_run_dir(
+        tmp_path,
+        n_variants=4,
+        n_evals=3,
+        variant_orderings=orderings,
+    )
+    # Overwrite the default per-cell scores with values that polarise on
+    # agent A's slot so influence has signal. variants 0,1 have A in
+    # slot 0 → high score; variants 2,3 have A elsewhere → low score.
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    try:
+        db.execute("DELETE FROM judge_results")
+        cells = [
+            (0, 0.9), (0, 0.85), (0, 0.92),
+            (1, 0.88), (1, 0.91), (1, 0.86),
+            (2, 0.10), (2, 0.05), (2, 0.12),
+            (3, 0.08), (3, 0.11), (3, 0.09),
+        ]
+        eval_ids = [f"eval-{i}" for i in range(3)]
+        for i, (v_idx, score) in enumerate(cells):
+            db.execute(
+                "INSERT INTO judge_results "
+                "(run_id, variant_id, eval_id, judge_kind, score_value, "
+                " passed, rationale, failure_reason) "
+                "VALUES (?, ?, ?, 'continuous', ?, NULL, NULL, NULL)",
+                ("run-test", f"var{v_idx:02d}", eval_ids[i % 3], score),
+            )
+        db.commit()
+    finally:
+        db.close()
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    body = (run_dir / "report.html").read_text(encoding="utf-8")
+    assert "Per-agent influence" in body
+    # The placeholder copy "influence unavailable" should NOT appear.
+    assert "influence unavailable" not in body
+    # All three agents appear in the influence-rows table.
+    assert ">A<" in body or ">A</" in body
+    assert ">B<" in body or ">B</" in body
+    assert ">C<" in body or ">C</" in body
+    # Three SVGs: voo bar, heatmap, influence chart.
+    assert body.count("<svg") >= 3
+
+
+def test_influence_panel_placeholder_when_orderings_missing(tmp_path: Path) -> None:
+    """A pre-step-15 run (no variant_orderings in manifest) renders a
+    placeholder SVG, not a crash, and produces an empty rows table."""
+    run_dir = _make_run_dir(tmp_path, n_variants=4, n_evals=3)
+    # Strip variant_orderings from the manifest to simulate an old run.
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("variant_orderings", None)
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    body = (run_dir / "report.html").read_text(encoding="utf-8")
+    assert "Per-agent influence" in body
+    assert "influence unavailable" in body
+    assert "no orderings in manifest" in body
+
+
+def test_attestation_findings_per_agent_influence_populated(tmp_path: Path) -> None:
+    """End-to-end: ``emit_run_attestation`` lands ``per_agent_influence``
+    inside the signed payload's ``findings`` dict."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+    )
+
+    from fuzzeval.attestation import Ed25519Signer, dsse_verify
+
+    from topofuzz.attest import emit_run_attestation
+
+    orderings = [
+        ["A", "B", "C"],
+        ["A", "C", "B"],
+        ["B", "A", "C"],
+        ["B", "C", "A"],
+    ]
+    run_dir = _make_run_dir(
+        tmp_path,
+        n_variants=4,
+        n_evals=3,
+        variant_orderings=orderings,
+    )
+    # Same polarised cells as the panel test so influence is computable.
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    try:
+        db.execute("DELETE FROM judge_results")
+        cells = [
+            (0, 0.9), (0, 0.85), (0, 0.92),
+            (1, 0.88), (1, 0.91), (1, 0.86),
+            (2, 0.10), (2, 0.05), (2, 0.12),
+            (3, 0.08), (3, 0.11), (3, 0.09),
+        ]
+        eval_ids = [f"eval-{i}" for i in range(3)]
+        for i, (v_idx, score) in enumerate(cells):
+            db.execute(
+                "INSERT INTO judge_results "
+                "(run_id, variant_id, eval_id, judge_kind, score_value, "
+                " passed, rationale, failure_reason) "
+                "VALUES (?, ?, ?, 'continuous', ?, NULL, NULL, NULL)",
+                ("run-test", f"var{v_idx:02d}", eval_ids[i % 3], score),
+            )
+        db.commit()
+    finally:
+        db.close()
+
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    signer = Ed25519Signer(Ed25519PrivateKey.generate())
+    public_key_pem = signer.public_key_pem
+    out_path = emit_run_attestation(
+        run_dir=run_dir,
+        run_id="run-test",
+        manifest=manifest,
+        status="succeeded",
+        successful_cells=12,
+        total_cells=12,
+        n_variants=4,
+        n_evals=3,
+        total_cost_usd=0.0,
+        elapsed_s=0.0,
+        signer=signer,
+    )
+    envelope = out_path.read_bytes()
+    verified = dsse_verify(envelope, public_key_pem)
+    payload = json.loads(verified.payload_bytes)
+    assert "findings" in payload
+    findings = payload["findings"]
+    assert "per_agent_influence" in findings
+    rows = findings["per_agent_influence"]
+    assert isinstance(rows, list)
+    assert len(rows) == 3
+    for r in rows:
+        assert set(r.keys()) >= {
+            "node_id", "influence", "ci_lower", "ci_upper", "degenerate"
+        }
+    # The dominant agent (A) carries a positive, non-degenerate influence.
+    by_id = {r["node_id"]: r for r in rows}
+    assert by_id["A"]["degenerate"] is False
+    assert by_id["A"]["influence"] is not None
+    assert by_id["A"]["influence"] > 0.0
+
+
+def test_attestation_influence_alignment_survives_non_lex_hashes(
+    tmp_path: Path,
+) -> None:
+    """Audit CR-M1 + RT-B-1 + RT-B-2 cover: a manifest whose
+    variant_canonical_hashes do NOT come out lex-sorted matches them
+    back to orderings via the hash table, not by row index. A is the
+    dominant agent in variants whose hash sorts last, so a naive
+    row-index alignment would attribute A's signal to the wrong agent.
+    """
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+    )
+
+    from fuzzeval.attestation import Ed25519Signer, dsse_verify
+
+    from topofuzz.attest import emit_run_attestation
+
+    # Non-lex hashes: lex order would be c0, d1, e2, f3.
+    # Insertion order (manifest order): f3, c0, e2, d1.
+    hashes = ["f3", "c0", "e2", "d1"]
+    # Per the dominant fixture: A is in slot 0 for the first two
+    # manifest-order variants → polarised high. Place those at the
+    # hashes that DON'T sort first lex, to prove alignment.
+    orderings = [
+        ["A", "B", "C"],   # f3 → manifest row 0, polarised high
+        ["A", "C", "B"],   # c0 → manifest row 1, polarised high
+        ["B", "A", "C"],   # e2 → manifest row 2, polarised low
+        ["B", "C", "A"],   # d1 → manifest row 3, polarised low
+    ]
+    run_dir = tmp_path / "non-lex-run"
+    run_dir.mkdir()
+
+    # Build the manifest + run.sqlite by hand with non-lex hashes so
+    # the read_score_matrix lex sort genuinely shuffles the axis.
+    manifest = {
+        "run_id": "non-lex-run",
+        "topology_canonical_hash": "topo-hash",
+        "topology_name": "lending_4role",
+        "tds_version": "0.5.0",
+        "tenant_id": "local",
+        "n_variants": 4,
+        "n_eval_rows": 3,
+        "variant_canonical_hashes": hashes,
+        "variant_orderings": orderings,
+        "eval_ids": ["eval-0", "eval-1", "eval-2"],
+        "max_cost_usd": None,
+        "judge_model": "google/gemini-2.5-pro",
+        "rubric_hash": "rh",
+        "semaphore_size": 8,
+        "cli_args": {},
+        "kickoff_ts": 1700000000.0,
+    }
+    (run_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
+
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    try:
+        db.executescript("""
+            CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY,
+                topology_canonical_hash TEXT NOT NULL,
+                topology_name TEXT NOT NULL,
+                tds_version TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                finished_at REAL,
+                n_variants INTEGER,
+                n_evals INTEGER,
+                judge_protocol TEXT,
+                cost_actual_usd REAL,
+                tenant_id TEXT NOT NULL DEFAULT 'local',
+                rubric_hash TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE cells (
+                run_id TEXT NOT NULL,
+                variant_id TEXT NOT NULL,
+                eval_id TEXT NOT NULL,
+                ir_canonical_hash TEXT NOT NULL,
+                node_outputs_json TEXT NOT NULL,
+                error TEXT,
+                cell_cost_usd REAL,
+                PRIMARY KEY (run_id, variant_id, eval_id)
+            );
+            CREATE TABLE judge_results (
+                run_id TEXT NOT NULL,
+                variant_id TEXT NOT NULL,
+                eval_id TEXT NOT NULL,
+                judge_kind TEXT NOT NULL,
+                score_value REAL,
+                passed INTEGER,
+                rationale TEXT,
+                failure_reason TEXT,
+                PRIMARY KEY (run_id, variant_id, eval_id)
+            );
+        """)
+        db.execute(
+            "INSERT INTO runs (run_id, topology_canonical_hash, "
+            "topology_name, tds_version, created_at, status, rubric_hash) "
+            "VALUES ('non-lex-run', 'h', 'name', '0.5', 0.0, 'succeeded', 'rh')"
+        )
+        # Insert per-variant cells with the polarised pattern, keyed
+        # by the actual hash (not by row index).
+        cells_per_variant = {
+            "f3": [0.90, 0.85, 0.92],  # A in slot 0 → high
+            "c0": [0.88, 0.91, 0.86],  # A in slot 0 → high
+            "e2": [0.10, 0.05, 0.12],  # A in slot 1 → low
+            "d1": [0.08, 0.11, 0.09],  # A in slot 2 → low
+        }
+        eval_ids = ["eval-0", "eval-1", "eval-2"]
+        for vid, scores in cells_per_variant.items():
+            for eid, sc in zip(eval_ids, scores, strict=True):
+                db.execute(
+                    "INSERT INTO judge_results "
+                    "(run_id, variant_id, eval_id, judge_kind, "
+                    " score_value, passed, rationale, failure_reason) "
+                    "VALUES ('non-lex-run', ?, ?, 'continuous', ?, "
+                    " NULL, NULL, NULL)",
+                    (vid, eid, sc),
+                )
+        db.commit()
+    finally:
+        db.close()
+
+    signer = Ed25519Signer(Ed25519PrivateKey.generate())
+    public_key_pem = signer.public_key_pem
+    out_path = emit_run_attestation(
+        run_dir=run_dir,
+        run_id="non-lex-run",
+        manifest=manifest,
+        status="succeeded",
+        successful_cells=12,
+        total_cells=12,
+        n_variants=4,
+        n_evals=3,
+        total_cost_usd=0.0,
+        elapsed_s=0.0,
+        signer=signer,
+    )
+    payload = json.loads(dsse_verify(out_path.read_bytes(), public_key_pem).payload_bytes)
+    rows = payload["findings"]["per_agent_influence"]
+    by_id = {r["node_id"]: r for r in rows}
+    # A is the polarised agent; correctly aligned to slot 0 in f3/c0
+    # variants → positive non-degenerate influence.
+    assert by_id["A"]["degenerate"] is False
+    assert by_id["A"]["influence"] is not None
+    assert by_id["A"]["influence"] > 0.0
 
 
 def test_cli_import_does_not_load_report_module() -> None:

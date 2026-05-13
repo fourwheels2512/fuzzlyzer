@@ -154,6 +154,9 @@ def render_report(run_dir: Path) -> Path:
 
     voo_svg = _render_voo_bar_svg(matrix, eval_ids_from_db)
     heatmap_svg = _render_heatmap_svg(matrix, variant_ids, eval_ids_from_db)
+    influence_svg, influence_rows = _render_influence_panel(
+        matrix, variant_ids, manifest
+    )
 
     # Banner gates. attestation.json presence is the structural check,
     # but we additionally require the file to parse as JSON shaped like
@@ -222,6 +225,8 @@ def render_report(run_dir: Path) -> Path:
         eval_ids_truncated=eval_ids_truncated,
         voo_svg=voo_svg,
         heatmap_svg=heatmap_svg,
+        influence_svg=influence_svg,
+        influence_rows=influence_rows,
         show_dev_key=show_dev_key,
         show_jury=show_jury,
         show_degraded=show_degraded,
@@ -571,6 +576,164 @@ def _short(label: str, *, limit: int = 12) -> str:
     if len(s) <= limit:
         return s
     return s[: limit - 1] + "…"
+
+
+# Hard cap on rows rendered in the influence-panel table so a topology
+# with ~50 agents (unlikely in v0.5 but not impossible) doesn't blow up
+# the HTML footprint. 32 is the same heuristic as _HEATMAP_TICK_LABEL_CAP.
+_INFLUENCE_ROW_RENDER_CAP = 32
+
+
+def _render_influence_panel(
+    matrix: "np.ndarray",
+    variant_ids: tuple[str, ...],
+    manifest: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Render the §6a per-agent influence panel.
+
+    Returns ``(svg, rows)``. ``svg`` is a horizontal bar chart (one bar
+    per agent, error bars = 95% bootstrap CI) or the placeholder SVG
+    when influence is not computable (old run, too few variants, no
+    score cells). ``rows`` is the list of dicts the template iterates
+    over for the textual table fallback — exactly what the attestation
+    ``findings.per_agent_influence`` field carries.
+
+    The manifest path is the source of truth for ``variant_orderings``;
+    we align them against the score matrix's canonical-hash axis the
+    same way :func:`topofuzz.attest.compute_influence_for_attestation`
+    does. The two callers compute identical influence rows from the
+    same run dir — verified in tests so the signed and rendered views
+    cannot drift.
+    """
+    if matrix.size == 0 or matrix.shape[0] < 2 or matrix.shape[1] < 1:
+        return _placeholder_svg("influence unavailable: score matrix empty"), []
+
+    try:
+        from topofuzz.metrics import (
+            OrderingAlignmentError,
+            align_orderings_to_matrix,
+            compute_influence,
+        )
+    except ImportError:
+        return _placeholder_svg("influence unavailable: metrics not installed"), []
+
+    # Strict alignment (audit RT-B-1 / RT-B-2): duplicates / mismatches
+    # / unknown hashes degrade to a placeholder + logged WARNING. The
+    # placeholder message uses the structured reason slug from the
+    # exception, not the raw ValueError text, so we never accidentally
+    # leak diagnostic detail into the rendered HTML.
+    try:
+        aligned = align_orderings_to_matrix(manifest, variant_ids)
+    except OrderingAlignmentError as e:
+        if e.reason == "missing":
+            # Pre-step-15 run dir; the operator already knows the field
+            # is new, no reason to spam the log on every report render.
+            # Mirrors the attest path's policy (RT pass-2 M-1).
+            return (
+                _placeholder_svg("influence unavailable: no orderings in manifest"),
+                [],
+            )
+        _log.warning("report: influence skipped (%s): %s", e.reason, e)
+        return (
+            _placeholder_svg(f"influence unavailable: manifest {e.reason}"),
+            [],
+        )
+
+    try:
+        comp = compute_influence(matrix, aligned, seed=0)
+    except (ValueError, ImportError) as e:
+        _log.warning("report: influence computation failed: %s", e)
+        return _placeholder_svg("influence unavailable: computation error"), []
+
+    rows: list[dict[str, Any]] = []
+    for r in comp.results:
+        rows.append(
+            {
+                "node_id": r.node_id,
+                "influence": r.influence,
+                "ci_lower": r.ci_lower,
+                "ci_upper": r.ci_upper,
+                "degenerate": r.degenerate,
+                "degenerate_reason": r.degenerate_reason,
+            }
+        )
+    if not rows:
+        return _placeholder_svg("influence unavailable: no agents"), []
+    # The SVG bar chart caps to keep the figure legible at default size,
+    # but the rendered rows table keeps every row so it matches the
+    # attestation `findings.per_agent_influence` list verbatim
+    # (audit CR-M2 — signed and rendered views must not silently diverge).
+    bar_rows = rows[:_INFLUENCE_ROW_RENDER_CAP]
+    svg = _render_influence_bar_svg(bar_rows)
+    return svg, rows
+
+
+def _render_influence_bar_svg(rows: list[dict[str, Any]]) -> str:
+    """Horizontal bar chart, one bar per agent, with 95% CI error bars."""
+    import numpy as np
+
+    plot_rows = [r for r in rows if r["influence"] is not None]
+    if not plot_rows:
+        return _placeholder_svg(
+            "influence available but every agent is degenerate"
+        )
+
+    plt = _setup_matplotlib()
+    labels = [_short(r["node_id"], limit=20) for r in plot_rows]
+    values = np.array([float(r["influence"]) for r in plot_rows], dtype=float)
+    # CI bounds and the point estimate are emitted together by
+    # compute_influence — degenerate rows carry None for all three and
+    # are already filtered out above. n_bootstrap=0 leaves the point
+    # populated and both bounds None; in that path the error bars
+    # collapse to zero width.
+    lo = np.array(
+        [
+            float(r["ci_lower"]) if r["ci_lower"] is not None else float(r["influence"])
+            for r in plot_rows
+        ],
+        dtype=float,
+    )
+    hi = np.array(
+        [
+            float(r["ci_upper"]) if r["ci_upper"] is not None else float(r["influence"])
+            for r in plot_rows
+        ],
+        dtype=float,
+    )
+    # matplotlib errorbar expects (lower_offset, upper_offset), both >= 0.
+    err_lo = np.maximum(values - lo, 0.0)
+    err_hi = np.maximum(hi - values, 0.0)
+
+    n = len(plot_rows)
+    height = max(2.0, min(6.0, 0.4 * n + 1.0))
+    fig, ax = plt.subplots(figsize=(7.5, height))
+    try:
+        y_pos = np.arange(n)
+        # Stable two-tone colouring: positive = blue (driver), negative
+        # = green (stabilising). No clamping per the step-15 decision.
+        colors = ["#3b6fb0" if v >= 0 else "#3da06e" for v in values]
+        ax.barh(y_pos, values, color=colors, alpha=0.85)
+        ax.errorbar(
+            values,
+            y_pos,
+            xerr=[err_lo, err_hi],
+            fmt="none",
+            ecolor="#1a1a1a",
+            elinewidth=1.0,
+            capsize=3,
+        )
+        ax.axvline(0.0, color="#888", linewidth=0.8)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(labels, fontsize=9)
+        ax.invert_yaxis()  # largest influence at top, matches ranking
+        ax.set_xlabel("influence  (P(flip | A moved) − P(flip | A same slot))")
+        ax.set_title("Per-agent influence with 95% bootstrap CI")
+        fig.tight_layout()
+        buf = BytesIO()
+        fig.savefig(buf, format="svg", metadata={"Date": None})
+    finally:
+        plt.close(fig)
+    return _strip_svg_preamble(buf.getvalue())
 
 
 # ---------------------------------------------------------------------------

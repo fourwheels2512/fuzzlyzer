@@ -66,6 +66,25 @@
   <tr><td class="k">kickoff</td><td>{{ kickoff_iso }}</td></tr>
 </table>
 
+<h2>Per-agent influence (§6a)</h2>
+<figure>
+  {{ influence_svg | safe }}
+  <figcaption>P(answer flips | agent moved between two variants) − P(answer flips | agent in same slot). Negative = stabilising. 95% CI via percentile bootstrap (n=1000) over evals.</figcaption>
+</figure>
+{% if influence_rows %}
+<table class="meta">
+  <tr><td class="k">agent</td><td class="k">influence</td><td class="k">95% CI</td><td class="k">note</td></tr>
+{% for r in influence_rows %}
+  <tr>
+    <td>{{ r.node_id }}</td>
+    <td>{% if r.influence is none %}—{% else %}{{ '%.3f' % r.influence }}{% endif %}</td>
+    <td>{% if r.ci_lower is none or r.ci_upper is none %}—{% else %}[{{ '%.3f' % r.ci_lower }}, {{ '%.3f' % r.ci_upper }}]{% endif %}</td>
+    <td>{% if r.degenerate_reason %}{{ r.degenerate_reason }}{% endif %}</td>
+  </tr>
+{% endfor %}
+</table>
+{% endif %}
+
 <h2>Per-eval variance across orderings</h2>
 <figure>
   {{ voo_svg | safe }}
