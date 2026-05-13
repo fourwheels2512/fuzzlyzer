@@ -555,16 +555,26 @@ async def execute_run(
             judge_cache.close()
 
     elapsed = time.monotonic() - started
+    final_successful = cost_state["successful_cells"] + already_successful_count
+    final_total = len(plan.variants) * len(plan.eval_rows)
+    _maybe_emit_attestation(
+        plan,
+        status=status,
+        successful_cells=final_successful,
+        total_cells=final_total,
+        total_cost_usd=cost_state["total_cost_usd"],
+        elapsed_s=elapsed,
+    )
     return RunResult(
         run_id=plan.run_id,
         run_dir=plan.run_dir,
-        total_cells=len(plan.variants) * len(plan.eval_rows),
+        total_cells=final_total,
         # ``completed_cells()`` filters on ``error IS NULL`` per its
         # docstring contract, so prior-run successes contribute to both
         # counters here. If that filter ever broadens, the rename
         # (already_done → already_successful) flags the spot to update.
         completed_cells=cost_state["completed_cells"] + already_successful_count,
-        successful_cells=cost_state["successful_cells"] + already_successful_count,
+        successful_cells=final_successful,
         total_cost_usd=cost_state["total_cost_usd"],
         cap_tripped=cost_state["cap_tripped"],
         elapsed_s=elapsed,
@@ -572,6 +582,102 @@ async def execute_run(
         status=status,
         metrics_exit_code=metrics_exit_code,
     )
+
+
+def _maybe_emit_attestation(
+    plan: RunPlan,
+    *,
+    status: str,
+    successful_cells: int,
+    total_cells: int,
+    total_cost_usd: float,
+    elapsed_s: float,
+) -> None:
+    """Best-effort emit of ``<run_dir>/attestation.json`` post-finalize.
+
+    Step 10a (BLUEPRINT_v5plus.md §11). Two log levels distinguish the
+    failure modes:
+
+    * INFO — no dev key on disk. This is the common path for first-run
+      users who haven't run ``topofuzz keygen``. Not an error; the run
+      itself succeeded.
+    * WARNING — key exists but something downstream failed: key load,
+      manifest read, or sign/write. The run still succeeded, but the
+      operator should investigate (corrupted key, disk-full, etc.).
+
+    Either way this function never propagates an exception — attestation
+    is additive metadata, not a precondition for a valid run.
+    """
+    log = logging.getLogger(__name__)
+    try:
+        # Imports are inside the function to avoid pulling cryptography
+        # / rfc8785 at orchestrator import time for callers that don't
+        # actually run (e.g. test_orchestrator's pure-helper tests).
+        from fuzzeval.attestation import Ed25519Signer
+        from fuzzeval.keys import (
+            KeyNotFoundError,
+            default_dev_priv_path,
+            load_private_key,
+        )
+
+        from topofuzz.attest import emit_run_attestation
+    except ImportError as e:
+        log.warning("attestation imports unavailable: %s — run not signed", e)
+        return
+
+    priv_path = default_dev_priv_path()
+    try:
+        priv_key = load_private_key(priv_path)
+    except KeyNotFoundError:
+        log.info(
+            "no dev key at %s — run not signed "
+            "(run `topofuzz keygen` to enable attestation)",
+            priv_path,
+        )
+        return
+    except (ValueError, OSError) as e:
+        log.warning(
+            "dev key at %s could not be loaded: %s — run not signed",
+            priv_path,
+            e,
+        )
+        return
+
+    manifest_path = plan.run_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning(
+            "manifest.json read failed at %s: %s — run not signed",
+            manifest_path,
+            e,
+        )
+        return
+
+    signer = Ed25519Signer(priv_key)
+    try:
+        out_path = emit_run_attestation(
+            run_dir=plan.run_dir,
+            run_id=plan.run_id,
+            manifest=manifest,
+            status=status,
+            successful_cells=successful_cells,
+            total_cells=total_cells,
+            n_variants=len(plan.variants),
+            n_evals=len(plan.eval_rows),
+            total_cost_usd=total_cost_usd,
+            elapsed_s=elapsed_s,
+            signer=signer,
+        )
+    except (OSError, ValueError, TypeError) as e:
+        # OSError covers disk-full / permission-denied. ValueError +
+        # TypeError cover JCS / encoding failures from rfc8785. We
+        # deliberately do NOT catch broader exceptions so a real bug
+        # (e.g. an AttributeError from a refactor) surfaces in tests
+        # rather than being silently swallowed.
+        log.warning("attestation emit failed: %s — run not signed", e)
+        return
+    log.info("wrote attestation: %s", out_path)
 
 
 def _pending_pairs(

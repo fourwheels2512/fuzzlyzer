@@ -33,17 +33,25 @@ from typing import Any
 
 import typer
 
-from fuzzeval.judge import SingleJudge
+from fuzzeval.keys import (
+    KeyAlreadyExistsError,
+    KeyNotFoundError,
+    default_dev_priv_path,
+    default_dev_pub_path,
+    generate_dev_keys,
+    load_public_key,
+)
 
 from topofuzz import __version__
-from topofuzz.loaders import load_eval_rows, load_topology
-from topofuzz.orchestrator import RunPlan, execute_run, write_manifest
-from topofuzz.runids import new_run_id
-from topofuzz.variants.generators import (
-    decoding_param_swap,
-    order_swap,
-    role_swap,
-)
+from topofuzz.attest import load_and_verify_attestation
+
+# Heavy imports (orchestrator, loaders, fuzzeval.judge, topofuzz.runids,
+# topofuzz.variants) are lazy — pulled inside :func:`run` and the kickoff
+# helpers only. BLUEPRINT_v5plus.md §11a calls out verify-only installs
+# (``pip install topofuzz[verify]``, no langgraph / LLM SDKs); the
+# ``topofuzz verify`` and ``topofuzz keygen`` codepaths must NOT
+# transitively pull the run-time stack. Step 10b ships an import-guard
+# test that asserts this.
 
 # Reserved flag namespace per BLUEPRINT_v5plus.md §16 #2. The CLI must
 # refuse these now so user habits do not form around squatting on a
@@ -132,6 +140,11 @@ def _round_robin_select(
 _RESERVED_FLAG_EXIT = 2
 _NOT_IMPLEMENTED_EXIT = 2
 _BAD_USAGE_EXIT = 2
+# `topofuzz verify` returns 1 on signature/JCS/digest failure per
+# BLUEPRINT_v5plus.md §15 DoD line 436 ("Tampering with one byte of the
+# payload returns exit 1"). Distinct from _BAD_USAGE_EXIT (=2) so CI
+# scripts can tell a tampered bundle apart from a missing one.
+_VERIFY_FAIL_EXIT = 1
 # §A error-taxonomy exit codes (BLUEPRINT lines 634-643). Step 6 wired
 # the codes observable then (cost cap, SIGINT, unsupported graph). Step 9
 # adds the 0/1/2 success/degraded/failed split — the metrics layer
@@ -329,6 +342,22 @@ def run(
 
     The cost estimator runs first (§12 contract). Confirm to proceed.
     """
+    # Lazy imports of the runtime stack (orchestrator + loaders +
+    # variant generators + judge). Keeping these out of module scope
+    # is the §11a "verify-path-safe" contract: ``topofuzz verify``
+    # and ``topofuzz keygen`` must NOT pull langgraph / LLM SDKs at
+    # import time. Step 10b ships the regression-guard test.
+    from fuzzeval.judge import SingleJudge
+
+    from topofuzz.loaders import load_eval_rows, load_topology
+    from topofuzz.orchestrator import RunPlan, write_manifest
+    from topofuzz.runids import new_run_id
+    from topofuzz.variants.generators import (
+        decoding_param_swap,
+        order_swap,
+        role_swap,
+    )
+
     # Reserved-flag + unknown-flag enforcement. Order matters: reserved
     # gets its specific message, then any remaining tokens are unknown.
     _reject_reserved_flags(list(ctx.args))
@@ -607,6 +636,10 @@ def _run_with_signal_handling(plan: RunPlan, *, judge: SingleJudge | None = None
     ``prompt_hash`` slot keys on the rendered prompt rather than the
     full eval_row (step-5 stopgap).
     """
+    # Lazy import of the orchestrator (mirrors the lazy-import policy
+    # in :func:`run` — see comment there about §11a verify-path safety).
+    from topofuzz.orchestrator import execute_run
+
     loop_cancel = asyncio.Event()
 
     def _signal_handler(sig: int, frame: Any) -> None:
@@ -654,15 +687,202 @@ def report(ctx: typer.Context, run_dir: str) -> None:
 
 @app.command(
     context_settings={
+        # The reserved-flag policy applies to every subcommand, so verify
+        # opts into the same context-settings even though it declares its
+        # own --bundle / --pubkey options below. Click parses the declared
+        # options first; any leftover unknown flags reach _reject_*.
         "ignore_unknown_options": True,
         "allow_extra_args": True,
     }
 )
-def verify(ctx: typer.Context, run_dir: str) -> None:
-    """Verify DSSE signature on a run's report. (Not yet implemented.)"""
+def verify(
+    ctx: typer.Context,
+    run_dir: str = typer.Argument(
+        ...,
+        help=(
+            "Run directory containing attestation.json + manifest.json. "
+            "Pass '-' as run_dir when also using --bundle."
+        ),
+    ),
+    bundle: Path | None = typer.Option(
+        None,
+        "--bundle",
+        help=(
+            "Path to a standalone attestation.json bundle. When given, "
+            "OVERRIDES run_dir entirely: run_dir is ignored, and the "
+            "file-vs-envelope checks (manifest_match, run_sqlite_sha256_match) "
+            "are skipped. Useful for verify-from-stdin CI pipelines and "
+            "public-key-only verification."
+        ),
+    ),
+    pubkey: Path | None = typer.Option(
+        None,
+        "--pubkey",
+        help=(
+            "Path to the Ed25519 public key PEM. Defaults to "
+            "~/.topofuzz/dev.pub.pem (the local dev key)."
+        ),
+    ),
+) -> None:
+    """Verify the DSSE attestation on a topofuzz run.
+
+    Exit codes:
+
+    * 0 — PASS: signature verified, JCS round-trip stable, manifest +
+      run.sqlite digests match (when applicable). Banner shows ``[DEV-KEY]``.
+    * 1 — FAIL: signature mismatch, decode error, JCS round-trip
+      mismatch, missing / drifted on-disk files, or attestation bundle
+      not discoverable.
+    * 2 — usage error (missing pubkey, run_dir is not a directory).
+    """
     _reject_reserved_flags(list(ctx.args))
     _reject_unknown_extras(list(ctx.args))
-    _not_yet("verify", "Weekend 3 step 10a")
+
+    pubkey_path = pubkey if pubkey is not None else default_dev_pub_path()
+    try:
+        pub_key = load_public_key(pubkey_path)
+    except KeyNotFoundError as e:
+        typer.echo(f"topofuzz verify: {e}", err=True)
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+    except ValueError as e:
+        typer.echo(f"topofuzz verify: {e}", err=True)
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+
+    # Serialize the public key back to PEM bytes; the verify helper
+    # accepts PEM (not the cryptography object) so the SECURITY.md
+    # reference verifier and `topofuzz verify` share one interface.
+    from cryptography.hazmat.primitives import serialization
+
+    pub_pem = pub_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+    # --bundle and run_dir are mutually exclusive in v0.5: passing
+    # both would silently skip the file-vs-envelope checks against
+    # the run_dir's manifest+sqlite, which is a footgun (user thinks
+    # they're verifying the run, actually only verifying the bundle).
+    # The '-' sentinel for run_dir is the explicit "I know there's no
+    # run_dir to bind to" opt-in. Pass-2 MAJOR-1 fix.
+    resolved_run_dir: Path | None
+    if bundle is not None:
+        if run_dir != "-":
+            typer.echo(
+                "topofuzz verify: --bundle is incompatible with a concrete "
+                "run_dir (file-vs-envelope checks would be silently "
+                "skipped). Pass '-' as run_dir, or drop --bundle.",
+                err=True,
+            )
+            raise typer.Exit(code=_BAD_USAGE_EXIT)
+        resolved_run_dir = None
+    else:
+        if run_dir == "-":
+            typer.echo(
+                "topofuzz verify: run_dir='-' requires --bundle <path>",
+                err=True,
+            )
+            raise typer.Exit(code=_BAD_USAGE_EXIT)
+        resolved_run_dir = Path(run_dir)
+        if not resolved_run_dir.is_dir():
+            typer.echo(
+                f"topofuzz verify: run_dir is not a directory: {run_dir}",
+                err=True,
+            )
+            raise typer.Exit(code=_BAD_USAGE_EXIT)
+
+    outcome = load_and_verify_attestation(
+        run_dir=resolved_run_dir,
+        bundle=bundle,
+        public_key_pem=pub_pem,
+    )
+
+    # Render the checklist. PASS/FAIL is the headline; each check's
+    # detail line follows for diagnosis.
+    for name, ok, detail in outcome.checks:
+        prefix = "  ok " if ok else "FAIL"
+        typer.echo(f"{prefix} {name}: {detail}")
+    if outcome.ok:
+        typer.echo(f"PASS {outcome.watermark}")
+        return
+    typer.echo(f"FAIL {outcome.watermark}", err=True)
+    raise typer.Exit(code=_VERIFY_FAIL_EXIT)
+
+
+@app.command(
+    context_settings={
+        # Reserved-flag rejection (§16 #2) is a universal policy across
+        # every subcommand — keygen opts in for the same reason scan /
+        # report / run / verify do: a user typing `topofuzz keygen --kms`
+        # should see the v1.0-reserved message, not a generic "no such
+        # option" from Click.
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+def keygen(
+    ctx: typer.Context,
+    priv_out: Path | None = typer.Option(
+        None,
+        "--priv-out",
+        help="Private key output path (default: ~/.topofuzz/dev.pem).",
+    ),
+    pub_out: Path | None = typer.Option(
+        None,
+        "--pub-out",
+        help="Public key output path (default: ~/.topofuzz/dev.pub.pem).",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help=(
+            "Overwrite existing keys. WARNING: rotating the dev key "
+            "invalidates every prior `topofuzz verify` against runs "
+            "signed with the old key."
+        ),
+    ),
+) -> None:
+    """Generate a fresh Ed25519 dev keypair for signing attestations.
+
+    Without flags, writes ``~/.topofuzz/dev.pem`` (private) and
+    ``~/.topofuzz/dev.pub.pem`` (public). On POSIX the private file is
+    chmod 0o600. On Windows, NTFS ACLs are inherited from the parent
+    directory — see SECURITY.md for the operator checklist.
+    """
+    _reject_reserved_flags(list(ctx.args))
+    _reject_unknown_extras(list(ctx.args))
+    priv_path = priv_out if priv_out is not None else default_dev_priv_path()
+    pub_path = pub_out if pub_out is not None else default_dev_pub_path()
+    try:
+        generate_dev_keys(priv_path, pub_path, force=force)
+    except KeyAlreadyExistsError as e:
+        typer.echo(f"topofuzz keygen: {e}", err=True)
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+    except FileExistsError as e:
+        # Stale `.tmp` from a prior crashed keygen — give a clear,
+        # actionable message instead of a raw traceback.
+        typer.echo(
+            f"topofuzz keygen: stale temp file blocks write: {e}. "
+            f"Remove it and re-run (a previous keygen was interrupted "
+            f"mid-write).",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+    except PermissionError as e:
+        # Windows raises PermissionError (WinError 5) on os.replace
+        # when the destination file is held open by another process.
+        # Pass-2 MAJOR-2 fix: surface a clean, actionable message.
+        typer.echo(
+            f"topofuzz keygen: cannot replace {priv_path} ({e}). "
+            f"Close any process holding the file open and re-run.",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+    typer.echo(f"Wrote private key: {priv_path}")
+    typer.echo(f"Wrote public key:  {pub_path}")
+    typer.echo(
+        "[DEV-KEY] this is a developer-grade key (unencrypted PEM, no KMS). "
+        "See SECURITY.md for the threat model."
+    )
 
 
 def main() -> None:

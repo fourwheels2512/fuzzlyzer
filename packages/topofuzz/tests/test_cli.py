@@ -46,9 +46,8 @@ def test_report_stub_exits_with_friendly_message():
     assert result.exit_code == 2
 
 
-def test_verify_stub_exits_with_friendly_message():
-    result = CliRunner().invoke(app, ["verify", "some-dir"])
-    assert result.exit_code == 2
+# `verify` is no longer a stub — see test_cli_verify_keygen.py for the
+# step-10a tests of the real command.
 
 
 def test_reserved_flags_constant_matches_blueprint_section_16():
@@ -308,7 +307,10 @@ def test_cli_run_end_to_end_with_mocked_orchestrator(tmp_path, monkeypatch):
         kwargs.setdefault("llm_callable", fake_llm)
         return await real_execute_run(plan, **kwargs)
 
-    monkeypatch.setattr(cli_mod, "execute_run", execute_run_with_fake)
+    # Step 10a moved `execute_run` to a lazy import inside `cli.run`
+    # (§11a verify-path safety). Patch at the source module so the
+    # lazy import resolves to the fake.
+    monkeypatch.setattr(orch_mod, "execute_run", execute_run_with_fake)
 
     out_dir = tmp_path / "runs"
     result = CliRunner().invoke(
@@ -477,7 +479,10 @@ def test_run_dry_run_flag_skips_llm_judge(tmp_path, monkeypatch):
         kwargs.setdefault("llm_callable", fake_llm)
         return await real_execute_run(plan, **kwargs)
 
-    monkeypatch.setattr(cli_mod, "execute_run", execute_run_with_fake)
+    # Step 10a moved `execute_run` to a lazy import inside `cli.run`
+    # (§11a verify-path safety). Patch at the source module so the
+    # lazy import resolves to the fake.
+    monkeypatch.setattr(orch_mod, "execute_run", execute_run_with_fake)
 
     out_dir = tmp_path / "runs"
     result = CliRunner().invoke(
@@ -575,7 +580,7 @@ def test_run_dry_run_threads_renderer_into_orchestrator(tmp_path, monkeypatch):
         kwargs.setdefault("llm_callable", fake_llm)
         return await real_execute_run(plan, **kwargs)
 
-    monkeypatch.setattr(cli_mod, "execute_run", capture_execute_run)
+    monkeypatch.setattr(orch_mod, "execute_run", capture_execute_run)
 
     out_dir = tmp_path / "runs"
     result = CliRunner().invoke(
@@ -676,7 +681,10 @@ def test_dry_run_forces_no_cache_at_cli_layer(tmp_path, monkeypatch):
         kwargs.setdefault("llm_callable", fake_llm)
         return await real_execute_run(plan, **kwargs)
 
-    monkeypatch.setattr(cli_mod, "execute_run", execute_run_with_fake)
+    # Step 10a moved `execute_run` to a lazy import inside `cli.run`
+    # (§11a verify-path safety). Patch at the source module so the
+    # lazy import resolves to the fake.
+    monkeypatch.setattr(orch_mod, "execute_run", execute_run_with_fake)
 
     out_dir = tmp_path / "runs"
     cache_dir = tmp_path / "real_cache"
