@@ -1044,3 +1044,334 @@ def test_report_worstcase_section_sentinels_present(tmp_path: Path) -> None:
     assert _WC_SECTION_BEGIN in body
     assert _WC_SECTION_END in body
     assert body.index(_WC_SECTION_BEGIN) < body.index(_WC_SECTION_END)
+
+
+# ---------------------------------------------------------------------------
+# §17 natural-language summary (step 17)
+# ---------------------------------------------------------------------------
+
+
+_SUMMARY_SECTION_BEGIN = "<!-- SUMMARY-SECTION-BEGIN -->"
+_SUMMARY_SECTION_END = "<!-- SUMMARY-SECTION-END -->"
+
+
+def _extract_summary_section(body: str) -> str:
+    """Return the §17 summary section between sentinel HTML comments.
+
+    Same pattern as :func:`_extract_worstcase_section` — scoped assertions
+    keep tests honest even if a future section introduces overlapping
+    copy.
+    """
+    start = body.index(_SUMMARY_SECTION_BEGIN)
+    end = body.index(_SUMMARY_SECTION_END, start + len(_SUMMARY_SECTION_BEGIN))
+    return body[start : end + len(_SUMMARY_SECTION_END)]
+
+
+def _write_report_json(
+    run_dir: Path,
+    *,
+    verdict_flip_rate: dict | None,
+    per_agent_influence: list[dict] | None = None,
+) -> None:
+    """Write a step-15a-shaped ``report.json`` mirror under ``run_dir``.
+
+    Only the fields :func:`_render_summary_panel` reads are populated;
+    other fields (manifest, schema_version, signed_at) are omitted on
+    purpose so the test fails loudly if the reader ever grows a new
+    dependency we forgot to wire.
+    """
+    doc = {
+        "headline": {
+            "verdict_flip_rate": verdict_flip_rate,
+        },
+        "findings": {
+            "per_agent_influence": per_agent_influence or [],
+        },
+    }
+    (run_dir / "report.json").write_text(json.dumps(doc), encoding="utf-8")
+
+
+def test_report_summary_section_sentinels_present(tmp_path: Path) -> None:
+    """The §17 sentinel HTML comments wrap the summary div in every
+    rendered report so a future template refactor that drops them
+    surfaces immediately."""
+    run_dir = _make_run_dir(tmp_path)
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    body = (run_dir / "report.html").read_text(encoding="utf-8")
+    assert _SUMMARY_SECTION_BEGIN in body
+    assert _SUMMARY_SECTION_END in body
+    # And the §17 sentinels precede the §10a sentinels (summary is at top).
+    assert body.index(_SUMMARY_SECTION_BEGIN) < body.index(_WC_SECTION_BEGIN)
+
+
+def test_report_summary_unstable_with_driver(tmp_path: Path) -> None:
+    """A real report.json with high flip rate + a positive-influence row
+    renders the unstable-tier paragraph naming the driver."""
+    run_dir = _make_run_dir(tmp_path)
+    _write_report_json(
+        run_dir,
+        verdict_flip_rate={
+            "point": 0.31, "ci_lower": 0.24, "ci_upper": 0.38,
+            "degenerate_flag": False,
+        },
+        per_agent_influence=[
+            {"node_id": "risk", "influence": 0.67,
+             "ci_lower": 0.55, "ci_upper": 0.78,
+             "degenerate": False, "degenerate_reason": None},
+            {"node_id": "intake", "influence": 0.10,
+             "ci_lower": 0.05, "ci_upper": 0.15,
+             "degenerate": False, "degenerate_reason": None},
+        ],
+    )
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_summary_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    assert "<strong>unstable</strong>" in section
+    assert "nls-unstable" in section
+    assert "<code>risk</code>" in section
+    assert "31% of answers flipped" in section
+    assert "pin its position or add a verification step downstream" in section
+
+
+def test_report_summary_stable_no_action(tmp_path: Path) -> None:
+    """Low flip rate renders the stable tier and no recommendation."""
+    run_dir = _make_run_dir(tmp_path)
+    _write_report_json(
+        run_dir,
+        verdict_flip_rate={
+            "point": 0.02, "ci_lower": 0.00, "ci_upper": 0.04,
+            "degenerate_flag": False,
+        },
+        per_agent_influence=[
+            {"node_id": "risk", "influence": 0.08,
+             "ci_lower": 0.05, "ci_upper": 0.12,
+             "degenerate": False, "degenerate_reason": None},
+        ],
+    )
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_summary_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    assert "<strong>stable</strong>" in section
+    assert "nls-stable" in section
+    assert "No action recommended" in section
+    assert "pin its position or add a verification step downstream" not in section
+
+
+def test_report_summary_unavailable_without_report_json(tmp_path: Path) -> None:
+    """When ``report.json`` is missing, the section degrades to the
+    'unavailable' placeholder and the rest of the report renders fine."""
+    run_dir = _make_run_dir(tmp_path)
+    assert not (run_dir / "report.json").exists()
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    body = (run_dir / "report.html").read_text(encoding="utf-8")
+    section = _extract_summary_section(body)
+    assert "nls-unavailable" in section
+    # Sanity: rest of the report still rendered.
+    assert "<title>topofuzz report" in body
+    assert "Worst-case viewer" in body
+
+
+def test_report_summary_unavailable_with_malformed_report_json(
+    tmp_path: Path,
+) -> None:
+    """Garbage in ``report.json`` degrades to 'unavailable' without crash."""
+    run_dir = _make_run_dir(tmp_path)
+    (run_dir / "report.json").write_text("{ not valid json", encoding="utf-8")
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_summary_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    assert "nls-unavailable" in section
+
+
+def test_report_summary_escapes_malicious_node_id(tmp_path: Path) -> None:
+    """A node_id containing HTML metacharacters in report.json is
+    HTML-escaped, never injected. Defence in depth — the IR restricts
+    node_id syntax, but this boundary is load-bearing for the report."""
+    run_dir = _make_run_dir(tmp_path)
+    _write_report_json(
+        run_dir,
+        verdict_flip_rate={
+            "point": 0.31, "ci_lower": 0.24, "ci_upper": 0.38,
+            "degenerate_flag": False,
+        },
+        per_agent_influence=[
+            {"node_id": "</div><script>alert(1)</script>",
+             "influence": 0.67,
+             "ci_lower": 0.55, "ci_upper": 0.78,
+             "degenerate": False, "degenerate_reason": None},
+        ],
+    )
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_summary_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    assert "<script>alert(1)</script>" not in section
+    assert "&lt;script&gt;" in section
+
+
+def test_report_summary_unstable_no_driver(tmp_path: Path) -> None:
+    """Unstable verdict but every influence row is degenerate → fallback
+    wording, no recommendation."""
+    run_dir = _make_run_dir(tmp_path)
+    _write_report_json(
+        run_dir,
+        verdict_flip_rate={
+            "point": 0.31, "ci_lower": 0.24, "ci_upper": 0.38,
+            "degenerate_flag": False,
+        },
+        per_agent_influence=[
+            {"node_id": "a", "influence": None,
+             "ci_lower": None, "ci_upper": None,
+             "degenerate": True, "degenerate_reason": "no moved pairs"},
+        ],
+    )
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_summary_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    assert "<strong>unstable</strong>" in section
+    assert "No single agent" in section
+    assert "pin its position or add a verification step downstream" not in section
+
+
+def test_report_summary_matches_real_attestation_chain(
+    tmp_path: Path,
+) -> None:
+    """Audit pass-1 RT-MINOR-1: cover the full attest → report.json →
+    summary chain on a real multi-agent fixture.
+
+    Without this, the §17 integration tests all hand-craft ``report.json``
+    via ``_write_report_json`` and the contract that "summary's
+    primary_driver matches the highest-influence row in the rendered
+    panel" is enforced only by construction, not by test. A future
+    contributor who switches the summary back to in-process recompute
+    (or who changes the field name on either side) would slip past CI.
+    """
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+    )
+
+    from fuzzeval.attestation import Ed25519Signer
+
+    from topofuzz.attest import emit_run_attestation
+
+    # Same polarised cell layout as
+    # ``test_attestation_findings_per_agent_influence_populated`` — A
+    # dominates outcomes, so the real influence computation produces a
+    # clean ranking with A at top.
+    orderings = [
+        ["A", "B", "C"],
+        ["A", "C", "B"],
+        ["B", "A", "C"],
+        ["B", "C", "A"],
+    ]
+    run_dir = _make_run_dir(
+        tmp_path, n_variants=4, n_evals=3, variant_orderings=orderings,
+    )
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    try:
+        db.execute("DELETE FROM judge_results")
+        cells = [
+            (0, 0.9), (0, 0.85), (0, 0.92),
+            (1, 0.88), (1, 0.91), (1, 0.86),
+            (2, 0.10), (2, 0.05), (2, 0.12),
+            (3, 0.08), (3, 0.11), (3, 0.09),
+        ]
+        eval_ids = [f"eval-{i}" for i in range(3)]
+        for i, (v_idx, score) in enumerate(cells):
+            db.execute(
+                "INSERT INTO judge_results "
+                "(run_id, variant_id, eval_id, judge_kind, score_value, "
+                " passed, rationale, failure_reason) "
+                "VALUES (?, ?, ?, 'continuous', ?, NULL, NULL, NULL)",
+                ("run-test", f"var{v_idx:02d}", eval_ids[i % 3], score),
+            )
+        db.commit()
+    finally:
+        db.close()
+
+    manifest = json.loads(
+        (run_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    signer = Ed25519Signer(Ed25519PrivateKey.generate())
+    emit_run_attestation(
+        run_dir=run_dir,
+        run_id="run-test",
+        manifest=manifest,
+        status="succeeded",
+        successful_cells=12,
+        total_cells=12,
+        n_variants=4,
+        n_evals=3,
+        total_cost_usd=0.0,
+        elapsed_s=0.0,
+        signer=signer,
+    )
+
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+
+    body = (run_dir / "report.html").read_text(encoding="utf-8")
+
+    # Pull the primary driver out of the persisted report.json — this is
+    # what the summary reads — and assert the rendered HTML names it.
+    report_doc = json.loads(
+        (run_dir / "report.json").read_text(encoding="utf-8")
+    )
+    rows = report_doc["findings"]["per_agent_influence"]
+    usable = [
+        r for r in rows
+        if not r.get("degenerate") and r.get("influence") is not None
+        and r.get("influence") > 0
+    ]
+    assert usable, "fixture is supposed to produce >=1 usable driver row"
+    top = max(usable, key=lambda r: r["influence"])
+
+    section = _extract_summary_section(body)
+    assert f"<code>{top['node_id']}</code>" in section, (
+        f"summary should name the highest-influence agent "
+        f"({top['node_id']!r}); got section:\n{section!r}"
+    )
+    # And the same agent appears in the §6a influence table further down.
+    # The table renders rows with the raw node_id; this is the "panel and
+    # summary do not drift" contract.
+    assert top["node_id"] in body
+
+
+def test_report_summary_idempotent_render(tmp_path: Path) -> None:
+    """Rendering the same run_dir twice produces a byte-identical summary
+    section — pins determinism so a future contributor doesn't introduce
+    a timestamp or hash into the rendered text."""
+    run_dir = _make_run_dir(tmp_path)
+    _write_report_json(
+        run_dir,
+        verdict_flip_rate={
+            "point": 0.31, "ci_lower": 0.24, "ci_upper": 0.38,
+            "degenerate_flag": False,
+        },
+        per_agent_influence=[
+            {"node_id": "risk", "influence": 0.67,
+             "ci_lower": 0.55, "ci_upper": 0.78,
+             "degenerate": False, "degenerate_reason": None},
+        ],
+    )
+    runner = CliRunner()
+    runner.invoke(app, ["report", str(run_dir)])
+    first = _extract_summary_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    runner.invoke(app, ["report", str(run_dir)])
+    second = _extract_summary_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    assert first == second

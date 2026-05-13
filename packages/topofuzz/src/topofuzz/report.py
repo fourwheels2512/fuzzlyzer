@@ -160,6 +160,7 @@ def render_report(run_dir: Path) -> Path:
     worstcase_ctx = _render_worstcase_panel(
         matrix, variant_ids, eval_ids_from_db, run_dir, run_id, manifest
     )
+    summary_ctx = _render_summary_panel(run_dir)
 
     # Banner gates. attestation.json presence is the structural check,
     # but we additionally require the file to parse as JSON shaped like
@@ -235,6 +236,7 @@ def render_report(run_dir: Path) -> Path:
         show_degraded=show_degraded,
         matrix_warning=matrix_warning,
         worstcase=worstcase_ctx,
+        summary=summary_ctx,
     )
 
     out_path = run_dir / "report.html"
@@ -860,6 +862,112 @@ def _side_to_dict(side: Any) -> dict[str, Any]:
             }
             for n in side.node_outputs
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Natural-language summary (§17)
+# ---------------------------------------------------------------------------
+
+
+def _render_summary_panel(run_dir: Path) -> dict[str, Any]:
+    """Build the §17 natural-language summary Jinja context.
+
+    Sources both ``headline.verdict_flip_rate`` and
+    ``findings.per_agent_influence`` from ``<run_dir>/report.json`` —
+    the plain-JSON mirror persisted by step 15a, which is in turn the
+    plain mirror of the signed attestation. Reading the persisted
+    artifact (rather than recomputing) means the rendered summary
+    matches what was signed and what downstream consumers reading
+    ``report.json`` will see. A pre-step-15a run (no ``report.json``)
+    degrades cleanly to the ``unavailable`` placeholder.
+
+    On any exception we degrade to a placeholder context with
+    ``verdict_word="unavailable"`` so the rest of the report renders.
+    The summary section is best-effort, not load-bearing.
+    """
+    try:
+        from topofuzz.summary import render_summary
+    except ImportError as e:
+        _log.warning(
+            "report: summary module unavailable (%s) — section disabled",
+            e,
+        )
+        return {
+            "verdict_word": "unavailable",
+            "summary_text": (
+                "Topology stability summary unavailable "
+                "(topofuzz.summary module not importable)."
+            ),
+            "summary_html": (
+                "Topology stability summary unavailable "
+                "(topofuzz.summary module not importable)."
+            ),
+        }
+
+    report_json_path = run_dir / "report.json"
+    verdict_flip_rate: dict[str, Any] | None = None
+    per_agent_influence: list[dict[str, Any]] | None = None
+    if report_json_path.is_file():
+        try:
+            raw = report_json_path.read_text(encoding="utf-8")
+            doc = json.loads(raw)
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            _log.warning(
+                "report: report.json unreadable (%s) — summary degrades to "
+                "unavailable (run_dir=%s)",
+                type(e).__name__, run_dir,
+            )
+            doc = None
+        if isinstance(doc, dict):
+            headline = doc.get("headline")
+            if isinstance(headline, dict):
+                vf = headline.get("verdict_flip_rate")
+                if isinstance(vf, dict):
+                    verdict_flip_rate = vf
+            findings = doc.get("findings")
+            if isinstance(findings, dict):
+                rows = findings.get("per_agent_influence")
+                if isinstance(rows, list):
+                    per_agent_influence = rows
+
+    try:
+        ctx = render_summary(verdict_flip_rate, per_agent_influence)
+    except (
+        ValueError, TypeError, ArithmeticError, AttributeError,
+    ) as e:
+        # Narrowed catch-list mirroring step 16's _render_worstcase_panel
+        # audit pass-2 RT-MAJOR-4: ``MemoryError`` / ``RecursionError`` /
+        # ``KeyboardInterrupt`` / ``SystemExit`` must propagate. The
+        # realistic failure modes of pure-stdlib text formatting are
+        # arithmetic (overflow / NaN format), type confusion, attribute
+        # errors on a malformed input row, and value errors from format
+        # string mismatches. Exception type only (no repr) keeps PII
+        # out of operator logs (audit pass-2 RT log-leak discipline).
+        _log.warning(
+            "report: summary render raised %s — section disabled "
+            "(run_dir=%s)",
+            type(e).__name__, run_dir,
+        )
+        return {
+            "verdict_word": "unavailable",
+            "summary_text": (
+                "Topology stability summary unavailable "
+                "(internal render error)."
+            ),
+            "summary_html": (
+                "Topology stability summary unavailable "
+                "(internal render error)."
+            ),
+        }
+
+    return {
+        "verdict_word": ctx.verdict_word,
+        "verdict_flip_rate": ctx.verdict_flip_rate,
+        "primary_driver": ctx.primary_driver,
+        "primary_influence": ctx.primary_influence,
+        "summary_text": ctx.summary_text,
+        "summary_html": ctx.summary_html,
     }
 
 

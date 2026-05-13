@@ -108,10 +108,33 @@
   svg { max-width: 100%; height: auto; }
   ul.evals { columns: 3; font-size: .85rem; color: #555; }
   footer { margin-top: 2rem; color: #777; font-size: .8rem; border-top: 1px solid #ddd; padding-top: .5rem; }
+  .natural-language-summary {
+    margin: .75rem 0 1rem 0;
+    padding: .6rem .8rem;
+    border-radius: 4px;
+    font-size: .92rem;
+    line-height: 1.5;
+  }
+  .nls-stable { background: #e0f5e0; border-left: 4px solid #3da06e; color: #1f5f3a; }
+  .nls-unstable { background: #ffe7d6; border-left: 4px solid #c46a2e; color: #7a3f1f; }
+  .nls-unavailable { background: #f0f0f0; border-left: 4px solid #999; color: #555; }
+  .natural-language-summary code {
+    background: rgba(0,0,0,.06);
+    padding: 0 .25rem;
+    border-radius: 2px;
+    font-size: .9em;
+  }
 </style>
 </head>
 <body>
 <h1>topofuzz run — {{ run_id }}</h1>
+<!-- SUMMARY-SECTION-BEGIN -->
+{% if summary and summary.summary_html %}
+<div class="natural-language-summary nls-{{ summary.verdict_word }}">
+{{ summary.summary_html | safe }}
+</div>
+{% endif %}
+<!-- SUMMARY-SECTION-END -->
 <div class="banners">
   {% if show_dev_key %}<span class="banner banner-dev-key">[DEV-KEY]</span>{% endif %}
   {% if show_jury %}<span class="banner banner-jury">[JURY]</span>{% endif %}
