@@ -139,7 +139,10 @@ _BAD_USAGE_EXIT = 2
 # ``runs`` row + ``RunResult``; we just translate to ``typer.Exit``.
 _COST_CAP_EXIT = 3
 _UNSUPPORTED_GRAPH_EXIT = 64
-_INTERRUPTED_EXIT = 130
+# 130 (POSIX SIGINT exit) is emitted by :class:`topofuzz.orchestrator.RunResult`
+# via ``metrics_exit_code`` when ``cancel_event`` was set without a cap-trip.
+# No CLI-side constant — the value flows through ``result.metrics_exit_code``
+# and reaches ``typer.Exit`` at the bottom of :func:`run`.
 
 app = typer.Typer(
     name="topofuzz",
