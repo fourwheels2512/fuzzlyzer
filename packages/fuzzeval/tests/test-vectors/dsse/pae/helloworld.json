@@ -1,0 +1,8 @@
+{
+  "name": "helloworld",
+  "source": "official",
+  "spec_reference": "https://github.com/secure-systems-lab/dsse/blob/v1.0.0/protocol.md#test-vectors",
+  "payload_type": "http://example.com/HelloWorld",
+  "payload_b64": "aGVsbG8gd29ybGQ=",
+  "expected_pae_b64": "RFNTRXYxIDI5IGh0dHA6Ly9leGFtcGxlLmNvbS9IZWxsb1dvcmxkIDExIGhlbGxvIHdvcmxk"
+}

@@ -1,0 +1,8 @@
+{
+  "name": "utf8_payload_type",
+  "source": "derived",
+  "spec_reference": "DSSE v1.0 protocol.md §4 formula; payload_type is 7 bytes UTF-8 ('ä' is 2 bytes + '+json' is 5 bytes), demonstrating type-len is byte-count",
+  "payload_type": "ä+json",
+  "payload_b64": "eA==",
+  "expected_pae_b64": "RFNTRXYxIDcgw6QranNvbiAxIHg="
+}

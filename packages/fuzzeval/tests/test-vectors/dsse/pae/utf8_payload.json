@@ -1,0 +1,8 @@
+{
+  "name": "utf8_payload",
+  "source": "derived",
+  "spec_reference": "DSSE v1.0 protocol.md §4 formula; payload is 10 bytes UTF-8 (héllo + SP + 漢), demonstrating len is byte-count not codepoint-count",
+  "payload_type": "application/vnd.test+json",
+  "payload_b64": "aMOpbGxvIOa8og==",
+  "expected_pae_b64": "RFNTRXYxIDI1IGFwcGxpY2F0aW9uL3ZuZC50ZXN0K2pzb24gMTAgaMOpbGxvIOa8og=="
+}

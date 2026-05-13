@@ -1,0 +1,8 @@
+{
+  "name": "empty_payload",
+  "source": "derived",
+  "spec_reference": "DSSE v1.0 protocol.md §4 formula applied with len(payload)=0",
+  "payload_type": "application/vnd.test+json",
+  "payload_b64": "",
+  "expected_pae_b64": "RFNTRXYxIDI1IGFwcGxpY2F0aW9uL3ZuZC50ZXN0K2pzb24gMCA="
+}
