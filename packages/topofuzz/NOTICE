@@ -1,0 +1,23 @@
+topofuzz
+Copyright 2026 Kiran Nayudu
+
+This product is licensed under the Apache License, Version 2.0. See LICENSE
+for the full text.
+
+Acknowledgments
+---------------
+
+- DSSE (Dead Simple Signing Envelope) specification v1.0.0, secure-systems-lab,
+  Linux Foundation. https://github.com/secure-systems-lab/dsse
+  The PAE (Pre-Authentication Encoding) implementation and conformance test
+  vectors in packages/fuzzeval/tests/test-vectors/dsse/ derive from the
+  upstream reference; see that directory's README for commit-pinned provenance.
+
+- Sigstore Rekor transparency-log JSON schema reference (dsse v0.0.1 entry
+  type). https://github.com/sigstore/rekor
+  The topofuzz/rekor.py client is a clean-room urllib implementation against
+  the public schema; no code is copied from sigstore-python.
+
+This project is independent of and not endorsed by the Linux Foundation,
+Sigstore, Anthropic, OpenAI, Google, or any other third party referenced in
+its source code or documentation.

@@ -1,0 +1,26 @@
+fuzzeval
+Copyright 2026 Kiran Nayudu
+
+This product is licensed under the Apache License, Version 2.0. See LICENSE
+for the full text.
+
+Acknowledgments
+---------------
+
+- DSSE (Dead Simple Signing Envelope) specification v1.0.0, secure-systems-lab,
+  Linux Foundation. https://github.com/secure-systems-lab/dsse
+  The PAE implementation in fuzzeval/attestation.py is a clean-room
+  implementation of the published spec formula. Conformance test vectors in
+  tests/test-vectors/dsse/ are taken verbatim from the upstream repository
+  with commit-pinned provenance documented in that directory's README.
+
+- Inverse-normal CDF algorithm: P. J. Acklam, "An algorithm for computing
+  the inverse normal cumulative distribution function" (2010).
+  https://web.archive.org/web/20150910044639/http://home.online.no/~pjacklam/notes/invnorm/
+  The coefficient constants in fuzzeval/stats.py are from this algorithm
+  (published numerical constants; not copyrightable but credited as best
+  practice).
+
+This project is independent of and not endorsed by the Linux Foundation,
+Sigstore, or any other third party referenced in its source code or
+documentation.

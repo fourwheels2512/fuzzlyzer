@@ -6,7 +6,7 @@ version = "0.5.0rc1"
 description = "Topology Safety Fuzzer for multi-agent LLM systems"
 readme = "README.md"
 license = { text = "Apache-2.0" }
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.11"
 authors = [{ name = "Kiran Nayudu" }]
 keywords = ["langgraph", "llm", "evaluation", "multi-agent", "topology", "fuzzing"]

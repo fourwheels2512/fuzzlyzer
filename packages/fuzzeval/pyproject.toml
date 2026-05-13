@@ -7,7 +7,7 @@ version = "0.1.0"
 description = "Shared eval infrastructure for topofuzz and other multi-agent eval tools"
 readme = "README.md"
 license = { text = "Apache-2.0" }
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.11"
 authors = [{ name = "Kiran Nayudu" }]
 keywords = ["llm", "evaluation", "dsse", "attestation", "judge", "statistics"]
