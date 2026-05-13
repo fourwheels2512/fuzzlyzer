@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 # §7 cache-key producer contract — pin one place so step-5+ runners
 # cannot drift. Every field consumed below is sourced as follows:
 #
+# LLMCache identity (5 fields + tenant_id from constructor):
 #   ir_canonical_hash       ← Topology.canonical_hash()
 #   node_id                 ← Node.id (str)
 #   llm_config_hash         ← LLMConfig.canonical_hash()
@@ -38,11 +39,40 @@ if TYPE_CHECKING:
 #                              — exact bytes the runner sent to the LLM,
 #                                AFTER variable substitution. attempt_id
 #                                is intentionally OUT (retries reuse).
-#   model_served_version    ← response.model from the LiteLLM response
-#                              (NOT request.model — Anthropic/LiteLLM
-#                              aliases route requests but the served
-#                              model id is what callers should key on).
-#   tenant_id               ← LLMCache(tenant_id="local") for v0.5.
+#   model_served_version    ← Spec text says response.model (the actual
+#                              served id, NOT request.model — providers
+#                              alias-route). v0.5 deviation: the runner
+#                              keys on a caller-supplied resolver's
+#                              prediction so the cache can be looked up
+#                              BEFORE calling. Default resolver is
+#                              identity (correct for non-aliasing
+#                              providers like Gemini direct). Anthropic /
+#                              multi-region OpenAI users MUST inject a
+#                              resolver that returns the served id, OR
+#                              accept that the cache key is the request
+#                              id (consistent across runs but technically
+#                              §7-deviating). See
+#                              ``topofuzz.runner`` module docstring,
+#                              "Cache served-version contract".
+#   tenant_id               ← LLMCache(tenant_id="local") constructor arg
+#                              for v0.5. Per-call tenant overrides are
+#                              NOT supported; supply the right cache.
+#
+# JudgeCache identity (4 fields + tenant_id):
+#   rubric_hash             ← caller-supplied; v0.5 callers compute once
+#                              from the rubric template at run start.
+#   prompt_hash             ← v0.5: canonical_hash(<full eval_row>).
+#                              The slot retains the §7 spec name but
+#                              v0.5's producer hashes the full eval row
+#                              (JCS-canonical) so multi-key rows that
+#                              differ in `expected_answer` / `category`
+#                              don't collide on the cached judgement.
+#                              Step 7 will refine to a hash of the
+#                              rendered judge-prompt text once the
+#                              rubric template is concrete.
+#   response_hash           ← canonical_hash(<final_agent_output_str>)
+#   judge_model_version     ← caller-supplied (e.g.
+#                              "google/gemini-2.5-pro@2026-04").
 #
 # `attempt_id` is omitted so retries do not re-bill. See BLUEPRINT §7.
 #
@@ -140,8 +170,10 @@ class LLMCache:
 class JudgeCache:
     """Cache for judge scores (ContinuousScore | BinaryScore).
 
-    Identity dict per BLUEPRINT §7 includes:
+    Identity dict per BLUEPRINT §7 (see contract block above for v0.5
+    semantics of each slot):
         rubric_hash, prompt_hash, response_hash, judge_model_version
+
     Separate from LLMCache so rubric changes don't invalidate agent rollouts.
     """
 
