@@ -1,0 +1,21 @@
+{
+  "cli_args": {},
+  "eval_ids": [
+    "fixture-eval-0"
+  ],
+  "judge_model": "google/gemini-2.5-pro",
+  "kickoff_ts": 1700000000.0,
+  "max_cost_usd": null,
+  "n_eval_rows": 1,
+  "n_variants": 1,
+  "rubric_hash": "fixture-rubric-hash",
+  "run_id": "fixture-v0.5",
+  "semaphore_size": 8,
+  "tds_version": "0.5.0",
+  "tenant_id": "local",
+  "topology_canonical_hash": "fixture-topo-hash",
+  "topology_name": "lending_4role",
+  "variant_canonical_hashes": [
+    "fixture-variant-hash"
+  ]
+}
