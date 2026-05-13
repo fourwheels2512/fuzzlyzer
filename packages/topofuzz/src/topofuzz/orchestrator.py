@@ -172,6 +172,7 @@ def write_manifest(plan: RunPlan, *, cli_args: dict[str, Any]) -> Path:
         "topology_canonical_hash": plan.topology.canonical_hash(),
         "topology_name": plan.topology.name,
         "tds_version": plan.topology.tds_version,
+        "tenant_id": "local",  # §16 #4 forward-compat placeholder
         "n_variants": len(plan.variants),
         "n_eval_rows": len(plan.eval_rows),
         "variant_canonical_hashes": [
@@ -476,6 +477,21 @@ async def execute_run(
                     await drain_task
                 except Exception:  # noqa: BLE001
                     _log.exception("RunWriter drain task failed on empty plan")
+
+            # Stamp end-of-run state on the runs row per §A error
+            # taxonomy. Status here is the coarse exit-code prerequisite:
+            # 'cost_cap_hit' if the cap tripped (CLI maps to exit 3),
+            # 'succeeded' otherwise. The 'degraded'/'failed' branches
+            # (cell error-rate thresholds) land with step 9 metrics; for
+            # now any non-cap completion is 'succeeded' regardless of
+            # individual cell errors.
+            writer.finalize(
+                status="cost_cap_hit" if cost_state["cap_tripped"] else "succeeded",
+                cost_actual_usd=cost_state["total_cost_usd"],
+                n_variants=len(plan.variants),
+                n_evals=len(plan.eval_rows),
+                judge_protocol="single" if judge is not None else None,
+            )
     finally:
         if llm_cache is not None:
             llm_cache.close()

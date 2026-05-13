@@ -132,9 +132,11 @@ def test_run_friendly_error_on_missing_eval(tmp_path):
             "--yes",
         ],
     )
-    assert result.exit_code == 2
-    # Either the fixture loader complains (graph = None isn't a graph)
-    # or the eval loader does. The point is a clean exit, not a stack trace.
+    # Either the fixture loader complains (graph = None → adapter raises
+    # NotImplementedError → exit 64 per §A error taxonomy) or the eval
+    # loader does (missing file → exit 2). The point is a clean exit,
+    # not a stack trace.
+    assert result.exit_code in (2, 64)
     assert "topofuzz:" in result.output.lower()
 
 

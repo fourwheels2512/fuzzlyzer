@@ -132,6 +132,12 @@ def _round_robin_select(
 _RESERVED_FLAG_EXIT = 2
 _NOT_IMPLEMENTED_EXIT = 2
 _BAD_USAGE_EXIT = 2
+# §A error-taxonomy exit codes (BLUEPRINT lines 634-643). Step 6 wires
+# the codes observable today (cost cap, SIGINT, unsupported graph); the
+# 0/1/2 success/degraded/failed split lands with step 9 metrics.
+_COST_CAP_EXIT = 3
+_UNSUPPORTED_GRAPH_EXIT = 64
+_INTERRUPTED_EXIT = 130
 
 app = typer.Typer(
     name="topofuzz",
@@ -203,9 +209,20 @@ def _not_yet(command: str, lands: str) -> None:
     raise typer.Exit(code=_NOT_IMPLEMENTED_EXIT)
 
 
-@app.command()
-def scan(fixture: str) -> None:
+@app.command(
+    context_settings={
+        # Reserved-flag rejection (§16 #2) is a global policy. The stub
+        # opts into the same context-settings as ``run`` so a user
+        # typing ``topofuzz scan --sandbox foo`` gets the v1.0-reserved
+        # message instead of a "no such option" from Click.
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+def scan(ctx: typer.Context, fixture: str) -> None:
     """Static risk badge for a LangGraph topology. (Not yet implemented.)"""
+    _reject_reserved_flags(list(ctx.args))
+    _reject_unknown_extras(list(ctx.args))
     _not_yet("scan", "Weekend 5 step 14")
 
 
@@ -322,12 +339,17 @@ def run(
 
     try:
         topology = load_topology(fixture)
+    except NotImplementedError as e:
+        # §A: adapter saw a graph construct it can't translate. Exit 64
+        # so CI can distinguish "your fixture uses an unsupported
+        # langgraph feature" from generic bad-usage.
+        typer.echo(f"topofuzz: unsupported graph construct: {e}", err=True)
+        raise typer.Exit(code=_UNSUPPORTED_GRAPH_EXIT) from e
     except (
         FileNotFoundError,
         ValueError,
         AttributeError,
         TypeError,
-        NotImplementedError,
     ) as e:
         typer.echo(f"topofuzz: failed to load fixture: {e}", err=True)
         raise typer.Exit(code=_BAD_USAGE_EXIT) from e
@@ -470,6 +492,16 @@ def run(
         )
     typer.echo(f"Elapsed: {result.elapsed_s:.2f}s")
 
+    # §A error-taxonomy exit codes (BLUEPRINT lines 634-643). Cost-cap
+    # exits 3 so CI can distinguish a budget-tripped run from success.
+    # The 'degraded' / 'failed' branches (cell error-rate thresholds)
+    # land with step 9 metrics. SIGINT (130) is best-effort: Python's
+    # default behaviour exits ~130 on Unix on second-Ctrl-C, and the
+    # first-Ctrl-C cancel path returns a partial RunResult that we
+    # report as cap-tripped-like below.
+    if result.cap_tripped:
+        raise typer.Exit(code=_COST_CAP_EXIT)
+
 
 def _preflight_cost(
     plan: RunPlan,
@@ -601,15 +633,29 @@ def _run_with_signal_handling(plan: RunPlan, *, judge: SingleJudge | None = None
         signal.signal(signal.SIGINT, previous)
 
 
-@app.command()
-def report(run_dir: str) -> None:
+@app.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+def report(ctx: typer.Context, run_dir: str) -> None:
     """Open the HTML report for a run. (Not yet implemented.)"""
+    _reject_reserved_flags(list(ctx.args))
+    _reject_unknown_extras(list(ctx.args))
     _not_yet("report", "Weekend 3 step 11")
 
 
-@app.command()
-def verify(run_dir: str) -> None:
+@app.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+def verify(ctx: typer.Context, run_dir: str) -> None:
     """Verify DSSE signature on a run's report. (Not yet implemented.)"""
+    _reject_reserved_flags(list(ctx.args))
+    _reject_unknown_extras(list(ctx.args))
     _not_yet("verify", "Weekend 3 step 10a")
 
 

@@ -663,9 +663,14 @@ async def _run_judge(
     else:
         prompt_hash = _eval_row_hash(eval_row)
 
+    # ``prompt_hash_producer`` discriminates the two prompt-hash producers
+    # (renderer vs. step-5 eval_row fallback) so they cannot share a row in
+    # the same judge cache directory. Mixing them silently splits the cache
+    # (audit: BLUEPRINT polish M4); the discriminator is part of identity.
     judge_identity = {
         "rubric_hash": rubric_hash,
         "prompt_hash": prompt_hash,
+        "prompt_hash_producer": "rendered" if judge_prompt_renderer else "eval_row",
         "response_hash": canonical_hash(final_output),
         "judge_model_version": judge_model_version,
     }
@@ -707,18 +712,20 @@ async def _run_judge(
 
 
 # Schema version bumps require a migration path. v0.5.0 step 5 = 1.
-# Step 6 = 2 (cost telemetry: cells.cell_cost_usd). Any column add or
-# rename must increment and either (a) ship a migration in `topofuzz
-# migrate`, or (b) inline a one-shot ALTER in :func:`_migrate` for a
-# small step bump pre-launch. The full migrate command is tracked as a
-# step-6 readiness gap; pre-launch we ALTER inline.
+# Step 6 = 2 (cost telemetry: cells.cell_cost_usd). Step 8 polish = 3
+# (full §A runs schema: status, finished_at, n_variants, n_evals,
+# judge_protocol, cost_actual_usd, tenant_id). Any column add or rename
+# must increment and either (a) ship a migration in `topofuzz migrate`,
+# or (b) inline a one-shot ALTER in :func:`_migrate` for a small step
+# bump pre-launch. The full migrate command is tracked as a step-6
+# readiness gap; pre-launch we ALTER inline.
 #
 # Schema DDL deliberately omits ``PRAGMA user_version``. The PRAGMA is
 # written by :func:`_migrate` after CREATE/ALTER finishes, so the
 # pre-existing user_version (0 for fresh DBs, 1 for legacy step-5 DBs,
 # 99+ for a hypothetical future DB) is observable when migrate decides
 # whether to ALTER or refuse.
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -726,7 +733,14 @@ CREATE TABLE IF NOT EXISTS runs (
     topology_canonical_hash TEXT NOT NULL,
     topology_name TEXT NOT NULL,
     tds_version TEXT NOT NULL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    finished_at REAL,
+    n_variants INTEGER,
+    n_evals INTEGER,
+    judge_protocol TEXT,
+    cost_actual_usd REAL,
+    tenant_id TEXT NOT NULL DEFAULT 'local'
 );
 CREATE TABLE IF NOT EXISTS cells (
     run_id TEXT NOT NULL,
@@ -784,12 +798,41 @@ def _migrate(db: sqlite3.Connection) -> None:
     # before CREATE TABLE ran; assert defends against caller drift.
     assert current <= _SCHEMA_VERSION, "forward-version slipped past check"
     if current < 2:
-        cols = {
+        cells_cols = {
             row[1]
             for row in db.execute("PRAGMA table_info(cells)").fetchall()
         }
-        if "cell_cost_usd" not in cols:
+        if "cell_cost_usd" not in cells_cols:
             db.execute("ALTER TABLE cells ADD COLUMN cell_cost_usd REAL")
+    if current < 3:
+        # v3: full §A runs schema. Each ALTER is conditional so a fresh
+        # DB (created above by CREATE TABLE IF NOT EXISTS with the v3
+        # column set) is a no-op.
+        runs_cols = {
+            row[1]
+            for row in db.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        if "status" not in runs_cols:
+            # SQLite ALTER...ADD COLUMN rejects NOT NULL without a
+            # constant default; the v3 CREATE has DEFAULT 'running' on
+            # NOT NULL columns, so the ALTER form mirrors that.
+            db.execute(
+                "ALTER TABLE runs ADD COLUMN status TEXT NOT NULL DEFAULT 'running'"
+            )
+        if "finished_at" not in runs_cols:
+            db.execute("ALTER TABLE runs ADD COLUMN finished_at REAL")
+        if "n_variants" not in runs_cols:
+            db.execute("ALTER TABLE runs ADD COLUMN n_variants INTEGER")
+        if "n_evals" not in runs_cols:
+            db.execute("ALTER TABLE runs ADD COLUMN n_evals INTEGER")
+        if "judge_protocol" not in runs_cols:
+            db.execute("ALTER TABLE runs ADD COLUMN judge_protocol TEXT")
+        if "cost_actual_usd" not in runs_cols:
+            db.execute("ALTER TABLE runs ADD COLUMN cost_actual_usd REAL")
+        if "tenant_id" not in runs_cols:
+            db.execute(
+                "ALTER TABLE runs ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'"
+            )
     db.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
     db.commit()
 
@@ -914,6 +957,11 @@ class RunWriter:
         self._run_dir = _validate_run_dir(Path(run_dir))
         self._run_dir.mkdir(parents=True, exist_ok=True)
         self._run_id = run_id
+        # Cached so :meth:`write` doesn't have to ask the Topology each
+        # call — also keeps the traces.jsonl tds_version field byte-
+        # stable for a run even if the in-memory Topology mutates
+        # (shouldn't happen — frozen Pydantic — but cheap insurance).
+        self._tds_version = topology.tds_version
 
         self._db: sqlite3.Connection | None = None
         self._jsonl: Any = None
@@ -960,14 +1008,61 @@ class RunWriter:
             return
         # First kickoff. INSERT (no OR IGNORE — we already proved no row
         # exists for this run_id, so a conflict here is a real bug).
+        # Status starts as 'running'; callers flip it to 'succeeded' /
+        # 'degraded' / 'failed' / 'cost_cap_hit' / 'interrupted' via
+        # :meth:`finalize` before exit. A row that stays 'running' is the
+        # signal of a crash or kill-9. tenant_id is the §16 #4 forward-
+        # compat placeholder; v0.5 always writes 'local'.
         self._db.execute(
-            "INSERT INTO runs VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO runs "
+            "(run_id, topology_canonical_hash, topology_name, tds_version, "
+            " created_at, status, tenant_id) "
+            "VALUES (?, ?, ?, ?, ?, 'running', 'local')",
             (
                 run_id,
                 topology.canonical_hash(),
                 topology.name,
                 topology.tds_version,
                 time.time(),
+            ),
+        )
+        self._db.commit()
+
+    def finalize(
+        self,
+        *,
+        status: str = "succeeded",
+        cost_actual_usd: float | None = None,
+        n_variants: int | None = None,
+        n_evals: int | None = None,
+        judge_protocol: str | None = None,
+    ) -> None:
+        """Stamp end-of-run state on the ``runs`` row per §A error taxonomy.
+
+        Call once, just before :meth:`close`. Idempotent: a second call
+        overwrites the prior status (useful for "finalize as succeeded,
+        then notice a late drain failure and downgrade to degraded").
+        Omitted optional fields stay at whatever the row already holds.
+        A row that never sees :meth:`finalize` keeps ``status='running'``
+        and ``finished_at IS NULL`` — diagnostic of a crash.
+        """
+        if self._db is None:
+            raise RuntimeError("RunWriter is closed")
+        self._db.execute(
+            "UPDATE runs SET status = ?, finished_at = ?, "
+            "cost_actual_usd = COALESCE(?, cost_actual_usd), "
+            "n_variants = COALESCE(?, n_variants), "
+            "n_evals = COALESCE(?, n_evals), "
+            "judge_protocol = COALESCE(?, judge_protocol) "
+            "WHERE run_id = ?",
+            (
+                status,
+                time.time(),
+                cost_actual_usd,
+                n_variants,
+                n_evals,
+                judge_protocol,
+                self._run_id,
             ),
         )
         self._db.commit()
@@ -995,7 +1090,11 @@ class RunWriter:
 
         cell_cost = _cell_cost_usd(cell)
 
+        # ``tds_version`` is on every JSON output per §16 #1; the
+        # traces.jsonl record carries it so a per-line consumer doesn't
+        # have to cross-reference manifest.json.
         record = {
+            "tds_version": self._tds_version,
             "run_id": self._run_id,
             "variant_id": cell.variant_id,
             "eval_id": cell.eval_id,

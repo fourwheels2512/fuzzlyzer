@@ -995,7 +995,7 @@ def test_run_writer_persists_schema_version_pragma(tmp_path):
         ver = db.execute("PRAGMA user_version").fetchone()[0]
     finally:
         db.close()
-    assert ver == 2  # bumped in step 6.0 (cost telemetry)
+    assert ver == 3  # bumped in step 8 polish (§A runs columns)
 
 
 def test_run_writer_resume_preserves_original_created_at(tmp_path):
@@ -1636,8 +1636,28 @@ def test_runwriter_migrates_v1_db_in_place(tmp_path):
 
     db = sqlite3.connect(str(db_path))
     try:
-        # Schema bumped.
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        # Schema bumped (v1 → v3 cascade: cost telemetry + §A runs cols).
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        # v3 runs columns landed: status defaults to 'running', tenant_id to 'local'.
+        runs_cols = {
+            row[1]
+            for row in db.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        for col in (
+            "status",
+            "finished_at",
+            "n_variants",
+            "n_evals",
+            "judge_protocol",
+            "cost_actual_usd",
+            "tenant_id",
+        ):
+            assert col in runs_cols, f"v3 column {col!r} missing post-migrate"
+        legacy_status, legacy_tenant = db.execute(
+            "SELECT status, tenant_id FROM runs WHERE run_id = 'legacy-run'"
+        ).fetchone()
+        assert legacy_status == "running"
+        assert legacy_tenant == "local"
         # Legacy row preserved with NULL in the new column.
         legacy_row = db.execute(
             "SELECT cell_cost_usd FROM cells WHERE eval_id = 'old-eval'"

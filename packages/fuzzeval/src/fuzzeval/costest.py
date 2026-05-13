@@ -12,6 +12,12 @@ Do not surface these numbers in user-facing budget UX yet — the BLUEPRINT
 
 Per BLUEPRINT_v5plus.md §17a:
     estimate(sample_rows, judge_mode, n_total_rows, n_variants) -> CostEstimate
+
+``estimate`` also accepts ``agent_model`` and ``judge_model`` as keyword
+arguments. These are an additive extension to the §17a-locked signature,
+matching the ``seed=`` precedent in :func:`fuzzeval.stats.percentile_cluster_bootstrap`:
+positional callers per §17a still work; downstream callers (CLI, Pramana)
+that need per-model rates pass them by name.
 """
 
 from __future__ import annotations
@@ -38,10 +44,14 @@ class CostEstimate:
 
 # Blended (in+out) USD per 1K tokens. Verify before relying on these for
 # real budgeting; step 6 replaces them with measured per-model rates.
+# The lending fixture uses ``google/gemini-2.5-flash`` for two of four
+# agents — keep it in the table so ``--max-cost-usd`` doesn't undercount
+# real spend (audit: BLUEPRINT polish B1).
 _RATE_USD_PER_1K = {
     "anthropic/claude-opus-4-7": 0.045,
     "openai/gpt-5": 0.040,
     "google/gemini-2.5-pro": 0.020,
+    "google/gemini-2.5-flash": 0.005,
 }
 _DEFAULT_RATE = 0.040
 
