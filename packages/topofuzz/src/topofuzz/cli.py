@@ -431,6 +431,19 @@ def run(
         "-y",
         help="Skip the cost-estimator confirmation prompt.",
     ),
+    rekor: bool = typer.Option(
+        False,
+        "--rekor",
+        help=(
+            "Opt in to Sigstore Rekor: after the run signs locally, POST "
+            "the DSSE envelope to the Sigstore Public Good Instance and "
+            "embed the LogEntry in <run_dir>/report.json.dsse.rekor.json. "
+            "Tries 3 times with bounded backoff (~30s ceiling). On "
+            "timeout, writes a [REKOR-DEFERRED] marker — re-run with "
+            "--rekor later to retry. Requires a dev key "
+            "(run `topofuzz keygen` first)."
+        ),
+    ),
 ) -> None:
     """Run topology fuzzing against an eval set.
 
@@ -706,6 +719,14 @@ def run(
         )
     typer.echo(f"Elapsed: {result.elapsed_s:.2f}s")
 
+    # Step 18 (§11 line 306): Rekor opt-in. Fires AFTER local sign + AFTER
+    # the result banner so the user always sees the run summary even if
+    # the Rekor submission hangs out the full 30s window. Catches all
+    # exceptions so a Rekor bug never tanks an otherwise-successful run
+    # — the BLUEPRINT contract is "Rekor is additive metadata."
+    if rekor:
+        _maybe_submit_to_rekor(result.run_dir)
+
     # §A error-taxonomy exit codes (BLUEPRINT lines 634-643).
     # Cap-tripped takes precedence (exit 3) so CI can distinguish a
     # budget-tripped run from success. Otherwise use the §A status
@@ -715,6 +736,126 @@ def run(
         raise typer.Exit(code=_COST_CAP_EXIT)
     if result.metrics_exit_code != 0:
         raise typer.Exit(code=result.metrics_exit_code)
+
+
+def _maybe_submit_to_rekor(run_dir: Path) -> None:
+    """Best-effort Rekor submission for ``run_dir/attestation.json``.
+
+    Loads the dev key, derives the public PEM, calls
+    :func:`topofuzz.rekor.submit_for_run_dir`. Prints a single line of
+    operator-readable outcome. Never raises — the deferred marker on
+    disk is the load-bearing signal; this function's prints are
+    additive UX.
+
+    Imports are inside the function so verify-only installs that never
+    pass --rekor don't pay the rekor-module import cost at CLI startup.
+    """
+    from cryptography.hazmat.primitives import serialization
+
+    from topofuzz.rekor import (
+        REKOR_DEFERRED_MARKER,
+        looks_like_rekor_logged,
+        submit_for_run_dir,
+    )
+
+    log = logging.getLogger(__name__)
+
+    # Audit Pass-1 RT MAJOR-1 / common-path 409 avoidance: if a prior
+    # invocation already logged this run, skip the submission entirely
+    # — re-POSTing the identical envelope to Rekor would return 409
+    # Conflict (handled but ugly). Cheaper for the user, kinder to
+    # Rekor's rate limits.
+    if looks_like_rekor_logged(run_dir):
+        typer.echo(
+            f"[REKOR] already logged for {run_dir.name}; skipping "
+            "re-submission. Delete report.json.dsse.rekor.json to force "
+            "a fresh submit."
+        )
+        return
+
+    pub_path = default_dev_pub_path()
+    try:
+        # Use the public-key bytes already on disk (written by
+        # ``topofuzz keygen``). Loading the PRIVATE key + deriving its
+        # public half would also work, but the public file is the
+        # canonical witness — and reading it doesn't require touching
+        # the encrypted private key material.
+        public_key = load_public_key(pub_path)
+    except KeyNotFoundError:
+        # Audit Pass-1 RT MAJOR-3 / CR MINOR-1 fix: name the file the
+        # operator actually needs to inspect (the public key path), not
+        # the private key path the prior message named.
+        typer.echo(
+            f"[REKOR] no dev public key at {pub_path}; run "
+            "`topofuzz keygen` first. Skipping submission.",
+            err=True,
+        )
+        return
+    except (ValueError, OSError) as e:
+        typer.echo(
+            f"[REKOR] dev key load failed: {e}. Skipping submission.",
+            err=True,
+        )
+        return
+
+    public_pem_bytes = public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+    try:
+        outcome = submit_for_run_dir(run_dir, public_pem_bytes)
+    except (OSError, ValueError) as e:
+        # Audit Pass-1 CR MAJOR-1 fix: widen catch to include
+        # ValueError (envelope-not-UTF-8 path from
+        # ``_build_proposed_entry`` reraise). Without this, a future
+        # signer that produced non-UTF-8 envelope bytes would crash
+        # the CLI AFTER an otherwise-successful run, costing the
+        # operator the run summary they were waiting for. We do NOT
+        # catch the broader ``Exception`` so a real bug (e.g.
+        # AttributeError from a refactor) still surfaces to tests —
+        # same discipline as ``orchestrator._maybe_emit_attestation``.
+        log.warning("rekor: persistence failed at %s: %s", run_dir, e)
+        typer.echo(
+            f"[REKOR] persistence failed: {e}. See logs for details.",
+            err=True,
+        )
+        return
+
+    if outcome.ok and outcome.log_entry is not None:
+        # Rekor wraps the LogEntry in ``{"<uuid>": {...}}`` for fresh
+        # entries; the 409-already-logged stub uses keys
+        # ``_rekor_409_already_logged`` + ``location_url``. Both
+        # variants are surfaced in a single readable line. The CLI
+        # never assumes a specific shape beyond "JSON dict" — extra
+        # keys are passed through transparently.
+        if outcome.log_entry.get("_rekor_409_already_logged"):
+            location = outcome.log_entry.get("location_url") or "(unknown)"
+            typer.echo(
+                f"[REKOR] already logged (server-side); "
+                f"location={location}"
+            )
+        else:
+            uuid_str: str | None = None
+            log_index: Any = None
+            first_key = next(iter(outcome.log_entry))
+            uuid_str = first_key
+            inner = outcome.log_entry[first_key]
+            if isinstance(inner, dict):
+                log_index = inner.get("logIndex")
+            parts = ["[REKOR] logged"]
+            if uuid_str:
+                parts.append(f"uuid={uuid_str}")
+            if log_index is not None:
+                parts.append(f"logIndex={log_index}")
+            typer.echo(" ".join(parts))
+    else:
+        typer.echo(
+            f"[REKOR-DEFERRED] {outcome.error or 'submission failed'}. "
+            f"Marker: {run_dir / REKOR_DEFERRED_MARKER}. "
+            "Re-run with --rekor to retry.",
+            err=True,
+        )
 
 
 def _preflight_cost(

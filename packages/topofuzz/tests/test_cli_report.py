@@ -270,6 +270,58 @@ def test_report_all_three_banners_together(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Step 18: [REKOR-DEFERRED] banner gate
+# ---------------------------------------------------------------------------
+
+
+def test_report_rekor_deferred_banner_when_marker_present(
+    tmp_path: Path,
+) -> None:
+    """[REKOR-DEFERRED] banner lights iff .rekor-deferred marker exists
+    AND no successful rekor LogEntry sits beside it. BLUEPRINT line 306."""
+    from topofuzz.rekor import REKOR_DEFERRED_MARKER
+
+    run_dir = _make_run_dir(tmp_path, with_attestation=True)
+    (run_dir / REKOR_DEFERRED_MARKER).write_text("", encoding="utf-8")
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    body = (run_dir / "report.html").read_text(encoding="utf-8")
+    assert "[REKOR-DEFERRED]" in body
+
+
+def test_report_no_rekor_deferred_banner_when_marker_absent(
+    tmp_path: Path,
+) -> None:
+    """No marker → no banner — the default state for a non-opt-in run."""
+    run_dir = _make_run_dir(tmp_path, with_attestation=True)
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    body = (run_dir / "report.html").read_text(encoding="utf-8")
+    assert "[REKOR-DEFERRED]" not in body
+
+
+def test_report_rekor_deferred_suppressed_when_log_entry_present(
+    tmp_path: Path,
+) -> None:
+    """A stale marker beside a successful rekor.json should NOT light
+    the banner — looks_like_rekor_logged AND-gate prevents the deferred
+    banner from sticking on a now-logged run (race-window guard)."""
+    import json as _json
+
+    from topofuzz.rekor import REKOR_DEFERRED_MARKER, REKOR_OUTPUT_FILENAME
+
+    run_dir = _make_run_dir(tmp_path, with_attestation=True)
+    (run_dir / REKOR_DEFERRED_MARKER).write_text("", encoding="utf-8")
+    (run_dir / REKOR_OUTPUT_FILENAME).write_text(
+        _json.dumps({"abc-uuid": {"logIndex": 1}}), encoding="utf-8",
+    )
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    body = (run_dir / "report.html").read_text(encoding="utf-8")
+    assert "[REKOR-DEFERRED]" not in body
+
+
+# ---------------------------------------------------------------------------
 # Missing-input failure modes
 # ---------------------------------------------------------------------------
 

@@ -174,6 +174,18 @@ def render_report(run_dir: Path) -> Path:
         manifest.get("cli_args", {}).get("jury_of_3", False)
     )
     show_degraded = status == "degraded"
+    # Step 18 (§11 line 306): [REKOR-DEFERRED] gate. Lights iff a
+    # ``.rekor-deferred`` marker is on disk AND there is no successful
+    # LogEntry alongside it — a re-attest that succeeded should clear
+    # the marker, but we AND with looks_like_rekor_logged so a race
+    # between marker write and unlink can't strand a stale deferred
+    # banner on a successful run.
+    from topofuzz.rekor import looks_like_rekor_deferred, looks_like_rekor_logged
+
+    show_rekor_deferred = (
+        looks_like_rekor_deferred(run_dir)
+        and not looks_like_rekor_logged(run_dir)
+    )
 
     # Prefer manifest run_id (it's the kickoff-time truth) but fall back
     # to the DB row if the manifest is somehow missing the field. A
@@ -234,6 +246,7 @@ def render_report(run_dir: Path) -> Path:
         show_dev_key=show_dev_key,
         show_jury=show_jury,
         show_degraded=show_degraded,
+        show_rekor_deferred=show_rekor_deferred,
         matrix_warning=matrix_warning,
         worstcase=worstcase_ctx,
         summary=summary_ctx,

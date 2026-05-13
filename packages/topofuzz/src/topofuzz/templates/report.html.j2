@@ -26,6 +26,7 @@
     letter-spacing: .04em;
   }
   .banner-dev-key { background: #fff3b0; color: #6b5b00; border: 1px solid #d9c45a; }
+  .banner-rekor-deferred { background: #ffe7b3; color: #7a4a00; border: 1px solid #d99a4a; }
   .banner-jury    { background: #d6e4ff; color: #1e3a8a; border: 1px solid #6f8fce; }
   .banner-degraded { background: #ffd6d6; color: #7a1f1f; border: 1px solid #c95757; }
   .wc-stable {
@@ -137,6 +138,7 @@
 <!-- SUMMARY-SECTION-END -->
 <div class="banners">
   {% if show_dev_key %}<span class="banner banner-dev-key">[DEV-KEY]</span>{% endif %}
+  {% if show_rekor_deferred %}<span class="banner banner-rekor-deferred">[REKOR-DEFERRED]</span>{% endif %}
   {% if show_jury %}<span class="banner banner-jury">[JURY]</span>{% endif %}
   {% if show_degraded %}<span class="banner banner-degraded">[DEGRADED]</span>{% endif %}
 </div>
