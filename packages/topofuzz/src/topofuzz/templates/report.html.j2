@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>topofuzz report — {{ run_id }}</title>
+<style>
+  body {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    max-width: 960px;
+    margin: 2rem auto;
+    padding: 0 1rem;
+    color: #1a1a1a;
+    background: #fafafa;
+    line-height: 1.45;
+  }
+  h1 { font-size: 1.4rem; margin: 0 0 .25rem 0; }
+  h2 { font-size: 1.05rem; margin: 2rem 0 .5rem 0; border-bottom: 1px solid #ddd; padding-bottom: .2rem; }
+  .banners { margin: .75rem 0 1rem 0; }
+  .banner {
+    display: inline-block;
+    padding: .15rem .55rem;
+    margin-right: .5rem;
+    border-radius: 3px;
+    font-weight: bold;
+    font-size: .85rem;
+    letter-spacing: .04em;
+  }
+  .banner-dev-key { background: #fff3b0; color: #6b5b00; border: 1px solid #d9c45a; }
+  .banner-jury    { background: #d6e4ff; color: #1e3a8a; border: 1px solid #6f8fce; }
+  .banner-degraded { background: #ffd6d6; color: #7a1f1f; border: 1px solid #c95757; }
+  .warning {
+    background: #fff0d6;
+    border-left: 4px solid #d99700;
+    padding: .5rem .75rem;
+    margin: .75rem 0;
+    color: #6b4400;
+    font-size: .85rem;
+  }
+  table.meta { border-collapse: collapse; margin: .5rem 0; }
+  table.meta td { padding: .15rem .75rem .15rem 0; vertical-align: top; }
+  table.meta td.k { color: #555; }
+  figure { margin: 1rem 0; text-align: center; }
+  figcaption { color: #555; font-size: .85rem; margin-top: .3rem; }
+  svg { max-width: 100%; height: auto; }
+  ul.evals { columns: 3; font-size: .85rem; color: #555; }
+  footer { margin-top: 2rem; color: #777; font-size: .8rem; border-top: 1px solid #ddd; padding-top: .5rem; }
+</style>
+</head>
+<body>
+<h1>topofuzz run — {{ run_id }}</h1>
+<div class="banners">
+  {% if show_dev_key %}<span class="banner banner-dev-key">[DEV-KEY]</span>{% endif %}
+  {% if show_jury %}<span class="banner banner-jury">[JURY]</span>{% endif %}
+  {% if show_degraded %}<span class="banner banner-degraded">[DEGRADED]</span>{% endif %}
+</div>
+
+{% if matrix_warning %}<div class="warning">⚠ {{ matrix_warning }}</div>{% endif %}
+
+<table class="meta">
+  <tr><td class="k">topology</td><td>{{ topology_name }}</td></tr>
+  <tr><td class="k">status</td><td>{{ status }}</td></tr>
+  <tr><td class="k">judge model</td><td>{{ judge_model }}</td></tr>
+  <tr><td class="k">rubric hash</td><td>{{ rubric_hash or '(none)' }}</td></tr>
+  <tr><td class="k">variants</td><td>{{ n_variants }}</td></tr>
+  <tr><td class="k">eval rows</td><td>{{ n_eval_rows }}</td></tr>
+  <tr><td class="k">kickoff</td><td>{{ kickoff_iso }}</td></tr>
+</table>
+
+<h2>Per-eval variance across orderings</h2>
+<figure>
+  {{ voo_svg | safe }}
+  <figcaption>§9 metric #1 — per-eval np.var across the variant axis (ddof=0). Higher = topology is more order-sensitive on that eval.</figcaption>
+</figure>
+
+<h2>Score matrix (variant × eval)</h2>
+<figure>
+  {{ heatmap_svg | safe }}
+  <figcaption>Continuous judge scores. Missing/failed cells render as gray.</figcaption>
+</figure>
+
+{% if eval_ids %}
+<h2>Eval IDs ({{ eval_ids|length + eval_ids_truncated }})</h2>
+<ul class="evals">
+{% for e in eval_ids %}<li>{{ e }}</li>{% endfor %}
+</ul>
+{% if eval_ids_truncated %}<p style="font-size:.85rem;color:#888;">… and {{ eval_ids_truncated }} more (see manifest.json for the full list).</p>{% endif %}
+{% endif %}
+
+<footer>
+  topofuzz {{ topofuzz_version }} · generated {{ generated_iso }}
+</footer>
+</body>
+</html>

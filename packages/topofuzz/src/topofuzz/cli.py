@@ -679,10 +679,57 @@ def _run_with_signal_handling(plan: RunPlan, *, judge: SingleJudge | None = None
     }
 )
 def report(ctx: typer.Context, run_dir: str) -> None:
-    """Open the HTML report for a run. (Not yet implemented.)"""
+    """Render ``<run_dir>/report.html`` and print its ``file://`` URL.
+
+    Reads ``manifest.json`` + ``run.sqlite`` from ``run_dir`` (both
+    required) and, when present, surfaces a ``[DEV-KEY]`` banner from
+    ``attestation.json``. Two inline matplotlib SVGs render per-eval
+    variance + the score matrix per BLUEPRINT_v5plus.md §11.
+
+    An existing ``<run_dir>/report.html`` is silently overwritten —
+    every invocation regenerates from scratch.
+
+    Exit codes:
+
+    * 0 — report written.
+    * 2 — usage error (run_dir not a directory; manifest.json or
+      run.sqlite missing; sqlite has zero / multiple runs;
+      matplotlib / numpy / jinja2 missing — install ``topofuzz[full]``).
+    """
     _reject_reserved_flags(list(ctx.args))
     _reject_unknown_extras(list(ctx.args))
-    _not_yet("report", "Weekend 3 step 11")
+
+    run_dir_path = Path(run_dir)
+    if not run_dir_path.is_dir():
+        typer.echo(
+            f"topofuzz report: run_dir is not a directory: {run_dir}",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT)
+
+    # Lazy import: pulls matplotlib + jinja2 + numpy. Keeping this out
+    # of module scope is the §11a verify-path-safety contract — the
+    # import-guard test (``tests/test_import_guard.py``) only allows
+    # ``topofuzz.cli`` to load without the run-time stack.
+    from topofuzz.report import (
+        ReportDependencyError,
+        ReportInputError,
+        render_report,
+    )
+
+    try:
+        out_path = render_report(run_dir_path)
+    except ReportInputError as e:
+        typer.echo(f"topofuzz report: {e}", err=True)
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+    except ReportDependencyError as e:
+        typer.echo(f"topofuzz report: {e}", err=True)
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+    except ValueError as e:
+        typer.echo(f"topofuzz report: {e}", err=True)
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+
+    typer.echo(out_path.resolve().as_uri())
 
 
 @app.command(

@@ -41,13 +41,17 @@ def test_scan_stub_exits_with_friendly_message():
     assert "not yet implemented" in (result.output or "").lower()
 
 
-def test_report_stub_exits_with_friendly_message():
-    result = CliRunner().invoke(app, ["report", "some-dir"])
+def test_report_bad_run_dir_exits_with_friendly_message():
+    """`report` is wired in step 11 — bad run_dir surfaces as exit 2,
+    not a stub message. End-to-end coverage lives in test_cli_report.py."""
+    result = CliRunner().invoke(app, ["report", "some-nonexistent-dir"])
     assert result.exit_code == 2
+    assert "not a directory" in (result.output or "").lower()
 
 
 # `verify` is no longer a stub — see test_cli_verify_keygen.py for the
-# step-10a tests of the real command.
+# step-10a tests of the real command. `report` likewise — see
+# test_cli_report.py for the step-11 tests.
 
 
 def test_reserved_flags_constant_matches_blueprint_section_16():

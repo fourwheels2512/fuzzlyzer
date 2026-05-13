@@ -21,6 +21,14 @@ dev = [
     # (`StateGraph._builder.branches`, `BranchSpec.ends`, the `xray=1`
     # flatten contract) that has shifted across major versions.
     "langgraph>=1.0,<2",
+    # Required by topofuzz.report tests (Weekend 3 step 11). Both libs
+    # live in topofuzz[full] for end-users; the dev group mirrors them
+    # so the test suite exercises the report render path without an
+    # extras dance. The cli.report subcommand lazy-imports them so
+    # topofuzz[verify] users still don't pay the ~50 MB matplotlib cost
+    # — test_import_guard.py pins that contract.
+    "matplotlib>=3.8",
+    "jinja2>=3.1",
 ]
 
 [tool.pytest.ini_options]
