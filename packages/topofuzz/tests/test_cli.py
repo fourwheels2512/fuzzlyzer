@@ -278,9 +278,16 @@ def test_cli_run_end_to_end_with_mocked_orchestrator(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     eval_path = tmp_path / "e.jsonl"
+    # ``ground_truth_decision`` is required by the packaged lending
+    # rubric's ``render_prompt`` (even in --dry-run, which renders to
+    # surface template bugs early). Without it every cell would raise
+    # KeyError inside the judge → judge_failure → §A status='failed' →
+    # exit 2. Step 9 makes that failure path observable; pre-step-9 the
+    # CLI hard-coded status='succeeded' regardless of judge failures,
+    # which is what this test was inadvertently relying on.
     eval_path.write_text(
-        '{"id": "e1", "input": "x"}\n'
-        '{"id": "e2", "input": "y"}\n',
+        '{"id": "e1", "input": "x", "ground_truth_decision": "approve"}\n'
+        '{"id": "e2", "input": "y", "ground_truth_decision": "deny"}\n',
         encoding="utf-8",
     )
 
@@ -314,6 +321,13 @@ def test_cli_run_end_to_end_with_mocked_orchestrator(tmp_path, monkeypatch):
             "--variants", "1",
             "--out", str(out_dir),
             "--no-cache",
+            # ``--dry-run`` short-circuits the judge to a deterministic
+            # ContinuousScore(0.5). Without it the packaged
+            # ``lending_judge.txt`` rubric would try to parse the
+            # ``fake_llm`` response "ok" as ``Score: N`` → every cell
+            # marked judge_failure → step-9 §A status='failed' → exit 2.
+            # This test exercises the CLI plumbing, not judge parsing.
+            "--dry-run",
             "--yes",
         ],
     )

@@ -34,6 +34,7 @@ from typing import Any, Callable, Iterable
 from fuzzeval.cache import JudgeCache, LLMCache
 
 from topofuzz.ir import Topology
+from topofuzz.metrics import classify_run_status
 from topofuzz.runner import (
     Cell,
     LLMCallable,
@@ -136,7 +137,14 @@ class RunPlan:
 
 @dataclass(frozen=True)
 class RunResult:
-    """What the orchestrator returns to the CLI for human-friendly summary."""
+    """What the orchestrator returns to the CLI for human-friendly summary.
+
+    ``status`` is the §A run-status stamped on the ``runs`` row, one of
+    ``"succeeded"``, ``"degraded"``, ``"failed"``, ``"cost_cap_hit"``, or
+    ``"interrupted"``. ``metrics_exit_code`` is the §A-mapped exit code
+    the CLI should use when the run was NOT cost-cap-tripped — the cost-
+    cap branch still owns its own exit code (3) at the CLI layer.
+    """
 
     run_id: str
     run_dir: Path
@@ -147,6 +155,8 @@ class RunResult:
     cap_tripped: bool          # True if --max-cost-usd triggered cancel
     elapsed_s: float
     manifest_path: Path
+    status: str = "succeeded"
+    metrics_exit_code: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +238,13 @@ async def _writer_drain(
             cost_state["completed_cells"] += 1
             if item.error is None:
                 cost_state["successful_cells"] += 1
+            # Step 9: track judge_failures separately so §A status
+            # classification can treat them as failed without changing
+            # the existing ``successful_cells`` semantic (which is
+            # ``error IS NULL`` per ``RunResult`` docstring + Cell
+            # judge_failure rows have ``error=None``).
+            if item.judge_failure:
+                cost_state["judge_failure_cells"] += 1
             if max_cost_usd is not None:
                 total = cost_state["total_cost_usd"]
                 if not soft_warn_emitted and total >= 0.80 * max_cost_usd:
@@ -381,13 +398,21 @@ async def execute_run(
         "total_cost_usd": 0.0,
         "completed_cells": 0,
         "successful_cells": 0,
+        "judge_failure_cells": 0,
         "cap_tripped": False,
     }
 
     started = time.monotonic()
     already_successful_count = 0
+    status = "succeeded"
+    metrics_exit_code = 0
     try:
-        with RunWriter(plan.run_dir, plan.run_id, plan.topology) as writer:
+        with RunWriter(
+            plan.run_dir,
+            plan.run_id,
+            plan.topology,
+            rubric_hash=plan.rubric_hash,
+        ) as writer:
             already_successful = writer.completed_cells()
             already_successful_count = len(already_successful)
             pending_pairs = _pending_pairs(plan, already_successful)
@@ -479,14 +504,45 @@ async def execute_run(
                     _log.exception("RunWriter drain task failed on empty plan")
 
             # Stamp end-of-run state on the runs row per §A error
-            # taxonomy. Status here is the coarse exit-code prerequisite:
-            # 'cost_cap_hit' if the cap tripped (CLI maps to exit 3),
-            # 'succeeded' otherwise. The 'degraded'/'failed' branches
-            # (cell error-rate thresholds) land with step 9 metrics; for
-            # now any non-cap completion is 'succeeded' regardless of
-            # individual cell errors.
+            # taxonomy. Step 9 wires the cell-failure-rate branches
+            # ('succeeded' / 'degraded' / 'failed') via
+            # :func:`topofuzz.metrics.classify_run_status`; cost-cap
+            # and interrupted paths keep their fixed strings.
+            #
+            # Priority order (highest first):
+            #   1. cost_cap_hit  — cap_tripped flag (cap_tripped → cancel)
+            #   2. interrupted   — cancel_event set, NOT cap_tripped (Ctrl+C)
+            #   3. succeeded/degraded/failed — by failure rate
+            #
+            # Failure-rate counting (§A row): "judge_failure or LLM error"
+            # both count. Judge-failure cells have ``error IS NULL`` so
+            # the existing ``successful_cells`` counter alone underreports
+            # failures; ``judge_failure_cells`` (step 9) is added in.
+            n_planned = len(plan.variants) * len(plan.eval_rows)
+            n_errored = (
+                cost_state["completed_cells"]
+                - cost_state["successful_cells"]
+            )
+            n_failed = n_errored + cost_state["judge_failure_cells"]
+
+            if cost_state["cap_tripped"]:
+                status = "cost_cap_hit"
+                metrics_exit_code = 0  # CLI uses _COST_CAP_EXIT (3)
+            elif cancel_event.is_set():
+                # Cancel without cap-trip ⇒ user-initiated SIGINT (the
+                # signal handler in :func:`topofuzz.cli._run_with_signal_handling`
+                # sets the event on first Ctrl+C). §A maps this to
+                # status='interrupted', exit code 130.
+                status = "interrupted"
+                metrics_exit_code = 130
+            else:
+                status, metrics_exit_code = classify_run_status(
+                    n_failed_cells=n_failed,
+                    n_total_cells=n_planned,
+                )
+
             writer.finalize(
-                status="cost_cap_hit" if cost_state["cap_tripped"] else "succeeded",
+                status=status,
                 cost_actual_usd=cost_state["total_cost_usd"],
                 n_variants=len(plan.variants),
                 n_evals=len(plan.eval_rows),
@@ -513,6 +569,8 @@ async def execute_run(
         cap_tripped=cost_state["cap_tripped"],
         elapsed_s=elapsed,
         manifest_path=plan.run_dir / "manifest.json",
+        status=status,
+        metrics_exit_code=metrics_exit_code,
     )
 
 

@@ -132,9 +132,11 @@ def _round_robin_select(
 _RESERVED_FLAG_EXIT = 2
 _NOT_IMPLEMENTED_EXIT = 2
 _BAD_USAGE_EXIT = 2
-# §A error-taxonomy exit codes (BLUEPRINT lines 634-643). Step 6 wires
-# the codes observable today (cost cap, SIGINT, unsupported graph); the
-# 0/1/2 success/degraded/failed split lands with step 9 metrics.
+# §A error-taxonomy exit codes (BLUEPRINT lines 634-643). Step 6 wired
+# the codes observable then (cost cap, SIGINT, unsupported graph). Step 9
+# adds the 0/1/2 success/degraded/failed split — the metrics layer
+# computes ``status`` + ``metrics_exit_code`` and stamps both onto the
+# ``runs`` row + ``RunResult``; we just translate to ``typer.Exit``.
 _COST_CAP_EXIT = 3
 _UNSUPPORTED_GRAPH_EXIT = 64
 _INTERRUPTED_EXIT = 130
@@ -477,6 +479,7 @@ def run(
     typer.echo("")
     typer.echo(f"Run id: {result.run_id}")
     typer.echo(f"Run dir: {result.run_dir}")
+    typer.echo(f"Status: {result.status}")
     typer.echo(
         f"Cells: {result.successful_cells} ok / {result.completed_cells} "
         f"completed / {result.total_cells} planned"
@@ -492,15 +495,15 @@ def run(
         )
     typer.echo(f"Elapsed: {result.elapsed_s:.2f}s")
 
-    # §A error-taxonomy exit codes (BLUEPRINT lines 634-643). Cost-cap
-    # exits 3 so CI can distinguish a budget-tripped run from success.
-    # The 'degraded' / 'failed' branches (cell error-rate thresholds)
-    # land with step 9 metrics. SIGINT (130) is best-effort: Python's
-    # default behaviour exits ~130 on Unix on second-Ctrl-C, and the
-    # first-Ctrl-C cancel path returns a partial RunResult that we
-    # report as cap-tripped-like below.
+    # §A error-taxonomy exit codes (BLUEPRINT lines 634-643).
+    # Cap-tripped takes precedence (exit 3) so CI can distinguish a
+    # budget-tripped run from success. Otherwise use the §A status
+    # mapping from the metrics layer (0 = succeeded / degraded-low,
+    # 1 = degraded-high, 2 = failed, 130 = interrupted).
     if result.cap_tripped:
         raise typer.Exit(code=_COST_CAP_EXIT)
+    if result.metrics_exit_code != 0:
+        raise typer.Exit(code=result.metrics_exit_code)
 
 
 def _preflight_cost(

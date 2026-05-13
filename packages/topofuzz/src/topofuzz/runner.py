@@ -714,9 +714,12 @@ async def _run_judge(
 # Schema version bumps require a migration path. v0.5.0 step 5 = 1.
 # Step 6 = 2 (cost telemetry: cells.cell_cost_usd). Step 8 polish = 3
 # (full §A runs schema: status, finished_at, n_variants, n_evals,
-# judge_protocol, cost_actual_usd, tenant_id). Any column add or rename
-# must increment and either (a) ship a migration in `topofuzz migrate`,
-# or (b) inline a one-shot ALTER in :func:`_migrate` for a small step
+# judge_protocol, cost_actual_usd, tenant_id). Step 9 = 4 (rubric_hash
+# on runs so `topofuzz.metrics.read_score_matrix` can refuse merging
+# score matrices across runs with different rubrics — a real footgun
+# noted in the §9 metrics layer design). Any column add or rename must
+# increment and either (a) ship a migration in `topofuzz migrate`, or
+# (b) inline a one-shot ALTER in :func:`_migrate` for a small step
 # bump pre-launch. The full migrate command is tracked as a step-6
 # readiness gap; pre-launch we ALTER inline.
 #
@@ -725,7 +728,7 @@ async def _run_judge(
 # pre-existing user_version (0 for fresh DBs, 1 for legacy step-5 DBs,
 # 99+ for a hypothetical future DB) is observable when migrate decides
 # whether to ALTER or refuse.
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -740,7 +743,8 @@ CREATE TABLE IF NOT EXISTS runs (
     n_evals INTEGER,
     judge_protocol TEXT,
     cost_actual_usd REAL,
-    tenant_id TEXT NOT NULL DEFAULT 'local'
+    tenant_id TEXT NOT NULL DEFAULT 'local',
+    rubric_hash TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS cells (
     run_id TEXT NOT NULL,
@@ -832,6 +836,21 @@ def _migrate(db: sqlite3.Connection) -> None:
         if "tenant_id" not in runs_cols:
             db.execute(
                 "ALTER TABLE runs ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'"
+            )
+    if current < 4:
+        # v4: rubric_hash on runs row. Step 9 wires this from
+        # ``plan.rubric_hash`` (SingleJudge.rubric_hash). The column is
+        # NOT NULL DEFAULT '' so a legacy v3 row migrated forward gets
+        # an empty hash — `read_score_matrix` treats empty-hash rows as
+        # "rubric unknown" (degenerate / refuse-to-merge), which is the
+        # safe failure mode for forensic data without rubric provenance.
+        runs_cols_v4 = {
+            row[1]
+            for row in db.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        if "rubric_hash" not in runs_cols_v4:
+            db.execute(
+                "ALTER TABLE runs ADD COLUMN rubric_hash TEXT NOT NULL DEFAULT ''"
             )
     db.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
     db.commit()
@@ -951,9 +970,15 @@ class RunWriter:
         run_dir: Path | str,
         run_id: str,
         topology: Topology,
+        *,
+        rubric_hash: str = "",
     ) -> None:
         if not run_id:
             raise ValueError("run_id must be non-empty")
+        if not isinstance(rubric_hash, str):
+            raise TypeError(
+                f"rubric_hash must be str; got {type(rubric_hash).__name__}"
+            )
         self._run_dir = _validate_run_dir(Path(run_dir))
         self._run_dir.mkdir(parents=True, exist_ok=True)
         self._run_id = run_id
@@ -962,6 +987,7 @@ class RunWriter:
         # stable for a run even if the in-memory Topology mutates
         # (shouldn't happen — frozen Pydantic — but cheap insurance).
         self._tds_version = topology.tds_version
+        self._rubric_hash = rubric_hash
 
         self._db: sqlite3.Connection | None = None
         self._jsonl: Any = None
@@ -1016,14 +1042,15 @@ class RunWriter:
         self._db.execute(
             "INSERT INTO runs "
             "(run_id, topology_canonical_hash, topology_name, tds_version, "
-            " created_at, status, tenant_id) "
-            "VALUES (?, ?, ?, ?, ?, 'running', 'local')",
+            " created_at, status, tenant_id, rubric_hash) "
+            "VALUES (?, ?, ?, ?, ?, 'running', 'local', ?)",
             (
                 run_id,
                 topology.canonical_hash(),
                 topology.name,
                 topology.tds_version,
                 time.time(),
+                self._rubric_hash,
             ),
         )
         self._db.commit()

@@ -995,7 +995,7 @@ def test_run_writer_persists_schema_version_pragma(tmp_path):
         ver = db.execute("PRAGMA user_version").fetchone()[0]
     finally:
         db.close()
-    assert ver == 3  # bumped in step 8 polish (§A runs columns)
+    assert ver == 4  # step 9: rubric_hash on runs (was 3 after step 8 polish)
 
 
 def test_run_writer_resume_preserves_original_created_at(tmp_path):
@@ -1636,9 +1636,11 @@ def test_runwriter_migrates_v1_db_in_place(tmp_path):
 
     db = sqlite3.connect(str(db_path))
     try:
-        # Schema bumped (v1 → v3 cascade: cost telemetry + §A runs cols).
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
-        # v3 runs columns landed: status defaults to 'running', tenant_id to 'local'.
+        # Schema bumped v1 → v4 cascade: cost telemetry (v2) + §A runs
+        # cols (v3) + rubric_hash on runs (v4 / step 9).
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
+        # v3 + v4 runs columns landed. ``status`` defaults to
+        # 'running', tenant_id to 'local', rubric_hash to ''.
         runs_cols = {
             row[1]
             for row in db.execute("PRAGMA table_info(runs)").fetchall()
@@ -1651,13 +1653,18 @@ def test_runwriter_migrates_v1_db_in_place(tmp_path):
             "judge_protocol",
             "cost_actual_usd",
             "tenant_id",
+            "rubric_hash",
         ):
-            assert col in runs_cols, f"v3 column {col!r} missing post-migrate"
-        legacy_status, legacy_tenant = db.execute(
-            "SELECT status, tenant_id FROM runs WHERE run_id = 'legacy-run'"
+            assert col in runs_cols, f"v3/v4 column {col!r} missing post-migrate"
+        legacy_status, legacy_tenant, legacy_rubric = db.execute(
+            "SELECT status, tenant_id, rubric_hash FROM runs "
+            "WHERE run_id = 'legacy-run'"
         ).fetchone()
         assert legacy_status == "running"
         assert legacy_tenant == "local"
+        # v4 default for the migrated-forward row: empty rubric_hash
+        # (the safe "rubric unknown" signal for read_score_matrix).
+        assert legacy_rubric == ""
         # Legacy row preserved with NULL in the new column.
         legacy_row = db.execute(
             "SELECT cell_cost_usd FROM cells WHERE eval_id = 'old-eval'"
