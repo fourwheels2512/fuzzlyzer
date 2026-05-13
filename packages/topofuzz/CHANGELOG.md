@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases prior to `0.5.0rc1` were development drops on the `0.5.0.dev0`
 placeholder version and are not separately enumerated.
 
+## [Unreleased]
+
+### Added
+
+- **`topofuzz scan FIXTURE_PATH` static risk badge** (Weekend 5 step 14,
+  BLUEPRINT §5a). Zero-LLM-cost rule-based scanner walks the Topology
+  IR and emits a `HIGH` / `MEDIUM` / `LOW` badge plus matched-patterns
+  + rationale. Four base rules from the §5a table (linear-3+-no-agg
+  HIGH, linear-2-no-agg MEDIUM, terminal-aggregator LOW, mid-flow
+  router MEDIUM) and two +1 RISK STEP promotions (all-share-model,
+  temperature>0). Human banner → stderr, JSON → stdout (parse with
+  `topofuzz scan ... | jq`). Exit 0 regardless of badge per DoD #11;
+  exit 2 on bad fixture, exit 64 on out-of-scope LangGraph construct.
+
+### Fixed
+
+- N/A — scan was previously a stub raising a "not yet implemented" message.
+
 ## [0.5.0rc1] — 2026-05-13
 
 First public release candidate of the v5+ build. Soft-launch to PyPI;
@@ -119,8 +137,9 @@ graduation to `0.5.0` follows smoke-test feedback per
   against three real LLM vendors is a v0.5.1 deliverable. Per
   `BLUEPRINT_v5plus.md` line 445 this is explicitly soft — known issues
   in jury infra do not block ship.
-- **`topofuzz scan` is a stub.** The static risk badge (BLUEPRINT §5a,
-  step 14) lands in Weekend 5; v0.5.0rc1 raises a "not yet" message.
+- **`topofuzz scan` is a stub at the v0.5.0rc1 tag.** The static risk
+  badge (BLUEPRINT §5a, step 14) lands post-rc1 on `main` and graduates
+  to v0.5.0; see the `[Unreleased]` section above.
 - **Worst-case viewer is a stub.** The §10a side-by-side trace excerpts
   (step 16) land in Weekend 5; the rendered report includes the "no
   instability detected" fallback path.

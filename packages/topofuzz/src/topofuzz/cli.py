@@ -229,7 +229,7 @@ def _not_yet(command: str, lands: str) -> None:
 
 @app.command(
     context_settings={
-        # Reserved-flag rejection (§16 #2) is a global policy. The stub
+        # Reserved-flag rejection (§16 #2) is a global policy. ``scan``
         # opts into the same context-settings as ``run`` so a user
         # typing ``topofuzz scan --sandbox foo`` gets the v1.0-reserved
         # message instead of a "no such option" from Click.
@@ -238,10 +238,100 @@ def _not_yet(command: str, lands: str) -> None:
     }
 )
 def scan(ctx: typer.Context, fixture: str) -> None:
-    """Static risk badge for a LangGraph topology. (Not yet implemented.)"""
+    """Static risk badge for a LangGraph topology (BLUEPRINT §5a).
+
+    Walks the Topology IR with a fixed rule table and emits a HIGH /
+    MEDIUM / LOW badge plus a single-line rationale. Zero LLM calls,
+    runs in milliseconds. Use it BEFORE ``topofuzz run`` to flag
+    obviously ordering-sensitive topologies for free.
+
+    Output:
+
+    * Human-readable banner → **stderr** (so terminal users see it
+      inline but pipes don't have to strip it). The :mod:`topofuzz.loaders`
+      one-time "executes arbitrary Python" warning also lands here.
+    * Machine-readable JSON → **stdout**. Schema:
+      ``{badge, matched_patterns, rationale}``. Pipe with ``2>/dev/null``
+      to feed ``jq`` cleanly (``topofuzz scan ... | jq`` works; merging
+      streams via ``2>&1 | jq`` does not — the banner is plain prose).
+
+    Exit codes:
+
+    * 0 — scan completed (regardless of badge color; the badge is
+      diagnostic, not a gate). Per BLUEPRINT DoD #11.
+    * 2 — usage error (bad fixture spec, file not found, LLM_CONFIGS
+      malformed, fixture module fails to import/exec). Same code as
+      ``topofuzz run`` for symmetry.
+    * 64 — fixture uses an out-of-scope LangGraph construct (same
+      ``_UNSUPPORTED_GRAPH_EXIT`` as ``run``).
+    """
     _reject_reserved_flags(list(ctx.args))
     _reject_unknown_extras(list(ctx.args))
-    _not_yet("scan", "Weekend 5 step 14")
+
+    # Lazy imports to preserve §11a verify-path safety: ``topofuzz.cli``
+    # MUST NOT pull langgraph at module import time (loaders.load_topology
+    # transitively imports adapter → langgraph). ``topofuzz.scan`` itself
+    # is verify-path-safe but loading topologies needs the run-time stack.
+    import json
+
+    from topofuzz.loaders import load_topology
+    from topofuzz.scan import scan as scan_topology
+
+    # Audit fix CR-MAJOR-1 (pass-1): ``load_topology`` exec_modules an
+    # arbitrary Python file, which can raise ``ImportError`` /
+    # ``SyntaxError`` / ``ModuleNotFoundError`` (nested import failure
+    # inside the fixture) in addition to the originally-enumerated set.
+    # Surface all of those as exit-2 with the documented "failed to load
+    # fixture" prefix — a raw traceback from the gateway-drug feature
+    # contradicts the §5a "instant, friendly" UX contract. We do NOT
+    # catch ``Exception`` blindly because a topofuzz internal bug should
+    # still surface as a traceback; the enumerated set covers every
+    # exception ``load_topology`` is documented (and observed) to raise.
+    try:
+        topology = load_topology(fixture)
+    except NotImplementedError as e:
+        typer.echo(f"topofuzz: unsupported graph construct: {e}", err=True)
+        raise typer.Exit(code=_UNSUPPORTED_GRAPH_EXIT) from e
+    except (
+        FileNotFoundError,
+        ValueError,
+        AttributeError,
+        TypeError,
+        ImportError,
+        SyntaxError,
+    ) as e:
+        # Audit fix RT-M2 (pass-2): prefix the message with the
+        # exception class so an ``ImportError`` is visually
+        # distinguishable from a ``SyntaxError`` without re-running.
+        # ``ImportError`` covers a fixture's own internal-import bugs,
+        # which would otherwise look identical to a missing-fixture-
+        # file message — the class prefix tells a debugger "the file
+        # loaded but its imports failed."
+        typer.echo(
+            f"topofuzz: failed to load fixture: {type(e).__name__}: {e}",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+
+    result = scan_topology(topology)
+
+    # Banner → stderr. Two-line layout: headline (badge + rationale)
+    # followed by the heuristic-only disclaimer and the next-step nudge.
+    # Wrap is implicit on terminal; we do NOT pre-wrap because terminal
+    # widths vary and `rich`/`textwrap` is overkill for ~3 lines.
+    typer.echo(f"{result.badge} RISK — {result.rationale}", err=True)
+    typer.echo(
+        "Heuristic only — false positives and false negatives both exist. "
+        f"Run `topofuzz run {fixture} --eval <file>` to measure actual "
+        "variance.",
+        err=True,
+    )
+
+    # JSON → stdout. ``sort_keys=True`` keeps the byte sequence stable
+    # across Python dict-insertion-order changes so CI snapshot tests
+    # don't flake. No trailing newline beyond ``typer.echo``'s default —
+    # one ``\n`` is conventional and pipe-friendly.
+    typer.echo(json.dumps(result.to_json_dict(), sort_keys=True))
 
 
 @app.command(

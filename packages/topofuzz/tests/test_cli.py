@@ -35,10 +35,13 @@ def test_version_prints_and_exits_cleanly():
     assert "topofuzz" in result.output
 
 
-def test_scan_stub_exits_with_friendly_message():
-    result = CliRunner().invoke(app, ["scan", "some-fixture"])
+def test_scan_bad_fixture_exits_with_friendly_message():
+    """``scan`` is wired in step 14 — bad fixture surfaces as exit 2,
+    not a stub message. End-to-end coverage of the badge dispatch +
+    lending_4role HIGH-RISK live in test_scan.py + test_cli_scan.py."""
+    result = CliRunner().invoke(app, ["scan", "some-nonexistent-fixture:graph"])
     assert result.exit_code == 2
-    assert "not yet implemented" in (result.output or "").lower()
+    assert "failed to load fixture" in (result.output or "").lower()
 
 
 def test_report_bad_run_dir_exits_with_friendly_message():
