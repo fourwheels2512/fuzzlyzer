@@ -614,9 +614,15 @@ def _load_cells_and_rationales(
                             d for d in parsed if isinstance(d, dict)
                         ]
                 except (json.JSONDecodeError, ValueError) as e:
+                    # Audit MINOR-2 fix: log the exception type only, not
+                    # `e` directly. JSONDecodeError.msg can include the
+                    # leading bytes of the offending payload, which on
+                    # this code path is user-controlled (cells.
+                    # node_outputs_json carries LLM-agent text); centralised
+                    # log shippers would otherwise see eval/agent content.
                     _log.warning(
                         "worstcase: node_outputs_json invalid for "
-                        "(%s, %s): %s", vid, eid, e,
+                        "(%s, %s): %s", vid, eid, type(e).__name__,
                     )
 
             judge_row = None

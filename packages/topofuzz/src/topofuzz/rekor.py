@@ -389,9 +389,21 @@ def submit_to_rekor(
                     ok=True, log_entry=stub, error=None,
                     attempts=attempt, url=url,
                 )
+            # The response-body preview belongs in `outcome.error` (the
+            # operator-facing return path — they need it to debug a
+            # malformed envelope), but NOT in the structured WARNING log
+            # — central log shippers would otherwise see server-rendered
+            # detail strings carrying operator identifiers / request paths
+            # / upstream-component-version diagnostics on a misconfigured
+            # Sigstore. Split: full preview goes to the caller, sanitised
+            # status+length goes to the log (audit MINOR-1 fix).
             preview = data[:200].decode("utf-8", errors="replace")
             last_error = f"rekor http {status} on attempt {attempt}: {preview}"
-            _log.warning("rekor: %s url=%s", last_error, url)
+            _log.warning(
+                "rekor: rekor http %d on attempt %d "
+                "(response %d bytes) url=%s",
+                status, attempt, len(data), url,
+            )
             if 400 <= status < 500:
                 # Other 4xx is terminal: a bad payload won't become
                 # good on retry. Surface the body so the operator can

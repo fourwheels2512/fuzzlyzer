@@ -40,6 +40,8 @@ contract belongs with the score type it operates on.
 from __future__ import annotations
 
 import logging
+import math
+import os
 import re
 import threading
 from dataclasses import dataclass
@@ -49,6 +51,49 @@ from typing import Any, Callable, Protocol
 from fuzzeval.canonical import canonical_hash
 
 _log = logging.getLogger(__name__)
+
+# Per-LLM-call timeout (seconds). Env-overridable so an operator can
+# tighten / loosen without code edits. 60s is the default — long enough
+# to absorb a slow Gemini 2.5-pro response on a complex eval, short
+# enough that a hung provider doesn't pin the whole run (no parent
+# supervisor would reap a stuck cell otherwise). v0.5.1 audit-batch
+# MAJOR fix.
+#
+# Hard ceiling at 3600s (1 hour) as defense-in-depth — TOPOFUZZ_
+# LLM_TIMEOUT_SECS=99999999 would otherwise restore the DoS surface
+# the cap was meant to close. The pass-2 red-team also caught that
+# `float("inf")` and `float("nan")` slip past a naive `<= 0` guard
+# (NaN comparisons return False), so the predicate is
+# `math.isfinite(value) AND value > 0` AND `value <= ceiling`.
+_LLM_TIMEOUT_MAX_SECS = 3600.0
+
+
+def _resolve_llm_timeout_secs() -> float:
+    raw = os.environ.get("TOPOFUZZ_LLM_TIMEOUT_SECS", "60")
+    try:
+        value = float(raw)
+    except ValueError:
+        _log.warning(
+            "judge: TOPOFUZZ_LLM_TIMEOUT_SECS=%r is not a float; "
+            "falling back to 60.0", raw,
+        )
+        return 60.0
+    if not math.isfinite(value) or value <= 0:
+        _log.warning(
+            "judge: TOPOFUZZ_LLM_TIMEOUT_SECS=%r is not a positive "
+            "finite float; falling back to 60.0", raw,
+        )
+        return 60.0
+    if value > _LLM_TIMEOUT_MAX_SECS:
+        _log.warning(
+            "judge: TOPOFUZZ_LLM_TIMEOUT_SECS=%r exceeds %ds ceiling; "
+            "clamping to ceiling", raw, int(_LLM_TIMEOUT_MAX_SECS),
+        )
+        return _LLM_TIMEOUT_MAX_SECS
+    return value
+
+
+_LLM_TIMEOUT_SECS = _resolve_llm_timeout_secs()
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +514,11 @@ class SingleJudge:
             "messages": messages,
             "temperature": temperature,
             "max_tokens": self._max_tokens,
+            # v0.5.1 audit MAJOR fix: bound the per-call wall-clock.
+            # LiteLLM's default is 600s; without a cap a single slow
+            # provider can pin every cell in the run. Operators can
+            # override via TOPOFUZZ_LLM_TIMEOUT_SECS env (see module).
+            "timeout": _LLM_TIMEOUT_SECS,
         }
         if self._llm_callable is not None:
             response = self._llm_callable(**kwargs)

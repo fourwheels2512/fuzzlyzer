@@ -449,6 +449,18 @@ def run(
 
     The cost estimator runs first (§12 contract). Confirm to proceed.
     """
+    # Pre-launch disclaimer banner (stderr so it never pollutes the
+    # stdout JSON / file:// URI other subcommands emit). Lands the
+    # legal-surface ask from the 2026-05-13 disclaimers/hardening audit
+    # without spamming users on every `verify` / `keygen` invocation —
+    # only `run` (the only subcommand that calls third-party LLMs and
+    # spends money) surfaces it.
+    typer.echo(
+        "topofuzz: research tool, no warranty. Measures topology "
+        "fragility — not safety or fitness for purpose. See LICENSE.",
+        err=True,
+    )
+
     # Lazy imports of the runtime stack (orchestrator + loaders +
     # variant generators + judge). Keeping these out of module scope
     # is the §11a "verify-path-safe" contract: ``topofuzz verify``
