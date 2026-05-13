@@ -1,13 +1,15 @@
-"""Statistical utilities: Wilson CI + percentile bootstrap.
+"""Statistical utilities: Wilson CI, percentile bootstrap, and the
+two-level paired cluster bootstrap used by topofuzz's
+variance-across-orderings CI (BLUEPRINT §9 metric #1).
 
-Cluster bootstrap (the two-level paired resampler used by topofuzz for its
-variance-across-orderings CI) lands in Weekend 2 step 8. The signature is
-defined here so dependent packages can import against the §17a contract.
+Public API frozen per BLUEPRINT_v5plus.md §17a so dependent packages
+(pramana-eval and others) can import against the contract on Day 1.
 """
 
 from __future__ import annotations
 
 import math
+import numbers
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
@@ -159,13 +161,178 @@ def percentile_cluster_bootstrap(
     conf: float = 0.95,
     outer_axis: int = 1,
     inner_axis: int = 0,
+    *,
+    seed: int | None = None,
 ) -> BootstrapResult:
-    """Two-level paired cluster bootstrap (variant × eval). Step 8.
+    """Two-level paired cluster bootstrap on a 2D score matrix.
 
-    Signature locked per BLUEPRINT_v5plus.md §17a so dependent packages can
-    import against it Day 1.
+    Resamples outer clusters (TSF: ``eval_id``, axis 1) and inner clusters
+    (TSF: ``variant_id``, axis 0) each with replacement. The same inner
+    resampling is applied across every chosen outer cluster on each draw —
+    that's the "paired" part — so within-row correlation structure across
+    evals is preserved. ``statistic`` is evaluated on the original matrix
+    (point estimate) and on each resampled (n_inner, n_outer)-shaped matrix.
+    Returns a ``conf``-level percentile CI from the resample distribution.
+
+    The API is statistic-agnostic: topofuzz's canonical use is
+    ``variance_across_orderings`` (BLUEPRINT §9 metric #1) ::
+
+        import numpy as np
+        scores = np.random.default_rng(0).random((5, 8))
+        stat = lambda m: float(np.mean(np.var(m, axis=0)))
+        result = percentile_cluster_bootstrap(scores, stat, seed=0)
+
+    but pramana-eval and other consumers can pass their own closures.
+
+    Signature locked per BLUEPRINT_v5plus.md §17a; ``seed`` is an additive
+    keyword-only extension matching the ``percentile_bootstrap`` precedent
+    so property tests can pin RNG state.
+
+    Args:
+        matrix: 2D score matrix with a numeric dtype (float/int/bool/uint).
+            Empty along either axis or containing non-finite entries
+            (NaN / inf) is treated as degenerate.
+        statistic: maps a 2D array to a scalar. Should be invariant under
+            permutation of whichever axis the bootstrap is paired over.
+        n_resamples: number of bootstrap draws (must be positive). The
+            default of 5000 per §9 is the recommended minimum for a
+            meaningful percentile CI.
+        conf: confidence level in (0, 1). Default 0.95.
+        outer_axis: axis whose clusters are sampled at the outer level
+            (TSF: eval_id, default 1).
+        inner_axis: axis whose clusters are sampled (paired) at the inner
+            level (TSF: variant_id, default 0).
+        seed: RNG seed for ``np.random.default_rng``; ``None`` is
+            non-deterministic.
+
+    Returns:
+        BootstrapResult with ``method="percentile"``. When ``matrix`` is
+        empty along either axis, every entry is identical, or any entry
+        is non-finite, returns ``ci_lower = ci_upper = None`` with
+        ``degenerate_flag=True`` and ``n_resamples=0`` (mirroring
+        ``percentile_bootstrap`` and the §9 ECR degenerate-cell convention).
+        In the all-equal case ``point_estimate`` is the constant value
+        (``arr[0, 0]``) rather than ``statistic(arr)`` — the statistic is
+        never invoked on degenerate input. For empty / non-finite matrices,
+        ``point_estimate`` is ``nan``.
+
+        A single-row or single-column matrix is **not** flagged degenerate —
+        the bootstrap is mathematically valid but degenerates content-wise
+        (zero variance across the singleton axis). For the (1, N) row case
+        this produces ``point=0, ci=[0, 0], degenerate_flag=False``, which
+        will render in §9's report as ``0.0 [0.0, 0.0]`` rather than as an
+        ECR-style dash. Callers that need the dash behaviour should check
+        ``matrix.shape[inner_axis] >= 2`` upstream.
+
+    Performance:
+        Pre-draws the resample indices as two ``(n_resamples, ·)`` int64
+        arrays — roughly ``8 · n_resamples · (n_inner + n_outer)`` bytes.
+        For §9 defaults (5,000 × 5 × 50) this is ~4 MB. Above
+        ``n_resamples ≈ 100_000`` on large matrices, callers should chunk.
+
+    Raises:
+        ValueError: matrix is not 2D, has a non-numeric dtype, ``conf`` is
+            outside (0, 1), ``n_resamples`` is not positive, or axes are
+            not a permutation of ``{0, 1}`` (with ``numbers.Integral``
+            values only — ``bool``/``float``/out-of-range are rejected).
+        ImportError: numpy is not installed (install the ``[stats]`` extra).
     """
-    raise NotImplementedError(
-        "percentile_cluster_bootstrap is implemented in step 8. "
-        "For step 2, use percentile_bootstrap on flattened data."
+    try:
+        import numpy as np
+    except ImportError as e:
+        raise ImportError(
+            "fuzzeval.stats.percentile_cluster_bootstrap requires the "
+            "[stats] extra: `pip install fuzzeval[stats]`"
+        ) from e
+
+    arr = np.asarray(matrix)
+    if arr.ndim != 2:
+        raise ValueError(f"matrix must be 2D; got ndim={arr.ndim}")
+    # dtype kind: f=float, i=int, u=uint, b=bool. Anything else (object,
+    # str, datetime, complex) is off-contract and `np.isfinite` would
+    # raise a confusing TypeError downstream — refuse here, loudly.
+    if arr.dtype.kind not in "fiub":
+        raise ValueError(
+            f"matrix dtype must be numeric (float/int/uint/bool); "
+            f"got dtype={arr.dtype!s}"
+        )
+    # Reject bool/float/np.int subclass-mismatch axes explicitly. Python
+    # treats True/1.0 as set-equal to 1, which would silently bypass the
+    # {0, 1} check; `numbers.Integral` covers `int` + `np.int64` + ...,
+    # excluding bool which we reject separately.
+    def _bad_axis(a: object) -> bool:
+        return isinstance(a, bool) or not isinstance(a, numbers.Integral)
+
+    if (
+        _bad_axis(outer_axis) or _bad_axis(inner_axis)
+        or {int(outer_axis), int(inner_axis)} != {0, 1}
+    ):
+        raise ValueError(
+            "axes (outer_axis, inner_axis) must be a permutation of "
+            f"{{0, 1}}; got outer_axis={outer_axis!r} "
+            f"inner_axis={inner_axis!r}"
+        )
+    if not 0.0 < conf < 1.0:
+        raise ValueError(f"conf must be in (0, 1); got {conf}")
+    if n_resamples <= 0:
+        raise ValueError(f"n_resamples must be positive; got {n_resamples}")
+
+    # Canonicalize: axis 0 = inner (variant), axis 1 = outer (eval).
+    if int(inner_axis) == 1:
+        arr = arr.T
+    n_inner, n_outer = arr.shape
+
+    # Degenerate paths: empty / non-finite / all-equal. All resolved
+    # BEFORE the point-estimate `statistic(arr)` call so niche statistics
+    # that don't tolerate degenerate input never see it.
+    if n_inner == 0 or n_outer == 0:
+        return BootstrapResult(
+            point_estimate=float("nan"),
+            ci_lower=None,
+            ci_upper=None,
+            n_resamples=0,
+            method="percentile",
+            degenerate_flag=True,
+        )
+    if not bool(np.all(np.isfinite(arr))):
+        return BootstrapResult(
+            point_estimate=float("nan"),
+            ci_lower=None,
+            ci_upper=None,
+            n_resamples=0,
+            method="percentile",
+            degenerate_flag=True,
+        )
+    if bool(np.all(arr == arr[0, 0])):
+        return BootstrapResult(
+            point_estimate=float(arr[0, 0]),
+            ci_lower=None,
+            ci_upper=None,
+            n_resamples=0,
+            method="percentile",
+            degenerate_flag=True,
+        )
+
+    point = float(statistic(arr))
+
+    # Pre-draw all resample indices in two RNG calls for ~2× speedup
+    # over a per-iteration draw. Same seed → same byte stream → same
+    # bootstrap distribution (different from a per-iteration scheme,
+    # but deterministically so).
+    rng = np.random.default_rng(seed)
+    outer_indices = rng.integers(0, n_outer, size=(n_resamples, n_outer))
+    inner_indices = rng.integers(0, n_inner, size=(n_resamples, n_inner))
+    resamples = np.empty(n_resamples, dtype=float)
+    for i in range(n_resamples):
+        sampled = arr[inner_indices[i][:, None], outer_indices[i][None, :]]
+        resamples[i] = float(statistic(sampled))
+
+    alpha = (1.0 - conf) / 2.0
+    return BootstrapResult(
+        point_estimate=point,
+        ci_lower=float(np.quantile(resamples, alpha)),
+        ci_upper=float(np.quantile(resamples, 1.0 - alpha)),
+        n_resamples=n_resamples,
+        method="percentile",
+        degenerate_flag=False,
     )
