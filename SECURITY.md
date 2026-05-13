@@ -52,8 +52,20 @@ keys/dev.pub.pem
 For a tagged release the stable URL is:
 
 ```
-https://github.com/kirannayudu/topofuzz/blob/v0.5.0/keys/dev.pub.pem
+https://github.com/kirannayudu/topofuzz/blob/v0.5.0rc1/keys/dev.pub.pem
 ```
+
+The pubkey is byte-identical across the `v0.5.0rc1` → `v0.5.0` promotion
+(same dev-key fixture); on GA promotion the canonical URL switches to
+`/blob/v0.5.0/...` without re-signing the v0.5 fixture bundle. This
+byte-identical promise is enforced by code-review discipline plus the
+sha256-pin in
+[`packages/topofuzz/tests/test_release_fixture_pins.py`](https://github.com/kirannayudu/topofuzz/blob/main/packages/topofuzz/tests/test_release_fixture_pins.py)
+— the test MUST exist at every release tag; a rotation requires
+bumping the pinned digest in the same commit. The pin protects
+against accidental `_regen.py` runs but does not defeat an adversary
+with merge access; for external trust, pin to a GitHub-immutable tag
+URL like `/blob/v0.5.0rc1/keys/dev.pub.pem` rather than `main`.
 
 The private half is **never** committed. Anyone running
 `topofuzz keygen` generates their own keypair locally; the committed
@@ -125,6 +137,16 @@ What it deliberately omits relative to `topofuzz verify`:
 * **Run-dir binding**: `topofuzz verify` re-hashes `run.sqlite` and
   re-canonicalizes the on-disk `manifest.json` against the envelope's
   signed copies. The reference script verifies only the envelope.
+* **`payloadType` semantic binding**: integrators using this reference
+  script as a security boundary **MUST** add an explicit
+  `assert env["payloadType"] == EXPECTED_TYPE` before trusting the
+  payload. The PAE-binding only catches *mutation of an existing
+  envelope* — it does NOT catch a fresh signature over an
+  attacker-chosen `payloadType` value (any signer with any key can
+  produce a valid envelope claiming any type). `topofuzz verify` does
+  enforce the canonical `application/vnd.topofuzz.run+json;v=<v>`
+  string match; the reference script omits this check for minimality
+  and that is why it is labeled a reference, not a security boundary.
 
 **Reproducing the test:**
 
@@ -201,9 +223,12 @@ cache format to JSON-only to remove this surface entirely.
 
 ## Reporting vulnerabilities
 
-Open an issue at
-<https://github.com/kirannayudu/topofuzz/issues> with the label
-`security` if the finding can be safely disclosed publicly. For
-findings that require coordinated disclosure, email the maintainer
-(address in `pyproject.toml`'s authors block) with a PGP-encrypted
-message; key fingerprint lands here at v0.6.
+For findings that can be safely disclosed publicly, open an issue at
+<https://github.com/kirannayudu/topofuzz/issues> with the label `security`.
+
+For findings that require coordinated disclosure, use GitHub's private
+vulnerability reporting at
+<https://github.com/kirannayudu/topofuzz/security/advisories/new>. The
+maintainer is alerted automatically and the report stays private until
+a fix is published. A PGP public key + fingerprint will be added here
+at v0.6.

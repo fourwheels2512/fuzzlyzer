@@ -40,3 +40,184 @@ jobs:
         # pyproject.toml `[tool.pytest.ini_options]` points testpaths at
         # both packages, so a bare `pytest` here discovers all 168+ tests.
         run: uv run --python ${{ matrix.python-version }} pytest -ra
+
+  verify-install-smoke:
+    # DoD #1 (BLUEPRINT_v5plus.md line 432): `pip install topofuzz`
+    # (verify-only) must install cleanly on macOS + Linux + Windows.
+    # Matrix expands across Python 3.11 + 3.13 so the verify-only
+    # promise holds on the oldest supported runtime as well as current.
+    # DoD #5 (BLUEPRINT_v5plus.md line 436): also exercises a real
+    # `topofuzz verify` against the packaged signed fixture so
+    # `--help` doesn't become the only enforced check.
+    name: verify-only install smoke (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Pin to two Python versions to cover the range without
+        # ballooning to a 12-cell matrix. 3.11 is the floor declared
+        # in pyproject.toml; 3.13 is the most-likely first-touch
+        # runtime.
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install fuzzeval (base) then topofuzz (base) from local source
+        # No extras. This is the verify-only path: no langgraph, no
+        # LLM SDKs, no matplotlib. Two-step install because the
+        # workspace `[tool.uv.sources]` block isn't honored by plain
+        # `pip install` outside the uv resolver — we install fuzzeval
+        # by path first so the topofuzz dep resolves locally.
+        run: |
+          python -m pip install --upgrade pip
+          pip install ./packages/fuzzeval
+          pip install ./packages/topofuzz
+
+      - name: Confirm verify codepath imports without LLM stack
+        # topofuzz.cli.verify must NOT transitively pull langgraph /
+        # litellm / matplotlib / jinja2 (§11a). The pytest-side
+        # regression guard lives in test_import_guard.py; this smoke
+        # check re-asserts at the OS layer, because the import guard
+        # only runs under the full-stack install above.
+        run: |
+          python -c "import topofuzz, topofuzz.cli; print(topofuzz.__version__)"
+          python -m topofuzz --help
+          python -m topofuzz verify --help
+        shell: bash
+
+      - name: Assert verify-path-forbidden modules are NOT installed
+        # Audit pass-1 RT-M-3 + pass-2 CR-M-3: `--help` alone doesn't
+        # catch a future PR that adds `import jinja2` inside
+        # `cli.verify`. The forbidden tuple here MUST match the
+        # canonical list in
+        # `packages/topofuzz/tests/test_import_guard.py::FORBIDDEN` —
+        # if you add to one, add to the other.
+        run: |
+          python -c "
+          import importlib.util as u
+          forbidden = [
+              'langgraph', 'litellm', 'anthropic', 'openai',
+              'google.genai', 'matplotlib', 'jinja2', 'numpy', 'scipy',
+          ]
+          found = []
+          for m in forbidden:
+              try:
+                  if u.find_spec(m) is not None:
+                      found.append(m)
+              except (ImportError, ModuleNotFoundError):
+                  # Parent package absent — counts as absent for the
+                  # dotted module (google.genai) too.
+                  pass
+          if found:
+              raise SystemExit(f'verify-only install pulled forbidden modules: {found}')
+          print('verify-only sys.path clean')"
+        shell: bash
+
+      - name: Verify the packaged signed fixture end-to-end
+        # DoD #5 (BLUEPRINT_v5plus.md line 436): `topofuzz verify`
+        # must return exit 0 on a signed bundle AND exit 1 on a
+        # tampered one — and crucially, this must work on a
+        # verify-only install (no LangGraph, no LLM SDKs). Audit
+        # RT-B-3 fix.
+        run: |
+          # The committed fixture under packages/topofuzz/tests/fixtures/signed/
+          # holds attestation.json + manifest.json + run.sqlite signed by the
+          # dev keypair. The published pubkey lives at repo root keys/dev.pub.pem
+          # (per _regen.py docstring + BLUEPRINT_v5plus.md §17a). The CLI's
+          # --pubkey flag bypasses ~/.topofuzz lookup so this works on a fresh
+          # machine with no `topofuzz keygen` call.
+          python -m topofuzz verify \
+            packages/topofuzz/tests/fixtures/signed \
+            --pubkey keys/dev.pub.pem
+        shell: bash
+
+      - name: Verify rejects a tampered fixture (negative test)
+        # The other half of DoD #5: tampering returns exit 1, NOT 0.
+        # Mutate one byte of the payload then re-run verify — must fail.
+        run: |
+          python - <<'PY'
+          import json, base64, shutil, subprocess, sys
+          from pathlib import Path
+          src = Path('packages/topofuzz/tests/fixtures/signed/attestation.json')
+          tampered = Path('attestation.tampered.json')
+          shutil.copy(src, tampered)
+          env = json.loads(tampered.read_bytes())
+          payload = bytearray(base64.b64decode(env['payload']))
+          payload[0] ^= 0x01
+          env['payload'] = base64.b64encode(bytes(payload)).decode('ascii')
+          tampered.write_text(json.dumps(env))
+          r = subprocess.run(
+              [sys.executable, '-m', 'topofuzz', 'verify', '-',
+               '--bundle', str(tampered),
+               '--pubkey', 'keys/dev.pub.pem'],
+              capture_output=True,
+          )
+          if r.returncode == 0:
+              sys.exit('FAIL: tampered fixture verified as if untampered')
+          print(f'tampered fixture rejected with exit {r.returncode} (expected nonzero)')
+          PY
+        shell: bash
+
+  full-install-smoke:
+    # DoD #1 (BLUEPRINT_v5plus.md line 432) second half: `pip install
+    # topofuzz[full]` must install cleanly on macOS + Linux + Windows.
+    # The verify-install-smoke job above covers the base install on 3
+    # OSes × 2 Python versions; this job covers the full-stack install
+    # on the same 3 OSes for the most-likely first-touch Python (3.13).
+    # Kept narrow to bound CI cost — the ubuntu `test` job above
+    # exercises the full-stack against the entire pytest suite.
+    name: full-extras install smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install topofuzz[full] from local source
+        # Approximate (not identical to) `pip install topofuzz[full]==0.5.0rc1`:
+        #   1. fuzzeval is pre-installed from local source, so the
+        #      second `pip install` resolves fuzzeval locally — a
+        #      real PyPI consumer hits PyPI for fuzzeval instead.
+        #      This means publish-order failures (topofuzz on PyPI
+        #      but fuzzeval not yet on PyPI) are NOT caught by this
+        #      job; the trip-wire lives in the release.yml comment
+        #      block describing the manual publish discipline (audit
+        #      pass-2 RT-F5 documented gap).
+        #   2. Heavy transitive deps (langgraph, litellm, anthropic,
+        #      openai, matplotlib, jinja2, etc.) ARE pulled from
+        #      PyPI here — pip resolves the latest within the
+        #      declared ranges, NOT the version uv.lock pins.
+        #      Intentional: this job is the float-tester that
+        #      catches PyPI drift before a real consumer does
+        #      (audit pass-2 RT-F4 documented gap).
+        run: |
+          python -m pip install --upgrade pip
+          pip install ./packages/fuzzeval[stats,cache]
+          pip install ./packages/topofuzz[full]
+
+      - name: Smoke-check full-stack imports
+        # Importing topofuzz.runner pulls langgraph; topofuzz.report
+        # pulls matplotlib + jinja2. Both must succeed under [full].
+        run: |
+          python -c "
+          import topofuzz, topofuzz.runner, topofuzz.report
+          import langgraph, litellm, anthropic, openai, matplotlib, jinja2
+          print('topofuzz', topofuzz.__version__, 'full-stack imports OK')"
+        shell: bash

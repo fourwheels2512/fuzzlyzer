@@ -1,0 +1,95 @@
+name: Release (build + twine check)
+
+# Dry-run release pipeline. Builds wheels + sdists for both packages
+# and runs `twine check` on every tag matching v* (topofuzz) or
+# fuzzeval-v* (fuzzeval). The actual PyPI upload step is intentionally
+# **commented out** — v0.5.0rc1 ships via a human pulling the trigger
+# from a clean local machine after smoke-test feedback.
+#
+# This workflow is the CI safety net: it confirms `uv build` and
+# `twine check` both pass on the tagged commit before the human ever
+# runs `twine upload`. When v0.5.0rc1 → v0.5.0 promotion happens, the
+# upload step can be uncommented after the trusted-publisher GitHub
+# OIDC config is in place.
+
+on:
+  push:
+    tags:
+      # Topofuzz release tags: v0.5.0rc1, v0.5.0, v0.5.1, v1.0.0, ...
+      # The character class guards against accidental noise tags like
+      # `vendor-bump`, `v-test`, etc. (audit RT-M-4 fix).
+      - "v[0-9]*"
+      # Fuzzeval release tags: fuzzeval-v0.1.0, fuzzeval-v0.2.0, ...
+      - "fuzzeval-v[0-9]*"
+  # Manual dispatch for testing the build path without cutting a tag.
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build wheels + sdists
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.13
+        run: uv python install 3.13
+
+      - name: Build fuzzeval wheel + sdist
+        run: uv build --package fuzzeval --out-dir dist-fuzzeval
+
+      - name: Build topofuzz wheel + sdist
+        run: uv build --package topofuzz --out-dir dist-topofuzz
+
+      - name: Install twine
+        run: uv tool install twine
+
+      - name: twine check fuzzeval
+        run: uv tool run twine check dist-fuzzeval/*
+
+      - name: twine check topofuzz
+        run: uv tool run twine check dist-topofuzz/*
+
+      - name: Upload built artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dists
+          path: |
+            dist-fuzzeval/*
+            dist-topofuzz/*
+          if-no-files-found: error
+          retention-days: 14
+
+      # PyPI upload intentionally commented out — see file header.
+      # When trusted-publishers OIDC is configured (one publisher per
+      # package on PyPI), uncomment EXACTLY ONE of the steps below.
+      # Per-tag-prefix gating routes each tag to its own dist dir so a
+      # `fuzzeval-v*` push doesn't try to publish the topofuzz wheel
+      # under the fuzzeval tag context (audit M-3 / RT-M-2 fix).
+      #
+      # Publish-order discipline (audit RT-M-6):
+      #   fuzzeval MUST be on PyPI BEFORE topofuzz, because
+      #   topofuzz/pyproject.toml pins `fuzzeval>=0.1,<0.2`. The
+      #   recommended sequence is:
+      #     1. Tag and push `fuzzeval-v0.1.0` — workflow publishes
+      #        fuzzeval. Wait for PyPI to make the wheel available
+      #        (~30 seconds, sometimes longer for index propagation).
+      #     2. Tag and push `v0.5.0rc1` — workflow publishes topofuzz,
+      #        which now resolves fuzzeval from the live PyPI index.
+      #
+      # - name: Publish topofuzz to PyPI
+      #   if: startsWith(github.ref, 'refs/tags/v')
+      #   uses: pypa/gh-action-pypi-publish@release/v1
+      #   with:
+      #     packages-dir: dist-topofuzz/
+      #
+      # - name: Publish fuzzeval to PyPI
+      #   if: startsWith(github.ref, 'refs/tags/fuzzeval-v')
+      #   uses: pypa/gh-action-pypi-publish@release/v1
+      #   with:
+      #     packages-dir: dist-fuzzeval/

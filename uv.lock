@@ -907,7 +907,7 @@ wheels = [
 
 [[package]]
 name = "fuzzeval"
-version = "0.1.0.dev0"
+version = "0.1.0"
 source = { editable = "packages/fuzzeval" }
 dependencies = [
     { name = "cryptography" },
@@ -928,7 +928,7 @@ stats = [
 requires-dist = [
     { name = "cryptography", specifier = ">=42" },
     { name = "diskcache", marker = "extra == 'cache'", specifier = ">=5.6" },
-    { name = "numpy", marker = "extra == 'stats'", specifier = ">=1.26" },
+    { name = "numpy", marker = "extra == 'stats'", specifier = ">=1.26,<3" },
     { name = "pydantic", specifier = ">=2.5" },
     { name = "rfc8785", specifier = ">=0.1" },
     { name = "scipy", marker = "extra == 'stats'", specifier = ">=1.13" },
@@ -3073,7 +3073,7 @@ wheels = [
 
 [[package]]
 name = "topofuzz"
-version = "0.5.0.dev0"
+version = "0.5.0rc1"
 source = { editable = "packages/topofuzz" }
 dependencies = [
     { name = "cryptography" },

@@ -1,10 +1,10 @@
 """fuzzeval — shared eval infrastructure for topofuzz (and siblings).
 
-Public API. Note: :func:`percentile_cluster_bootstrap` is a §17a contract
-pin that lands in step 8; calling it before then raises
-``NotImplementedError``. Importing it (and the rest of the package) at
-module load is intentionally cheap so callers can wire the surface today
-and rely on the implementation as it lands.
+Public API per BLUEPRINT_v5plus.md §17a. All listed symbols are
+implemented as of v0.1.0 (released alongside topofuzz v0.5.0rc1).
+Importing the package is intentionally cheap so the verify-only path
+stays under its dependency budget — no LangGraph and no LLM SDKs are
+pulled at import time.
 """
 
 from fuzzeval.attestation import (
@@ -47,7 +47,7 @@ from fuzzeval.stats import (
     wilson_ci,
 )
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"
 
 __all__ = [
     "BinaryScore",

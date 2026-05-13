@@ -1,18 +1,32 @@
 [project]
 name = "fuzzeval"
-version = "0.1.0.dev0"
+# Ride alongside topofuzz v0.5.0rc1 — fuzzeval is the verify-path
+# substrate, so its 0.1.0 release covers DSSE primitives + judge
+# (single + jury) + stats + cache + costest + keys API surface.
+version = "0.1.0"
 description = "Shared eval infrastructure for topofuzz and other multi-agent eval tools"
 readme = "README.md"
 license = { text = "Apache-2.0" }
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "Kiran Nayudu" }]
+keywords = ["llm", "evaluation", "dsse", "attestation", "judge", "statistics"]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 # Verify-path-safe deps only (no LangGraph, no LLM SDKs, no numpy).
 # Heavy deps live in extras so `topofuzz[verify]` stays ~15MB.
@@ -24,7 +38,11 @@ dependencies = [
 
 [project.optional-dependencies]
 stats = [
-    "numpy>=1.26",
+    # Upper bound: numpy 3.x may change dtype/bootstrap semantics in a way
+    # that shifts canonical_hash on percentile_cluster_bootstrap CIs.
+    # Bump deliberately and re-bless any stats-touching golden tests
+    # together (audit RT-N3 fix).
+    "numpy>=1.26,<3",
     "scipy>=1.13",
 ]
 cache = [
@@ -32,12 +50,20 @@ cache = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/kirannayudu/fuzzeval"
-Repository = "https://github.com/kirannayudu/fuzzeval"
-Issues = "https://github.com/kirannayudu/fuzzeval/issues"
+Homepage = "https://github.com/kirannayudu/topofuzz"
+Repository = "https://github.com/kirannayudu/topofuzz"
+Issues = "https://github.com/kirannayudu/topofuzz/issues"
+Changelog = "https://github.com/kirannayudu/topofuzz/blob/main/packages/fuzzeval/CHANGELOG.md"
+Documentation = "https://github.com/kirannayudu/topofuzz/blob/main/packages/fuzzeval/README.md"
 
 [build-system]
-requires = ["hatchling"]
+# hatchling >= 1.27 implements the **finalized** PEP 639 `license-files`
+# semantics (array of glob patterns). Earlier versions (1.5-1.25) shipped
+# draft-spec behavior; 1.26 was a transitional release. Pinning at >=1.27
+# is the safest floor that guarantees the `License-File` field lands in
+# wheel metadata across every consumer's build environment (audit pass-2
+# CR-B2 fix).
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

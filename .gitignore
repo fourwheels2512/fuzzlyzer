@@ -8,9 +8,15 @@ __pycache__/
 *.egg-info/
 *.egg
 dist/
+dist-*/
 build/
 wheels/
 *.whl
+*.tar.gz
+
+# CI fixtures (negative-test mutation of the signed fixture; CI workflow
+# writes this at workspace root and never cleans it up)
+attestation.tampered.json
 
 # Virtual environments
 .venv/
