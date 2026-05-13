@@ -307,6 +307,16 @@ def test_align_raises_on_missing_orderings():
     assert exc.value.reason == "missing"
 
 
+@pytest.mark.parametrize("bad_manifest", [None, [], "manifest", 42, object()])
+def test_align_raises_on_non_dict_manifest(bad_manifest):
+    """Post-step-15 cross-check: a non-dict manifest used to crash with
+    AttributeError, which the silent-degrade callers (attest, report)
+    don't catch. Must surface as OrderingAlignmentError."""
+    with pytest.raises(OrderingAlignmentError) as exc:
+        align_orderings_to_matrix(bad_manifest, ("a",))
+    assert exc.value.reason == "malformed"
+
+
 def test_align_raises_on_malformed_orderings():
     manifest = _manifest_with(["a", "b", "c"], [["A"], ["B"]])  # length mismatch
     with pytest.raises(OrderingAlignmentError) as exc:

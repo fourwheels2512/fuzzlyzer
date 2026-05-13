@@ -116,9 +116,9 @@ submitting jobs; `-y` skips the prompt.
 |---|---|
 | `topofuzz run`    | Permute topology, run all `(variant, eval_row)` cells, sign the bundle. |
 | `topofuzz verify` | DSSE-verify an output bundle. Works without LLM SDKs installed. |
-| `topofuzz report` | Render HTML report with two SVGs and [§A](https://github.com/kirannayudu/topofuzz/blob/main/BLUEPRINT_v5plus.md) banners. |
+| `topofuzz report` | Render HTML report with voo bar + heatmap + per-agent influence panel (§6a) and [§A](https://github.com/kirannayudu/topofuzz/blob/main/BLUEPRINT_v5plus.md) banners. |
 | `topofuzz keygen` | Generate a dev Ed25519 signing keypair in `~/.topofuzz/`. |
-| `topofuzz scan`   | Static risk badge — stub in v0.5.0rc1, lands Weekend 5 (v0.5.1). |
+| `topofuzz scan`   | Static risk badge — zero-LLM-cost HIGH/MEDIUM/LOW rule-based scanner over the Topology IR (BLUEPRINT §5a). |
 
 Full option lists: `topofuzz <cmd> --help`.
 
@@ -132,6 +132,7 @@ approve/deny calls — that is the kind of brittleness the tool surfaces.
 
 The report also includes:
 
+- **Per-agent influence (§6a)** — for each agent, `P(answer flips | agent moved between two variants) − P(answer flips | agent in same slot)`, with a 95% bootstrap CI per agent. Negative = stabilising. The signed `attestation.json` carries the same list under `findings.per_agent_influence`.
 - **Per-eval variance** — which rows in the eval set are most order-sensitive.
 - **ECR (Effective Cell Rank)** — degenerate-cell-aware effective sample size.
 - **Cohen's κ + balanced accuracy** — judge-vs-ground-truth agreement.

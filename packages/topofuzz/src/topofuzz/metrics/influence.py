@@ -131,6 +131,17 @@ def align_orderings_to_matrix(
     placeholder so the operator sees an explanation rather than a
     wrong-axis influence chart.
     """
+    # Non-dict manifest (None, Pydantic model, list) would otherwise
+    # crash with AttributeError inside ``manifest.get`` — and the two
+    # on-disk consumers (attest, report) only catch
+    # OrderingAlignmentError. Surface as a structured exception so the
+    # silent-degrade contract in those modules' docstrings stays
+    # honest (post-step-15 cross-check finding).
+    if not isinstance(manifest, dict):
+        raise OrderingAlignmentError(
+            "malformed",
+            f"manifest must be a dict; got {type(manifest).__name__}",
+        )
     orderings = manifest.get("variant_orderings")
     if not orderings or not isinstance(orderings, list):
         raise OrderingAlignmentError(
