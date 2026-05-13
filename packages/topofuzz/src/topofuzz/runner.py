@@ -74,6 +74,7 @@ would orphan the response without caching it.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import sqlite3
@@ -278,6 +279,7 @@ async def run_variant(
     judge_model_version: str = "",
     semaphore: asyncio.Semaphore | None = None,
     prompt_builder: PromptBuilder = _default_prompt,
+    judge_prompt_renderer: Callable[[dict], str] | None = None,
     model_served_version_resolver: ServedVersionResolver = _identity_resolver,
     llm_callable: LLMCallable | None = None,
     cancel: asyncio.Event | None = None,
@@ -311,6 +313,16 @@ async def run_variant(
             calls. Default fresh ``Semaphore(8)`` — useful in tests, wrong
             for production (each call would get its own cap).
         prompt_builder: See type alias docstring.
+        judge_prompt_renderer: Optional ``(payload: dict) -> str`` used to
+            compute the §7 JudgeCache ``prompt_hash`` slot. Step 7+
+            callers pass :meth:`fuzzeval.judge.SingleJudge.render_prompt`
+            so the cache key is the byte-exact prompt the judge saw.
+            When ``None`` (step-5 callers / no judge) the runner falls
+            back to hashing the full ``eval_row`` — preserves step-5
+            behavior but produces a different cache row than the
+            renderer version. A renderer that raises produces a
+            ``judge_failure`` cell rather than falling back, so a buggy
+            renderer is loud, not silent.
         model_served_version_resolver: See type alias docstring.
         llm_callable: See type alias docstring.
         cancel: Optional :class:`asyncio.Event` checked between nodes and
@@ -442,6 +454,7 @@ async def run_variant(
         variant_id=ir_hash,
         rubric_hash=rubric_hash,
         judge_model_version=judge_model_version,
+        judge_prompt_renderer=judge_prompt_renderer,
     )
 
     return Cell(
@@ -600,19 +613,59 @@ async def _run_judge(
     variant_id: str,
     rubric_hash: str,
     judge_model_version: str,
+    judge_prompt_renderer: Callable[[dict], str] | None = None,
 ) -> tuple[JudgeResult | None, bool, str | None]:
     if judge is None or not outputs:
         return None, False, None
 
     final_output = outputs[-1].response_text
+    payload = {
+        "variant_id": variant_id,
+        "eval_row": eval_row,
+        "agent_output": final_output,
+    }
+
+    # §7 ``prompt_hash`` slot.
+    #
+    # Step 7 refinement: when the caller supplies ``judge_prompt_renderer``
+    # (typically ``SingleJudge.render_prompt``), hash the rendered text
+    # exactly as the judge would see it. Two cells whose rendered prompts
+    # are byte-equal therefore share a JudgeCache row — the right
+    # invalidation behavior when the rubric or the per-row substitution
+    # changes.
+    #
+    # Step 5/6 fallback: hash the full eval_row. This keeps step-5
+    # behavior intact for callers (mostly tests) that supply a Judge but
+    # no renderer. A renderer that itself raises (bad payload, template
+    # error) is caught here and converted into a judge_failure cell —
+    # the eval_row hash is NOT used as a fallback after the renderer
+    # raised, because that would silently let a buggy renderer share a
+    # cache row with the step-5 stopgap behavior.
+    #
+    # We pass a ``copy.deepcopy`` of the payload to the renderer so a
+    # buggy user-supplied renderer that mutates ``payload['eval_row']``
+    # in place can't poison the judge's view downstream (audit MINOR:
+    # renderer mutation risk).
+    if judge_prompt_renderer is not None:
+        try:
+            rendered = judge_prompt_renderer(copy.deepcopy(payload))
+        except Exception as e:  # noqa: BLE001 — boundary: untrusted user code
+            return None, True, (
+                f"judge_prompt_renderer raised "
+                f"{type(e).__name__}: {e}"
+            )
+        if not isinstance(rendered, str):
+            return None, True, (
+                "judge_prompt_renderer returned "
+                f"{type(rendered).__name__}; expected str."
+            )
+        prompt_hash = canonical_hash(rendered)
+    else:
+        prompt_hash = _eval_row_hash(eval_row)
+
     judge_identity = {
         "rubric_hash": rubric_hash,
-        # NOTE: §7 spec text labels this slot ``prompt_hash``. v0.5 hashes
-        # the entire eval_row (not just ``input``) so multi-key rows that
-        # differ in ``expected_answer`` / ``category`` don't collide on a
-        # cached judgement. Step 7 will refine this once the rubric
-        # template is concrete.
-        "prompt_hash": _eval_row_hash(eval_row),
+        "prompt_hash": prompt_hash,
         "response_hash": canonical_hash(final_output),
         "judge_model_version": judge_model_version,
     }
@@ -621,12 +674,6 @@ async def _run_judge(
         cached = judge_cache.get(judge_identity)
         if cached is not None:
             return cached, False, None
-
-    payload = {
-        "variant_id": variant_id,
-        "eval_row": eval_row,
-        "agent_output": final_output,
-    }
     try:
         # Judge.score is sync per the Protocol; offload to a worker thread
         # so a slow judge doesn't block the event loop's other run_variant

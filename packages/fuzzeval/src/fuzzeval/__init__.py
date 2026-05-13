@@ -10,7 +10,15 @@ and rely on the implementation as it lands.
 from fuzzeval.cache import JudgeCache, LLMCache
 from fuzzeval.canonical import canonical_hash
 from fuzzeval.costest import CostEstimate, CostLine, estimate
-from fuzzeval.judge import BinaryScore, ContinuousScore, Judge, JudgeResult
+from fuzzeval.judge import (
+    BinaryScore,
+    ContinuousScore,
+    Judge,
+    JudgeResult,
+    JudgeUnparseableError,
+    SingleJudge,
+    binary_from_continuous,
+)
 from fuzzeval.stats import (
     BootstrapResult,
     percentile_bootstrap,
@@ -29,8 +37,11 @@ __all__ = [
     "Judge",
     "JudgeCache",
     "JudgeResult",
+    "JudgeUnparseableError",
     "LLMCache",
+    "SingleJudge",
     "__version__",
+    "binary_from_continuous",
     "canonical_hash",
     "estimate",
     "percentile_bootstrap",

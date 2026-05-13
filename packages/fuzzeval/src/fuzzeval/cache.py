@@ -59,17 +59,22 @@ if TYPE_CHECKING:
 #                              NOT supported; supply the right cache.
 #
 # JudgeCache identity (4 fields + tenant_id):
-#   rubric_hash             ← caller-supplied; v0.5 callers compute once
-#                              from the rubric template at run start.
-#   prompt_hash             ← v0.5: canonical_hash(<full eval_row>).
-#                              The slot retains the §7 spec name but
-#                              v0.5's producer hashes the full eval row
-#                              (JCS-canonical) so multi-key rows that
-#                              differ in `expected_answer` / `category`
-#                              don't collide on the cached judgement.
-#                              Step 7 will refine to a hash of the
-#                              rendered judge-prompt text once the
-#                              rubric template is concrete.
+#   rubric_hash             ← caller-supplied. v0.5 callers compute once
+#                              from the rubric template at run start —
+#                              ``fuzzeval.judge.SingleJudge.rubric_hash``
+#                              is the canonical producer.
+#   prompt_hash             ← Step 7+: canonical_hash(<rendered_judge_prompt>).
+#                              The runner passes a ``judge_prompt_renderer``
+#                              (typically ``SingleJudge.render_prompt``)
+#                              and hashes its output byte-for-byte. Two
+#                              cells whose rendered prompts agree share a
+#                              JudgeCache row — exact §7 spec text intent.
+#                              Step 5/6 fallback (no renderer supplied)
+#                              hashes the full eval_row instead so test
+#                              callers that pass a Judge but no renderer
+#                              still get stable cache keys; this is the
+#                              v0.5 step-5 stopgap, preserved for
+#                              compatibility but no longer the default.
 #   response_hash           ← canonical_hash(<final_agent_output_str>)
 #   judge_model_version     ← caller-supplied (e.g.
 #                              "google/gemini-2.5-pro@2026-04").
@@ -175,6 +180,15 @@ class JudgeCache:
         rubric_hash, prompt_hash, response_hash, judge_model_version
 
     Separate from LLMCache so rubric changes don't invalidate agent rollouts.
+
+    **Hash producer for ``prompt_hash``** is the runner's
+    ``judge_prompt_renderer`` (step 7+, typically
+    :meth:`fuzzeval.judge.SingleJudge.render_prompt`). The legacy step-5
+    fallback (hash the full eval_row) is preserved for test callers that
+    supply a Judge but no renderer; mixing the two producers in one cache
+    directory is supported but produces two distinct cache rows for the
+    same (eval_row, agent_output) — clear the cache directory when
+    switching producers if cache-warmth matters.
     """
 
     def __init__(

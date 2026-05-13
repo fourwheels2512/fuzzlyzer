@@ -1,0 +1,36 @@
+# Force LF line endings for text-like content so hashes are stable across
+# Windows / macOS / Linux clones regardless of `core.autocrlf` settings.
+#
+# Critical for files that contribute to canonical_hash chains:
+# - rubric templates (fuzzeval.judge.SingleJudge.rubric_hash)
+# - YAML / TOML / JSON config that any hashing path may read
+#
+# Python source is included so cross-platform pytest stays bit-identical.
+
+* text=auto eol=lf
+
+# Prompts and other rubric-adjacent text MUST be LF.
+*.txt text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.csv text eol=lf
+*.cfg text eol=lf
+*.ini text eol=lf
+
+# Binary assets should NEVER be eol-converted.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.whl binary
+*.gz binary
+*.tgz binary
+*.tar binary

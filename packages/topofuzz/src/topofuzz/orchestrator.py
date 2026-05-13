@@ -111,7 +111,16 @@ def install_resolver_mismatch_dedup() -> _ResolverMismatchDedupFilter:
 
 @dataclass(frozen=True)
 class RunPlan:
-    """Static inputs for one ``topofuzz run`` invocation."""
+    """Static inputs for one ``topofuzz run`` invocation.
+
+    ``rubric_hash`` is the JCS-canonical SHA-256 of the rubric template
+    text (computed once at run start by the caller — typically
+    :class:`fuzzeval.judge.SingleJudge.rubric_hash`). Threaded through
+    :func:`execute_run` into every cell's JudgeCache key so a rubric
+    edit cleanly invalidates the cache without touching agent
+    rollouts. Empty string when no judge is supplied — :class:`Cell`
+    rows still have judge fields, but the cache slot is unused.
+    """
 
     topology: Topology
     variants: tuple[Topology, ...]
@@ -122,6 +131,7 @@ class RunPlan:
     max_cost_usd: float | None
     judge_model: str
     semaphore_size: int = 8
+    rubric_hash: str = ""
 
 
 @dataclass(frozen=True)
@@ -150,6 +160,11 @@ def write_manifest(plan: RunPlan, *, cli_args: dict[str, Any]) -> Path:
     The manifest records (a) what was run and (b) how it was invoked, so
     a post-mortem reader can reproduce the invocation. Token / cost
     totals are NOT in the manifest — they live in the SQLite rollup.
+
+    ``rubric_hash`` is sourced from ``plan.rubric_hash`` (step 7) and
+    surfaced at the top level so post-mortem tooling (and step 11's
+    report HTML) can read it without parsing ``cli_args``. The empty-
+    string default for "no rubric supplied" is preserved verbatim.
     """
     plan.run_dir.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -165,6 +180,7 @@ def write_manifest(plan: RunPlan, *, cli_args: dict[str, Any]) -> Path:
         "eval_ids": [r["id"] for r in plan.eval_rows],
         "max_cost_usd": plan.max_cost_usd,
         "judge_model": plan.judge_model,
+        "rubric_hash": plan.rubric_hash,
         "semaphore_size": plan.semaphore_size,
         "cli_args": cli_args,
         "kickoff_ts": time.time(),
@@ -257,6 +273,7 @@ async def _worker(
     judge_model_version: str,
     semaphore: asyncio.Semaphore,
     prompt_builder: PromptBuilder,
+    judge_prompt_renderer: Callable[[dict], str] | None,
     resolver: ServedVersionResolver,
     llm_callable: LLMCallable | None,
     cancel: asyncio.Event,
@@ -279,10 +296,18 @@ async def _worker(
             judge_model_version=judge_model_version,
             semaphore=semaphore,
             prompt_builder=prompt_builder,
+            judge_prompt_renderer=judge_prompt_renderer,
             model_served_version_resolver=resolver,
             llm_callable=llm_callable,
             cancel=cancel,
         )
+    except asyncio.CancelledError:
+        # Supervisor-initiated cancel after the drain dies must
+        # propagate, not be persisted as a fake "CancelledError" cell.
+        # See execute_run's supervisor block: the drain's exception
+        # is the real cause, and reaching the except-Exception arm
+        # below would record a misleading error string.
+        raise
     except Exception as e:  # noqa: BLE001 — boundary: keep the run alive
         # Reconstruct a minimal failed Cell. Use empty node_outputs +
         # the exception text as ``error``; cost is None for this cell.
@@ -304,8 +329,8 @@ async def execute_run(
     *,
     llm_callable: LLMCallable | None = None,
     judge: Any = None,
-    rubric_hash: str = "",
     prompt_builder: PromptBuilder = _default_prompt,
+    judge_prompt_renderer: Callable[[dict], str] | None = None,
     resolver: ServedVersionResolver = _identity_resolver,
     cancel: asyncio.Event | None = None,
 ) -> RunResult:
@@ -313,8 +338,32 @@ async def execute_run(
 
     See module docstring for concurrency and cancellation semantics.
     Resume-aware: cells already persisted under this run_id are skipped.
+
+    ``rubric_hash`` is sourced from ``plan.rubric_hash`` (step-7 refinement
+    — was a kwarg in step 6). Threaded into every worker's JudgeCache key.
+
+    ``judge_prompt_renderer`` is the step-7 refinement of the §7 cache
+    contract. When supplied (typically ``SingleJudge.render_prompt``), the
+    runner uses ``canonical_hash(rendered_judge_prompt)`` for the
+    JudgeCache ``prompt_hash`` slot instead of step-5's hash-the-whole-
+    eval_row stopgap. When ``None`` (no judge, or judge has no renderer),
+    the runner falls back to the eval-row hash so step-5 callers continue
+    working unchanged.
     """
     install_resolver_mismatch_dedup()
+
+    # Surface the legacy fallback combination so callers see it instead
+    # of silently keying the JudgeCache on the eval_row stopgap
+    # (audit M6). Step-5 callers (tests, mostly) that intentionally
+    # skip the renderer can ignore the warning; step-7+ orchestration
+    # paths always supply both.
+    if judge is not None and judge_prompt_renderer is None:
+        _log.warning(
+            "execute_run: judge supplied without judge_prompt_renderer. "
+            "JudgeCache will key on the full eval_row (step-5 stopgap). "
+            "For the step-7 contract, pass judge_prompt_renderer="
+            "<judge>.render_prompt or equivalent."
+        )
 
     cancel_event = cancel if cancel is not None else asyncio.Event()
     semaphore = asyncio.Semaphore(plan.semaphore_size)
@@ -363,10 +412,11 @@ async def execute_run(
                         llm_cache=llm_cache,
                         judge=judge,
                         judge_cache=judge_cache,
-                        rubric_hash=rubric_hash,
+                        rubric_hash=plan.rubric_hash,
                         judge_model_version=plan.judge_model,
                         semaphore=semaphore,
                         prompt_builder=prompt_builder,
+                        judge_prompt_renderer=judge_prompt_renderer,
                         resolver=resolver,
                         llm_callable=llm_callable,
                         cancel=cancel_event,

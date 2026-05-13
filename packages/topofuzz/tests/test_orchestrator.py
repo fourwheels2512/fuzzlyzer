@@ -389,3 +389,326 @@ def test_manifest_records_variant_hashes(tmp_path):
         topo_b.canonical_hash(),
     ]
     assert payload["eval_ids"] == ["e1"]
+
+
+# ---------------------------------------------------------------------------
+# Step 7: rubric_hash + judge_prompt_renderer threading
+# ---------------------------------------------------------------------------
+
+
+class _CapturingJudge:
+    """Sync judge that records what it was asked to score.
+
+    Returns ContinuousScore(0.7) for every payload so the runner's
+    happy-path code paths exercise the cache (cells with same
+    response_text would hit on second call).
+    """
+
+    def __init__(self):
+        self.payloads: list[dict] = []
+
+    def score(self, payload: dict) -> ContinuousScore:
+        self.payloads.append(payload)
+        return ContinuousScore(value=0.7)
+
+
+def test_run_plan_rubric_hash_defaults_to_empty():
+    topo = _toy_topology(n=1)
+    plan = RunPlan(
+        topology=topo,
+        variants=(topo,),
+        eval_rows=({"id": "e", "input": "x"},),
+        run_id="r",
+        run_dir=Path("/tmp/r"),
+        cache_dir=None,
+        max_cost_usd=None,
+        judge_model="m",
+    )
+    assert plan.rubric_hash == ""
+
+
+def test_run_plan_rubric_hash_round_trip():
+    topo = _toy_topology(n=1)
+    plan = RunPlan(
+        topology=topo,
+        variants=(topo,),
+        eval_rows=({"id": "e", "input": "x"},),
+        run_id="r",
+        run_dir=Path("/tmp/r"),
+        cache_dir=None,
+        max_cost_usd=None,
+        judge_model="m",
+        rubric_hash="deadbeef" * 8,
+    )
+    assert plan.rubric_hash == "deadbeef" * 8
+
+
+def test_orchestrator_threads_judge_and_records_result(tmp_path):
+    plan = _plan(tmp_path, n_rows=2)
+    fake = FakeLLMWithUsage()
+    judge = _CapturingJudge()
+    _run(execute_run(plan, llm_callable=fake, judge=judge))
+
+    # Judge was invoked for each cell.
+    assert len(judge.payloads) == 2
+    # Every payload has the §17a-contract keys topofuzz uses.
+    for p in judge.payloads:
+        assert set(p.keys()) == {"variant_id", "eval_row", "agent_output"}
+
+    # Cell rows record the judge result via judge_results table.
+    db = sqlite3.connect(str(plan.run_dir / "run.sqlite"))
+    try:
+        rows = db.execute(
+            "SELECT judge_kind, score_value FROM judge_results "
+            "WHERE run_id = ? ORDER BY eval_id", (plan.run_id,)
+        ).fetchall()
+    finally:
+        db.close()
+    assert {(k, v) for k, v in rows} == {("continuous", 0.7)}
+
+
+def test_orchestrator_uses_renderer_output_for_judge_cache_key(tmp_path):
+    """Two cells whose RENDERED prompts are byte-identical must hit
+    the JudgeCache after the first one writes — even if their underlying
+    payloads differ. This is the contract the renderer-keying refinement
+    is here to enforce: the cache key is the prompt the judge saw.
+
+    Setup:
+      * Two distinct (variant, eval_row) cells with different ``id`` and
+        different ``agent_output`` reaching the judge.
+      * A renderer that DELIBERATELY collapses both cells onto the same
+        rendered text (constant return).
+      * The first call writes ContinuousScore(0.7) to JudgeCache; the
+        second call MUST hit cache and NOT invoke judge.score again.
+
+    Failure mode this guards against: if the runner reverted to the
+    eval_row hash for the prompt_hash slot, the two cells would have
+    different cache keys and judge.score would be called twice — the
+    assertion ``len(payloads) == 1`` would fail.
+    """
+    pytest.importorskip("diskcache")
+
+    # Two variants of the same topology that hash-distinctly so the
+    # `(variant, eval)` keys differ; the eval_rows also differ on `id`.
+    # Only the rendered prompt collapses to the same string.
+    topo_a = _toy_topology(n=1, model="google/gemini-2.5-pro")
+    topo_b = _toy_topology(n=1, model="google/gemini-2.5-flash")
+    eval_rows = (
+        {"id": "e1", "input": "alpha"},
+        {"id": "e2", "input": "beta"},
+    )
+    plan = RunPlan(
+        topology=topo_a,
+        variants=(topo_a, topo_b),
+        eval_rows=eval_rows,
+        run_id="renderer-thread-001",
+        run_dir=tmp_path / "renderer-thread-001",
+        cache_dir=tmp_path / ".cache",
+        max_cost_usd=None,
+        judge_model="judge-m",
+        rubric_hash="rubric-X",
+    )
+
+    judge = _CapturingJudge()
+
+    # The judge cache key has three other slots beyond prompt_hash:
+    # response_hash, rubric_hash, judge_model_version. We force same
+    # response_hash by giving every LLM call the same response text.
+    class _ConstResponseLLM:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        async def __call__(self, **kwargs):
+            self.calls.append(kwargs)
+            return {
+                "choices": [{"message": {"content": "FIXED_AGENT_OUTPUT"}}],
+                "model": kwargs["model"],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 5},
+            }
+
+    fake = _ConstResponseLLM()
+
+    # Renderer returns a constant string regardless of payload — so any
+    # two cells collapse to the same prompt_hash. With same rubric_hash,
+    # same judge_model_version, same response_hash, AND now same
+    # prompt_hash, the JudgeCache row IS the same → second call hits.
+    def renderer(payload: dict) -> str:
+        return "FIXED_RENDERED_PROMPT"
+
+    _run(
+        execute_run(
+            plan,
+            llm_callable=fake,
+            judge=judge,
+            judge_prompt_renderer=renderer,
+        )
+    )
+
+    # 4 cells total (2 variants × 2 eval rows), 4 agent rollouts, but
+    # only ONE judge invocation — the other three hit JudgeCache.
+    assert len(fake.calls) == 4
+    assert len(judge.payloads) == 1, (
+        f"Expected JudgeCache to short-circuit 3 of 4 calls "
+        f"(same rendered prompt → same cache key); "
+        f"got {len(judge.payloads)} judge invocations."
+    )
+
+
+def test_orchestrator_marks_cell_judge_failure_when_renderer_raises(tmp_path):
+    plan = _plan(tmp_path, n_rows=1)
+
+    def bad_renderer(payload: dict) -> str:
+        raise RuntimeError("renderer broke")
+
+    judge = _CapturingJudge()
+    _run(
+        execute_run(
+            plan,
+            llm_callable=FakeLLMWithUsage(),
+            judge=judge,
+            judge_prompt_renderer=bad_renderer,
+        )
+    )
+
+    db = sqlite3.connect(str(plan.run_dir / "run.sqlite"))
+    try:
+        kind, reason = db.execute(
+            "SELECT judge_kind, failure_reason FROM judge_results "
+            "WHERE run_id = ?", (plan.run_id,)
+        ).fetchone()
+    finally:
+        db.close()
+    assert kind == "failure"
+    assert "renderer broke" in reason
+    # Judge.score must NOT be called when the renderer raised.
+    assert len(judge.payloads) == 0
+
+
+def test_orchestrator_marks_cell_judge_failure_when_renderer_returns_non_str(tmp_path):
+    plan = _plan(tmp_path, n_rows=1)
+
+    judge = _CapturingJudge()
+    _run(
+        execute_run(
+            plan,
+            llm_callable=FakeLLMWithUsage(),
+            judge=judge,
+            judge_prompt_renderer=lambda p: 42,  # type: ignore[arg-type,return-value]
+        )
+    )
+
+    db = sqlite3.connect(str(plan.run_dir / "run.sqlite"))
+    try:
+        kind, reason = db.execute(
+            "SELECT judge_kind, failure_reason FROM judge_results "
+            "WHERE run_id = ?", (plan.run_id,)
+        ).fetchone()
+    finally:
+        db.close()
+    assert kind == "failure"
+    assert "int" in reason  # the offending type name appears in the message
+
+
+def test_orchestrator_falls_back_to_eval_row_hash_without_renderer(tmp_path, caplog):
+    """Step-5 callers (judge but no renderer) must still get cells judged.
+
+    Backwards-compat check — the legacy path still works AND emits the
+    audit-M6 deprecation warning so callers see they're on the stopgap.
+    """
+    plan = _plan(tmp_path, n_rows=2)
+    judge = _CapturingJudge()
+    with caplog.at_level(logging.WARNING, logger="topofuzz.orchestrator"):
+        _run(execute_run(plan, llm_callable=FakeLLMWithUsage(), judge=judge))
+    db = sqlite3.connect(str(plan.run_dir / "run.sqlite"))
+    try:
+        kinds = [
+            r[0] for r in db.execute(
+                "SELECT judge_kind FROM judge_results WHERE run_id = ?",
+                (plan.run_id,),
+            ).fetchall()
+        ]
+    finally:
+        db.close()
+    assert kinds == ["continuous", "continuous"]
+    # M6: caller is told they're on the legacy path.
+    assert any(
+        "judge_prompt_renderer" in r.getMessage() and "stopgap" in r.getMessage()
+        for r in caplog.records
+    ), "expected audit-M6 warning about missing judge_prompt_renderer"
+
+
+def test_orchestrator_does_not_warn_when_renderer_supplied(tmp_path, caplog):
+    plan = _plan(tmp_path, n_rows=1)
+    judge = _CapturingJudge()
+    with caplog.at_level(logging.WARNING, logger="topofuzz.orchestrator"):
+        _run(
+            execute_run(
+                plan,
+                llm_callable=FakeLLMWithUsage(),
+                judge=judge,
+                judge_prompt_renderer=lambda p: "rendered",
+            )
+        )
+    assert not any(
+        "judge_prompt_renderer" in r.getMessage() and "stopgap" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_orchestrator_renderer_mutation_does_not_leak_to_judge(tmp_path):
+    """A buggy renderer that mutates payload['eval_row'] in place must
+    not affect what the judge receives (audit MINOR: renderer mutation).
+    """
+    plan = _plan(tmp_path, n_rows=1)
+    judge = _CapturingJudge()
+
+    def mutating_renderer(payload: dict) -> str:
+        payload["eval_row"]["__poisoned__"] = "yes"
+        payload["eval_row"].pop("input", None)
+        return "rendered"
+
+    _run(
+        execute_run(
+            plan,
+            llm_callable=FakeLLMWithUsage(),
+            judge=judge,
+            judge_prompt_renderer=mutating_renderer,
+        )
+    )
+    # Judge sees a clean payload (the deepcopy in the runner protects it).
+    assert len(judge.payloads) == 1
+    received = judge.payloads[0]["eval_row"]
+    assert "__poisoned__" not in received
+    assert received.get("input") == "input0"
+
+
+def test_manifest_records_rubric_hash_at_top_level(tmp_path):
+    """Manifest carries reproducibility-relevant state at the top level.
+
+    rubric_hash sits alongside topology_canonical_hash and
+    variant_canonical_hashes so post-mortem tooling and step 11's
+    report HTML can read it without parsing cli_args. Empty string is
+    the explicit "no rubric configured" sentinel.
+    """
+    topo = _toy_topology(n=1)
+    plan = RunPlan(
+        topology=topo, variants=(topo,),
+        eval_rows=({"id": "e", "input": "x"},),
+        run_id="r", run_dir=tmp_path / "r",
+        cache_dir=None, max_cost_usd=None, judge_model="m",
+        rubric_hash="deadbeef",
+    )
+    path = write_manifest(plan, cli_args={})
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["rubric_hash"] == "deadbeef"
+    # Empty-rubric runs (no judge) preserve the empty sentinel.
+    plan_no_rubric = RunPlan(
+        topology=topo, variants=(topo,),
+        eval_rows=({"id": "e", "input": "x"},),
+        run_id="r2", run_dir=tmp_path / "r2",
+        cache_dir=None, max_cost_usd=None, judge_model="m",
+    )
+    payload2 = json.loads(
+        write_manifest(plan_no_rubric, cli_args={}).read_text(encoding="utf-8")
+    )
+    assert payload2["rubric_hash"] == ""

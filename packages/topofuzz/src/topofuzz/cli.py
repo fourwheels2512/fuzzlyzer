@@ -23,12 +23,17 @@ error so CI checks don't have to special-case it.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import logging
 import signal
+from contextlib import ExitStack
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
 import typer
+
+from fuzzeval.judge import SingleJudge
 
 from topofuzz import __version__
 from topofuzz.loaders import load_eval_rows, load_topology
@@ -57,6 +62,36 @@ RESERVED_FLAGS: tuple[str, ...] = (
 
 _DEFAULT_JUDGE_MODEL = "google/gemini-2.5-pro"
 _DEFAULT_SEMAPHORE_SIZE = 8
+
+
+# Module-scoped ExitStack holds open any resource handles created by
+# :func:`_packaged_default_rubric_path`. For editable / wheel installs
+# `importlib.resources.as_file` returns a real fs path with no cleanup
+# callback (no-op exit). For zip-imported / frozen-executable cases it
+# extracts to a tempdir and the exit callback unlinks the file —
+# **after** the path has been returned to the caller, which would leave
+# :class:`fuzzeval.judge.SingleJudge` reading a dangling path (audit M3).
+# Holding the stack at module scope keeps every resource alive for the
+# process lifetime. ``atexit`` closes it on interpreter shutdown.
+_RESOURCE_STACK = ExitStack()
+atexit.register(_RESOURCE_STACK.close)
+
+
+def _packaged_default_rubric_path() -> Path:
+    """Resolve the bundled ``lending_judge.txt`` rubric path.
+
+    Uses :mod:`importlib.resources` so the path is correct regardless of
+    whether topofuzz was installed editable from the repo or as a wheel.
+    Hatch (see ``packages/topofuzz/pyproject.toml``) ships every file
+    under ``src/topofuzz/`` so the ``prompts/`` directory rides along.
+
+    The returned :class:`pathlib.Path` is valid for the lifetime of the
+    Python interpreter — see :data:`_RESOURCE_STACK` for the cleanup
+    contract. Repeated calls re-enter ``as_file`` (cheap for fs-resident
+    resources; one extra temp-file extraction for zip-imported resources).
+    """
+    resource = resources.files("topofuzz").joinpath("prompts/lending_judge.txt")
+    return Path(_RESOURCE_STACK.enter_context(resources.as_file(resource)))
 
 
 def _round_robin_select(
@@ -244,6 +279,23 @@ def run(
         "--rng-seed",
         help="Variant-generator seed; same value → same variant list.",
     ),
+    rubric_path: Path | None = typer.Option(
+        None,
+        "--rubric",
+        help=(
+            "Path to a rubric template (str.format placeholders). "
+            "Default: packaged topofuzz/prompts/lending_judge.txt."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "Skip the real LLM judge call; every cell gets a deterministic "
+            "ContinuousScore(0.5). Judge costs $0. Implies --no-cache. "
+            "Agent rollouts STILL bill real money (use --max-cost-usd to cap)."
+        ),
+    ),
     yes: bool = typer.Option(
         False,
         "--yes",
@@ -334,7 +386,30 @@ def run(
     # absolute path even if the orchestrator's cwd changes mid-run.
     run_dir = (out_dir / run_id).resolve()
 
-    effective_cache_dir = None if no_cache else cache_dir
+    # --dry-run implies --no-cache. Without this, the judge's deterministic
+    # ContinuousScore(0.5) sentinel gets written to the JudgeCache; a
+    # subsequent real-mode run with the same cache_dir would hit the cached
+    # 0.5 and silently skip the real judge call, corrupting the §9 score
+    # matrix (audit B2). Forcing no-cache in dry-run also matches user
+    # intent — a dry-run is throwaway by definition.
+    effective_cache_dir = None if (no_cache or dry_run) else cache_dir
+
+    # Construct the judge. Falls back to the packaged rubric if --rubric
+    # was not supplied. SingleJudge reads the file at construction so
+    # bad paths / empty files surface here, before the cost-estimator
+    # prompt runs.
+    effective_rubric_path = (
+        rubric_path if rubric_path is not None else _packaged_default_rubric_path()
+    )
+    try:
+        judge = SingleJudge(
+            model=judge_model,
+            rubric_path=effective_rubric_path,
+            dry_run=dry_run,
+        )
+    except (FileNotFoundError, ValueError) as e:
+        typer.echo(f"topofuzz: bad rubric: {e}", err=True)
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
 
     plan = RunPlan(
         topology=topology,
@@ -346,9 +421,13 @@ def run(
         max_cost_usd=max_cost_usd,
         judge_model=judge_model,
         semaphore_size=_DEFAULT_SEMAPHORE_SIZE,
+        rubric_hash=judge.rubric_hash,
     )
 
-    _preflight_cost(plan, eval_rows=eval_rows, judge_model=judge_model, yes=yes)
+    _preflight_cost(
+        plan, eval_rows=eval_rows, judge_model=judge_model,
+        yes=yes, dry_run=dry_run,
+    )
 
     cli_args = {
         "fixture": fixture,
@@ -362,10 +441,16 @@ def run(
         "cache": str(effective_cache_dir) if effective_cache_dir else None,
         "no_cache": no_cache,
         "rng_seed": rng_seed,
+        "rubric": str(effective_rubric_path),
+        "rubric_hash": judge.rubric_hash,
+        "dry_run": dry_run,
     }
     write_manifest(plan, cli_args=cli_args)
 
-    result = _run_with_signal_handling(plan)
+    if dry_run:
+        typer.echo("[DRY-RUN] No real judge LLM calls — every cell gets ContinuousScore(0.5).")
+
+    result = _run_with_signal_handling(plan, judge=judge)
 
     typer.echo("")
     typer.echo(f"Run id: {result.run_id}")
@@ -392,12 +477,18 @@ def _preflight_cost(
     eval_rows: list[dict],
     judge_model: str,
     yes: bool,
+    dry_run: bool = False,
 ) -> None:
     """Cost estimate + ``Continue? [y/N]`` prompt before kickoff.
 
     The current estimator is a static placeholder (§costest) — call it
     once, print, prompt. When the measured-rate update lands the call
     site stays the same.
+
+    ``dry_run=True`` zeros the judge column in the printed estimate so
+    the user sees the run's *actual* expected billing (agent calls
+    still cost real money; the judge stub does not). The estimator
+    itself is judge-mode agnostic; we annotate downstream.
     """
     from fuzzeval.costest import estimate as _estimate
 
@@ -412,18 +503,47 @@ def _preflight_cost(
         else _DEFAULT_JUDGE_MODEL,
         judge_model=judge_model,
     )
+    # Compute dry-run-aware totals BEFORE printing so the displayed
+    # bottom-line matches reality (audit M4 — without this, the user
+    # saw the judge column zeroed but the Total still summed in the
+    # original judge cost, contradicting the disclaimer).
+    judge_cold_subtracted = 0.0
+    judge_warm_subtracted = 0.0
+    if dry_run:
+        for line in est.lines:
+            if "judg" in line.name.lower():
+                judge_cold_subtracted += line.cold_estimate_usd
+                judge_warm_subtracted += line.warm_estimate_usd
+    effective_total_cold = est.total_cold_usd - judge_cold_subtracted
+    effective_total_warm = est.total_warm_usd - judge_warm_subtracted
+
     typer.echo("")
     typer.echo("Estimated cost:")
     for line in est.lines:
+        # In dry-run, the judge does not bill — surface zeros for the
+        # judge-priced line so the displayed total matches reality.
+        # Other lines (agent rollouts) still bill.
+        if dry_run and "judg" in line.name.lower():
+            typer.echo(
+                f"  {line.name:<14} "
+                f"cold=$0.0000 ± $0.0000 / warm=$0.0000 ± $0.0000  "
+                f"[DRY-RUN judge — no LLM call]"
+            )
+            continue
         typer.echo(
             f"  {line.name:<14} "
             f"cold=${line.cold_estimate_usd:.4f} ± ${line.cold_ci_half_width_usd:.4f} / "
             f"warm=${line.warm_estimate_usd:.4f} ± ${line.warm_ci_half_width_usd:.4f}"
         )
     typer.echo(
-        f"  Total:         cold=${est.total_cold_usd:.4f} / "
-        f"warm=${est.total_warm_usd:.4f} (90% CI)"
+        f"  Total:         cold=${effective_total_cold:.4f} / "
+        f"warm=${effective_total_warm:.4f} (90% CI)"
     )
+    if dry_run:
+        typer.echo(
+            "  (dry-run total reflects agent rollouts only; "
+            "judge column subtracted)"
+        )
     typer.echo(f"Estimated wallclock: {est.wallclock_estimate_s:.0f}s")
     if plan.max_cost_usd is not None:
         typer.echo(f"Hard cap: ${plan.max_cost_usd:.2f}")
@@ -435,7 +555,7 @@ def _preflight_cost(
         raise typer.Exit(code=0)
 
 
-def _run_with_signal_handling(plan: RunPlan) -> Any:
+def _run_with_signal_handling(plan: RunPlan, *, judge: SingleJudge | None = None) -> Any:
     """Run the orchestrator with SIGINT → cancel-event wiring.
 
     On Ctrl+C the orchestrator's cancel event is set; the runner stops
@@ -443,6 +563,11 @@ def _run_with_signal_handling(plan: RunPlan) -> Any:
     completed. A *second* Ctrl+C lets the default handler interrupt
     abruptly — we don't try to swallow it, in case the orchestrator
     itself is wedged.
+
+    When ``judge`` is supplied, its :meth:`render_prompt` is passed as
+    the orchestrator's ``judge_prompt_renderer`` so the §7 JudgeCache
+    ``prompt_hash`` slot keys on the rendered prompt rather than the
+    full eval_row (step-5 stopgap).
     """
     loop_cancel = asyncio.Event()
 
@@ -464,7 +589,14 @@ def _run_with_signal_handling(plan: RunPlan) -> Any:
 
     previous = signal.signal(signal.SIGINT, _signal_handler)
     try:
-        return asyncio.run(execute_run(plan, cancel=loop_cancel))
+        return asyncio.run(
+            execute_run(
+                plan,
+                cancel=loop_cancel,
+                judge=judge,
+                judge_prompt_renderer=judge.render_prompt if judge is not None else None,
+            )
+        )
     finally:
         signal.signal(signal.SIGINT, previous)
 

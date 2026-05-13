@@ -345,3 +345,349 @@ def test_cli_run_end_to_end_with_mocked_orchestrator(tmp_path, monkeypatch):
     for eid, err, cost in cells:
         assert err is None
         assert cost is not None and cost > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Step 7 — packaged rubric + --rubric + --dry-run
+# ---------------------------------------------------------------------------
+
+
+def test_packaged_default_rubric_resolves_to_existing_file():
+    """The CLI's default rubric must resolve to a file that ships with
+    the wheel. Hatch picks up everything under src/topofuzz/; the test
+    confirms the resource is actually loadable via importlib.resources.
+    """
+    from topofuzz.cli import _packaged_default_rubric_path
+
+    path = _packaged_default_rubric_path()
+    assert path.exists(), f"rubric missing at {path}"
+    text = path.read_text(encoding="utf-8")
+    assert "{variant_id}" in text
+    assert "{applicant_blurb}" in text
+    assert "{ground_truth_decision}" in text
+    assert "{agent_output}" in text
+
+
+def test_run_rejects_missing_rubric_path(tmp_path):
+    """A user-supplied --rubric path that doesn't exist must surface
+    a friendly error, not a stack trace.
+    """
+    pytest.importorskip("langgraph")
+    fixture = tmp_path / "fx.py"
+    fixture.write_text(
+        "from langgraph.graph import END, START, StateGraph\n"
+        "from typing import TypedDict\n"
+        "from topofuzz.ir import LLMConfig\n"
+        "\n"
+        "class _S(TypedDict, total=False):\n"
+        "    x: str\n"
+        "\n"
+        "def _a(s): return s\n"
+        "\n"
+        "def build_graph():\n"
+        "    g = StateGraph(_S)\n"
+        "    g.add_node('a', _a)\n"
+        "    g.add_edge(START, 'a')\n"
+        "    g.add_edge('a', END)\n"
+        "    return g.compile()\n"
+        "\n"
+        "LLM_CONFIGS = {'a': LLMConfig(model='google/gemini-2.5-pro')}\n",
+        encoding="utf-8",
+    )
+    eval_path = tmp_path / "e.jsonl"
+    eval_path.write_text('{"id": "e1", "input": "x"}\n', encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            f"{fixture}:build_graph",
+            "--eval", str(eval_path),
+            "--rubric", str(tmp_path / "nope.txt"),
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "rubric" in result.output.lower()
+
+
+def test_run_dry_run_flag_skips_llm_judge(tmp_path, monkeypatch):
+    """End-to-end dry-run: judge never calls an LLM; cells get
+    ContinuousScore(0.5); manifest cli_args records ``dry_run: true``.
+    """
+    pytest.importorskip("langgraph")
+
+    fixture = tmp_path / "fx.py"
+    fixture.write_text(
+        "from langgraph.graph import END, START, StateGraph\n"
+        "from typing import TypedDict\n"
+        "from topofuzz.ir import LLMConfig\n"
+        "\n"
+        "class _S(TypedDict, total=False):\n"
+        "    x: str\n"
+        "\n"
+        "def _a(s): return s\n"
+        "\n"
+        "def build_graph():\n"
+        "    g = StateGraph(_S)\n"
+        "    g.add_node('a', _a)\n"
+        "    g.add_edge(START, 'a')\n"
+        "    g.add_edge('a', END)\n"
+        "    return g.compile()\n"
+        "\n"
+        "LLM_CONFIGS = {'a': LLMConfig(model='google/gemini-2.5-pro')}\n",
+        encoding="utf-8",
+    )
+    eval_path = tmp_path / "e.jsonl"
+    eval_path.write_text(
+        '{"id": "e1", "input": "x", "ground_truth_decision": "approve"}\n'
+        '{"id": "e2", "input": "y", "ground_truth_decision": "deny"}\n',
+        encoding="utf-8",
+    )
+
+    async def fake_llm(**kwargs):
+        return {
+            "choices": [{"message": {"content": "agent decision: ok"}}],
+            "model": kwargs["model"],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+
+    from topofuzz import cli as cli_mod
+    from topofuzz import orchestrator as orch_mod
+
+    real_execute_run = orch_mod.execute_run
+
+    async def execute_run_with_fake(plan, **kwargs):
+        kwargs.setdefault("llm_callable", fake_llm)
+        return await real_execute_run(plan, **kwargs)
+
+    monkeypatch.setattr(cli_mod, "execute_run", execute_run_with_fake)
+
+    out_dir = tmp_path / "runs"
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            f"{fixture}:build_graph",
+            "--eval", str(eval_path),
+            "--n", "2",
+            "--variants", "1",
+            "--out", str(out_dir),
+            "--no-cache",
+            "--dry-run",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "[DRY-RUN]" in result.output
+
+    run_dirs = [p for p in out_dir.iterdir() if p.is_dir()]
+    assert len(run_dirs) == 1
+    run_dir = run_dirs[0]
+
+    import json
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["cli_args"]["dry_run"] is True
+    assert manifest["cli_args"]["rubric"]  # packaged path was resolved
+    assert manifest["cli_args"]["rubric_hash"]  # non-empty hash
+
+    # Every cell's judge_result must be ContinuousScore(0.5) when dry-run.
+    import sqlite3
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    try:
+        rows = db.execute(
+            "SELECT judge_kind, score_value FROM judge_results "
+            "WHERE run_id = ?", (manifest["run_id"],)
+        ).fetchall()
+    finally:
+        db.close()
+    assert len(rows) == 2
+    for kind, value in rows:
+        assert kind == "continuous"
+        assert value == 0.5
+
+
+def test_run_dry_run_threads_renderer_into_orchestrator(tmp_path, monkeypatch):
+    """The CLI must pass ``judge.render_prompt`` as the orchestrator's
+    judge_prompt_renderer so the §7 cache slot keys on the rendered
+    prompt (not the eval_row fallback). Verify via capture.
+    """
+    pytest.importorskip("langgraph")
+
+    fixture = tmp_path / "fx.py"
+    fixture.write_text(
+        "from langgraph.graph import END, START, StateGraph\n"
+        "from typing import TypedDict\n"
+        "from topofuzz.ir import LLMConfig\n"
+        "\n"
+        "class _S(TypedDict, total=False):\n"
+        "    x: str\n"
+        "\n"
+        "def _a(s): return s\n"
+        "\n"
+        "def build_graph():\n"
+        "    g = StateGraph(_S)\n"
+        "    g.add_node('a', _a)\n"
+        "    g.add_edge(START, 'a')\n"
+        "    g.add_edge('a', END)\n"
+        "    return g.compile()\n"
+        "\n"
+        "LLM_CONFIGS = {'a': LLMConfig(model='google/gemini-2.5-pro')}\n",
+        encoding="utf-8",
+    )
+    eval_path = tmp_path / "e.jsonl"
+    eval_path.write_text(
+        '{"id": "e1", "input": "x", "ground_truth_decision": "approve"}\n',
+        encoding="utf-8",
+    )
+
+    async def fake_llm(**kwargs):
+        return {
+            "choices": [{"message": {"content": "ok"}}],
+            "model": kwargs["model"],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+
+    captured: dict = {}
+    from topofuzz import cli as cli_mod
+    from topofuzz import orchestrator as orch_mod
+    real_execute_run = orch_mod.execute_run
+
+    async def capture_execute_run(plan, **kwargs):
+        captured["judge"] = kwargs.get("judge")
+        captured["renderer"] = kwargs.get("judge_prompt_renderer")
+        kwargs.setdefault("llm_callable", fake_llm)
+        return await real_execute_run(plan, **kwargs)
+
+    monkeypatch.setattr(cli_mod, "execute_run", capture_execute_run)
+
+    out_dir = tmp_path / "runs"
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            f"{fixture}:build_graph",
+            "--eval", str(eval_path),
+            "--n", "1",
+            "--variants", "1",
+            "--out", str(out_dir),
+            "--no-cache",
+            "--dry-run",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["judge"] is not None
+    assert callable(captured["renderer"])
+    # Renderer is judge.render_prompt — invoke and confirm it returns a str.
+    rendered = captured["renderer"]({
+        "variant_id": "v",
+        "eval_row": {"id": "e", "input": "x", "ground_truth_decision": "approve"},
+        "agent_output": "out",
+    })
+    assert isinstance(rendered, str)
+    assert "x" in rendered  # the applicant input flowed in
+
+
+# ---------------------------------------------------------------------------
+# Step 7 — packaged lending_eval.csv loads cleanly
+# ---------------------------------------------------------------------------
+
+
+def test_packaged_lending_eval_csv_loads_with_loader():
+    """The bundled lending_eval.csv must satisfy the loader's id+input
+    contract AND carry the ground_truth_decision column the judge needs.
+    """
+    from importlib import resources
+
+    from topofuzz.loaders import load_eval_rows
+
+    resource = resources.files("topofuzz").joinpath("fixtures/lending_eval.csv")
+    with resources.as_file(resource) as csv_path:
+        rows = load_eval_rows(Path(csv_path))
+    assert len(rows) == 50
+    for row in rows:
+        assert isinstance(row.get("id"), str) and row["id"].startswith("lending_")
+        assert isinstance(row.get("input"), str) and len(row["input"]) > 20
+        assert row.get("ground_truth_decision") in {"approve", "deny"}
+
+
+# Audit B2: dry-run must NOT pollute the JudgeCache. The CLI guarantees
+# this by forcing --no-cache when --dry-run is set. Verify the manifest's
+# recorded cache field is null in dry-run, even when --cache is supplied.
+def test_dry_run_forces_no_cache_at_cli_layer(tmp_path, monkeypatch):
+    pytest.importorskip("langgraph")
+
+    fixture = tmp_path / "fx.py"
+    fixture.write_text(
+        "from langgraph.graph import END, START, StateGraph\n"
+        "from typing import TypedDict\n"
+        "from topofuzz.ir import LLMConfig\n"
+        "\n"
+        "class _S(TypedDict, total=False):\n"
+        "    x: str\n"
+        "\n"
+        "def _a(s): return s\n"
+        "\n"
+        "def build_graph():\n"
+        "    g = StateGraph(_S)\n"
+        "    g.add_node('a', _a)\n"
+        "    g.add_edge(START, 'a')\n"
+        "    g.add_edge('a', END)\n"
+        "    return g.compile()\n"
+        "\n"
+        "LLM_CONFIGS = {'a': LLMConfig(model='google/gemini-2.5-pro')}\n",
+        encoding="utf-8",
+    )
+    eval_path = tmp_path / "e.jsonl"
+    eval_path.write_text(
+        '{"id": "e1", "input": "x", "ground_truth_decision": "approve"}\n',
+        encoding="utf-8",
+    )
+
+    async def fake_llm(**kwargs):
+        return {
+            "choices": [{"message": {"content": "ok"}}],
+            "model": kwargs["model"],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5},
+        }
+
+    from topofuzz import cli as cli_mod
+    from topofuzz import orchestrator as orch_mod
+    real_execute_run = orch_mod.execute_run
+
+    async def execute_run_with_fake(plan, **kwargs):
+        kwargs.setdefault("llm_callable", fake_llm)
+        return await real_execute_run(plan, **kwargs)
+
+    monkeypatch.setattr(cli_mod, "execute_run", execute_run_with_fake)
+
+    out_dir = tmp_path / "runs"
+    cache_dir = tmp_path / "real_cache"
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            f"{fixture}:build_graph",
+            "--eval", str(eval_path),
+            "--n", "1",
+            "--variants", "1",
+            "--out", str(out_dir),
+            "--cache", str(cache_dir),  # user explicitly asked for cache
+            "--dry-run",                # …but dry-run wins
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    # Manifest's cli_args["cache"] should be null AND the cache dir
+    # should NOT have been created on disk.
+    run_dirs = [p for p in out_dir.iterdir() if p.is_dir()]
+    import json
+    manifest = json.loads((run_dirs[0] / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["cli_args"]["cache"] is None, (
+        "dry-run must force cache=None at the CLI layer (audit B2)"
+    )
+    assert not cache_dir.exists(), (
+        "dry-run must not create the cache dir even when --cache is supplied"
+    )
