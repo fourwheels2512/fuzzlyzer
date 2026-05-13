@@ -41,13 +41,20 @@ from topofuzz.metrics.influence import (
     compute_influence,
 )
 from topofuzz.metrics.kappa import (
+    BalancedAccuracyDropResult,
     KappaResult,
     balanced_accuracy,
+    balanced_accuracy_drop,
     cohens_kappa,
+    cohens_kappa_original_vs_permuted,
     cohens_kappa_vs_truth,
 )
 from topofuzz.metrics.score_matrix import ScoreMatrixResult, read_score_matrix
 from topofuzz.metrics.status import classify_run_status
+from topofuzz.metrics.verdict_flip import (
+    VerdictFlipResult,
+    compute_verdict_flip_rate,
+)
 from topofuzz.metrics.voo import (
     variance_across_orderings,
     variance_across_orderings_ci,
@@ -55,17 +62,22 @@ from topofuzz.metrics.voo import (
 
 __all__ = [
     "AgentInfluence",
+    "BalancedAccuracyDropResult",
     "ECRResult",
     "InfluenceComputation",
     "KappaResult",
     "OrderingAlignmentError",
     "ScoreMatrixResult",
+    "VerdictFlipResult",
     "align_orderings_to_matrix",
     "balanced_accuracy",
+    "balanced_accuracy_drop",
     "classify_run_status",
     "cohens_kappa",
+    "cohens_kappa_original_vs_permuted",
     "cohens_kappa_vs_truth",
     "compute_influence",
+    "compute_verdict_flip_rate",
     "error_correction_rate",
     "read_score_matrix",
     "variance_across_orderings",

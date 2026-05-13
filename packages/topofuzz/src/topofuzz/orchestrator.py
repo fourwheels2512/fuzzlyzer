@@ -164,6 +164,79 @@ class RunResult:
 # ---------------------------------------------------------------------------
 
 
+_GROUND_TRUTH_BINARY_MAP: dict[str, int] = {
+    "approve": 1,
+    "deny": 0,
+    "pass": 1,
+    "fail": 0,
+    "1": 1,
+    "0": 0,
+    "true": 1,
+    "false": 0,
+}
+
+
+def _binarize_ground_truth(raw: Any) -> int | None:
+    """Map a row's ``ground_truth_decision`` to 0/1 (or None if absent).
+
+    Step 15a (e) needs binary ground-truth labels parallel to
+    ``manifest.eval_ids``. The lending fixture stores "approve" / "deny"
+    strings; we normalise to 1 / 0. Unknown values, missing fields,
+    and explicit nulls all map to ``None`` so the attest path skips
+    BA-drop when ground-truth isn't available — the metric is
+    degenerate, not the run.
+
+    Audit Pass-1 RT-M5: when a non-None value is presented but doesn't
+    appear in :data:`_GROUND_TRUTH_BINARY_MAP`, emit a WARNING so a
+    label-mapping bug (e.g. an eval CSV with ``"recommend"`` /
+    ``"reject"`` strings the lending fixture's map doesn't know)
+    surfaces in operator logs rather than silently degrading the
+    signed BA-drop field to ``None``. A "fixture has no ground truth"
+    condition looks identical to "fixture has ground truth I can't
+    parse" without this log.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return 1 if raw else 0
+    if isinstance(raw, int) and raw in (0, 1):
+        return raw
+    if isinstance(raw, str):
+        mapped = _GROUND_TRUTH_BINARY_MAP.get(raw.strip().lower())
+        if mapped is None:
+            _log.warning(
+                "ground_truth_decision %r not in known binary map; "
+                "row will be excluded from BA-drop. Recognised values: %s.",
+                raw,
+                sorted(_GROUND_TRUTH_BINARY_MAP),
+            )
+        return mapped
+    return None
+
+
+def _agent_vendors_from_topology(topology: Any) -> list[str]:
+    """Return sorted unique agent-side vendors for §8 judge_independence.
+
+    Per BLUEPRINT §8: a "vendor" is the LiteLLM provider prefix before
+    the ``/`` (e.g., ``"google/gemini-2.5-flash"`` → ``"google"``).
+    Nodes without an ``llm_config`` (router / human-in-the-loop) are
+    skipped. The result is sorted lex so JCS-canonical hashes are
+    byte-stable across runs of the same topology.
+    """
+    vendors: set[str] = set()
+    for node in topology.nodes:
+        cfg = node.llm_config
+        if cfg is None:
+            continue
+        model = getattr(cfg, "model", "")
+        if not isinstance(model, str) or "/" not in model:
+            continue
+        vendor = model.split("/", 1)[0].strip().lower()
+        if vendor:
+            vendors.add(vendor)
+    return sorted(vendors)
+
+
 def write_manifest(plan: RunPlan, *, cli_args: dict[str, Any]) -> Path:
     """Write ``runs/<id>/manifest.json`` at kickoff.
 
@@ -175,6 +248,18 @@ def write_manifest(plan: RunPlan, *, cli_args: dict[str, Any]) -> Path:
     surfaced at the top level so post-mortem tooling (and step 11's
     report HTML) can read it without parsing ``cli_args``. The empty-
     string default for "no rubric supplied" is preserved verbatim.
+
+    Step 15a additions:
+
+    * ``eval_ground_truth`` — list of 0 / 1 / null parallel to
+      ``eval_ids``. Sourced from each row's ``ground_truth_decision``
+      (binarised via :func:`_binarize_ground_truth`). All-null when no
+      eval row carries the column; consumers treat null entries as
+      "ground truth unavailable for this eval". Persisted in the signed
+      manifest so step 15a (e)'s BA-drop is auditor-verifiable.
+    * ``agent_vendors`` — sorted unique list of LiteLLM provider
+      prefixes derived from the topology's per-node ``llm_config.model``.
+      Used by the §8 ``judge_independence`` overlap computation.
     """
     plan.run_dir.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -197,6 +282,11 @@ def write_manifest(plan: RunPlan, *, cli_args: dict[str, Any]) -> Path:
             [n.id for n in v.nodes] for v in plan.variants
         ],
         "eval_ids": [r["id"] for r in plan.eval_rows],
+        "eval_ground_truth": [
+            _binarize_ground_truth(r.get("ground_truth_decision"))
+            for r in plan.eval_rows
+        ],
+        "agent_vendors": _agent_vendors_from_topology(plan.topology),
         "max_cost_usd": plan.max_cost_usd,
         "judge_model": plan.judge_model,
         "rubric_hash": plan.rubric_hash,
@@ -578,6 +668,18 @@ async def execute_run(
     elapsed = time.monotonic() - started
     final_successful = cost_state["successful_cells"] + already_successful_count
     final_total = len(plan.variants) * len(plan.eval_rows)
+    # Step 15a (f): cell-level §8 judge_failure_rate (judge_failure_cells
+    # / n_total_cells). Always finite — when n_total is 0 (empty plan),
+    # we surface 0.0 to keep the headline schema strict.
+    judge_failure_rate = (
+        cost_state["judge_failure_cells"] / final_total
+        if final_total > 0
+        else 0.0
+    )
+    # Step 15a (g): pre-assemble the §8 judge_independence dict here so
+    # the attest module doesn't need to import :mod:`fuzzeval.judge`
+    # (keeps the verify-only install path numpy/cryptography-only).
+    judge_independence = _build_judge_independence_dict(judge, plan.topology)
     _maybe_emit_attestation(
         plan,
         status=status,
@@ -585,6 +687,8 @@ async def execute_run(
         total_cells=final_total,
         total_cost_usd=cost_state["total_cost_usd"],
         elapsed_s=elapsed,
+        judge_failure_rate=judge_failure_rate,
+        judge_independence=judge_independence,
     )
     return RunResult(
         run_id=plan.run_id,
@@ -605,6 +709,136 @@ async def execute_run(
     )
 
 
+def _vendor_from_model_id(model_id: str) -> str | None:
+    """Extract the LiteLLM provider prefix from a model id.
+
+    ``"google/gemini-2.5-flash"`` → ``"google"``;
+    ``"jury_of_3:anthropic+google+openai"`` → ``None`` (the synthetic
+    jury display id is not a real provider). Returns the
+    strip+lowercase form, or ``None`` if no ``/`` is present.
+    """
+    if not isinstance(model_id, str) or "/" not in model_id:
+        return None
+    vendor = model_id.split("/", 1)[0].strip().lower()
+    return vendor or None
+
+
+def _build_judge_independence_dict(
+    judge: Any, topology: Any
+) -> dict[str, Any] | None:
+    """§14 step 15a (g): assemble the full §8 judge_independence dict.
+
+    Per BLUEPRINT §8 (line 223-235), the dict carries:
+
+    * ``judge_protocol`` — ``"jury_of_3"`` | ``"single"``
+    * ``judges`` — list of ``{vendor, model_id}`` for each constituent
+    * ``vendor_overlap`` — sorted vendors shared between agents & judges
+    * ``vendor_disjoint`` — bool (true iff the intersection is empty)
+    * ``self_preference_warning`` — string when non-empty overlap, else null
+    * ``vendor_call_failure_rate`` — vendor-call level rate from
+      JuryJudge (0.0 for single-judge runs by definition; null if the
+      judge instance doesn't expose the accessor)
+
+    Returns ``None`` when no judge is attached (a topology-only run).
+    The orchestrator skips the §8 disclosure in that case — there's
+    nothing to disclose.
+
+    Structurally distinguishes JuryJudge from SingleJudge via the
+    presence of the ``judge_independence`` attribute (mirrors the
+    existing in-loop check at orchestrator.py:561). Avoids a
+    :mod:`fuzzeval.judge` import here so the orchestrator's
+    lazy-import policy is preserved.
+    """
+    if judge is None:
+        return None
+
+    agent_vendors = set(_agent_vendors_from_topology(topology))
+    judges: list[dict[str, str]] = []
+    judge_vendors: set[str] = set()
+
+    # Audit RT-M3: classify by the conjunction of the three JuryJudge-
+    # specific attrs (``vendors`` tuple, ``_judges`` dict,
+    # ``judge_independence`` property). A future SingleJudge that
+    # gains a single one of these — e.g. a stubbed ``judge_independence``
+    # for telemetry — would otherwise misclassify as jury_of_3 and
+    # ship an empty disclosure with ``vendor_disjoint=True``, hiding
+    # a real self-preference risk.
+    is_jury = (
+        hasattr(judge, "judge_independence")
+        and hasattr(judge, "vendors")
+        and hasattr(judge, "_judges")
+    )
+
+    if is_jury:
+        judge_protocol = "jury_of_3"
+        vendor_names = tuple(getattr(judge, "vendors", ()))
+        inner = getattr(judge, "_judges", {})
+        for vendor in vendor_names:
+            single = inner.get(vendor)
+            model_id = getattr(single, "model", "") if single is not None else ""
+            judges.append({"vendor": vendor, "model_id": model_id})
+            judge_vendors.add(vendor)
+        # Audit CR-m3: ``judge_failure_rate`` is contractually a float
+        # (the JuryJudge property returns 0.0 even on a fresh instance),
+        # so the ``or 0.0`` defensive fallback was dead code — drop it.
+        # If a future judge implementation returns None, the resulting
+        # TypeError surfaces the contract violation loudly instead of
+        # being papered over.
+        vendor_call_failure_rate = float(
+            getattr(judge, "judge_failure_rate", 0.0)
+        )
+    else:
+        # Single judge — exposes ``model`` directly. Audit RT-M4:
+        # detect missing / empty model id explicitly and disclose the
+        # gap rather than emitting empty strings that are
+        # indistinguishable from a legitimate disjoint-vendor run.
+        judge_protocol = "single"
+        model_id_raw = getattr(judge, "model", None)
+        if not isinstance(model_id_raw, str) or not model_id_raw:
+            return {
+                "judge_protocol": "single",
+                "judges": [{"vendor": "unknown", "model_id": "unknown"}],
+                "vendor_overlap": [],
+                "vendor_disjoint": False,
+                "self_preference_warning": (
+                    "judge model not introspectable; cannot assess "
+                    "agent/judge vendor overlap — assume self-preference "
+                    "risk and review SECURITY.md §8."
+                ),
+                "vendor_call_failure_rate": 0.0,
+            }
+        derived_vendor = _vendor_from_model_id(model_id_raw) or ""
+        judges.append({"vendor": derived_vendor, "model_id": model_id_raw})
+        if derived_vendor:
+            judge_vendors.add(derived_vendor)
+        # No vendor-call-level failure tracking on SingleJudge; the
+        # cell-level judge_failure_rate (headline.judge_failure_rate)
+        # carries the equivalent signal.
+        vendor_call_failure_rate = 0.0
+
+    overlap_set = agent_vendors & judge_vendors
+    vendor_overlap = sorted(overlap_set)
+    vendor_disjoint = not overlap_set
+    self_preference_warning: str | None
+    if overlap_set:
+        joined = ", ".join(sorted(overlap_set))
+        self_preference_warning = (
+            f"Agents and judges share vendor(s): {joined}. "
+            "Same-vendor scoring can inflate apparent agreement — see SECURITY.md §8."
+        )
+    else:
+        self_preference_warning = None
+
+    return {
+        "judge_protocol": judge_protocol,
+        "judges": judges,
+        "vendor_overlap": vendor_overlap,
+        "vendor_disjoint": vendor_disjoint,
+        "self_preference_warning": self_preference_warning,
+        "vendor_call_failure_rate": vendor_call_failure_rate,
+    }
+
+
 def _maybe_emit_attestation(
     plan: RunPlan,
     *,
@@ -613,6 +847,8 @@ def _maybe_emit_attestation(
     total_cells: int,
     total_cost_usd: float,
     elapsed_s: float,
+    judge_failure_rate: float | None = None,
+    judge_independence: dict[str, Any] | None = None,
 ) -> None:
     """Best-effort emit of ``<run_dir>/attestation.json`` post-finalize.
 
@@ -689,6 +925,8 @@ def _maybe_emit_attestation(
             total_cost_usd=total_cost_usd,
             elapsed_s=elapsed_s,
             signer=signer,
+            judge_failure_rate=judge_failure_rate,
+            judge_independence=judge_independence,
         )
     except (OSError, ValueError, TypeError) as e:
         # OSError covers disk-full / permission-denied. ValueError +

@@ -78,11 +78,15 @@ __all__ = [
     "AttestationDiscoveryError",
     "PAYLOAD_SCHEMA_VERSION",
     "PAYLOAD_TYPE",
+    "REPORT_FILENAME",
     "VerifyOutcome",
     "build_attestation_payload",
+    "compute_ba_drop_for_attestation",
     "compute_findings",
     "compute_headline",
     "compute_influence_for_attestation",
+    "compute_kappa_orig_vs_perm_for_attestation",
+    "compute_verdict_flip_for_attestation",
     "compute_voo_for_attestation",
     "emit_attestation",
     "emit_run_attestation",
@@ -93,6 +97,10 @@ __all__ = [
 PAYLOAD_TYPE: Final[str] = "application/vnd.topofuzz.run+json;v=0.5"
 PAYLOAD_SCHEMA_VERSION: Final[int] = 1
 ATTESTATION_FILENAME: Final[str] = "attestation.json"
+# Step 15a (h): plain-JSON mirror of attestation.json's inner payload.
+# Same bytes as ``base64decode(attestation.payload)``, just unwrapped, so
+# step 22's recipient can ``jq '.headline'`` without DSSE-decoding skills.
+REPORT_FILENAME: Final[str] = "report.json"
 
 
 class AttestationDiscoveryError(FileNotFoundError):
@@ -150,19 +158,45 @@ def compute_headline(
     total_cost_usd: float,
     elapsed_s: float,
     voo_per_eval: list[dict[str, Any]] | None = None,
+    verdict_flip_rate: dict[str, Any] | None = None,
+    kappa_original_vs_permuted: float | None = None,
+    balanced_accuracy_drop: dict[str, Any] | None = None,
+    judge_failure_rate: float | None = None,
+    judge_independence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the headline dict.
 
-    ``voo_per_eval`` is the only "expensive" field — callers compute it
-    using :mod:`topofuzz.metrics` (score matrix + per-eval variance)
-    and pass it in. ECR and κ are hard-coded ``null`` in v0.5; see
-    module docstring for the rationale.
+    Step 15a fields (BLUEPRINT §14):
+
+    * ``voo_per_eval`` — list of ``{eval_id, point, ci_lower, ci_upper,
+      degenerate_flag}`` per BLUEPRINT §14 sub-deliverable (b).
+    * ``verdict_flip_rate`` — ``{point, ci_lower, ci_upper}`` per (c).
+    * ``kappa_original_vs_permuted`` — scalar float per (d).
+    * ``balanced_accuracy_drop`` — ``{original, mean_permuted, drop}`` per (e).
+    * ``judge_failure_rate`` — cell-level §8 rate in [0, 1] per (f).
+    * ``judge_independence`` — full §8 dict (judge_protocol, judges,
+      vendor_overlap, vendor_disjoint, self_preference_warning,
+      vendor_call_failure_rate) per (g).
+
+    ECR and κ-vs-truth remain hard-coded ``null`` in v0.5 (see module
+    docstring). ``kappa_original_vs_permuted`` is the *new* κ statistic
+    introduced by step 15a (d); it is intentionally distinct from the
+    legacy ``kappa`` field, which references κ-vs-truth.
+
+    All step-15a fields default to ``None`` so pre-step-15a callers
+    (and the v0.5 in-tree callsites that haven't been migrated yet)
+    continue producing well-shaped headlines without the new metrics.
     """
     return {
         "status": status,
         "voo_per_eval": voo_per_eval,
         "ecr": None,
         "kappa": None,
+        "verdict_flip_rate": verdict_flip_rate,
+        "kappa_original_vs_permuted": kappa_original_vs_permuted,
+        "balanced_accuracy_drop": balanced_accuracy_drop,
+        "judge_failure_rate": judge_failure_rate,
+        "judge_independence": judge_independence,
         "n_successful_cells": int(n_successful_cells),
         "n_total_cells": int(n_total_cells),
         "n_variants": int(n_variants),
@@ -220,6 +254,8 @@ def emit_attestation(
     payload: dict[str, Any],
     signer: Signer,
     out_path: Path,
+    *,
+    report_path: Path | None = None,
 ) -> Path:
     """JCS-canonicalize ``payload``, DSSE-sign, write to ``out_path``.
 
@@ -227,11 +263,49 @@ def emit_attestation(
     :func:`fuzzeval.attestation.dsse_sign` (compact, key-sorted JSON).
     No newline is appended — the file is exactly the bytes a verifier
     would re-read with ``Path.read_bytes()``.
+
+    Step 15a (h) — ``report_path``: when supplied, also writes the
+    JCS-canonical ``rfc8785.dumps(payload)`` bytes (the same payload
+    that is base64-wrapped inside the DSSE envelope) to
+    ``report_path``. This is the *plain-JSON mirror* DoD #4 promises:
+    grep-extractable without DSSE-decoding skills, but byte-identical
+    at the payload level to ``base64decode(attestation.payload)`` by
+    construction.
+
+    **Audit Pass-1 CR-M3 / RT-M2 hardening — write ordering:**
+
+    1. Build canonical payload bytes.
+    2. DSSE-sign and write ``attestation.json`` to its final path.
+    3. Atomic-rename ``report.json.tmp`` → ``report.json``.
+
+    Rationale: if ``dsse_sign`` raises (signer revoked, etc.), step 2
+    never lands AND step 3 never runs, so no orphan mirror persists
+    on disk. If step 2 succeeds but step 3 races with a concurrent
+    reader, the atomic rename guarantees readers see either the prior
+    mirror or the new one, never a half-written one. The mirror's
+    presence is therefore a strict subset of the envelope's presence:
+    consumers running ``jq '.headline' report.json`` MUST also verify
+    via the envelope, because the mirror without an envelope is
+    structurally impossible in a clean emit.
+
+    The reverse order (mirror-first) leaves a window where a signed
+    envelope failure persists an orphan mirror that recipients would
+    quote-and-trust — exactly the silent-failure vector the audit
+    flagged.
     """
     canonical = rfc8785.dumps(payload)
-    envelope = dsse_sign(canonical, PAYLOAD_TYPE, signer)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    envelope = dsse_sign(canonical, PAYLOAD_TYPE, signer)
     out_path.write_bytes(envelope)
+    if report_path is not None:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic write via tmp + replace. ``Path.replace`` is atomic on
+        # POSIX (rename(2)) and on Windows NTFS (since Python 3.3).
+        # The tmp filename appends ``.tmp`` AFTER the existing suffix
+        # so a concurrent ``glob("*.json")`` sweep doesn't pick it up.
+        tmp_path = report_path.with_suffix(report_path.suffix + ".tmp")
+        tmp_path.write_bytes(canonical)
+        tmp_path.replace(report_path)
     return out_path
 
 
@@ -467,6 +541,10 @@ def load_and_verify_attestation(
 def compute_voo_for_attestation(
     run_dir: Path,
     run_id: str,
+    *,
+    n_resamples: int = 5000,
+    conf: float = 0.95,
+    seed: int | None = 0,
 ) -> list[dict[str, Any]] | None:
     """Best-effort per-eval ``variance_across_orderings`` for the headline.
 
@@ -478,8 +556,24 @@ def compute_voo_for_attestation(
     The per-eval point estimate is ``np.var(matrix[:, j], ddof=0)`` for
     each eval ``j`` — matching the inner statistic of
     :func:`topofuzz.metrics.variance_across_orderings`. Per-eval cells
-    with NaN (failed cell in that variant×eval) propagate to ``point=None``
-    so the JSON stays well-typed.
+    with NaN (failed cell in that variant×eval) propagate to
+    ``point=None`` with ``degenerate_flag=True`` so the JSON stays
+    well-typed.
+
+    Step 15a (b) — each per-eval entry also carries
+    ``{ci_lower, ci_upper, degenerate_flag}``. The CI is a percentile
+    bootstrap on the **variant axis** (``n_resamples=5000`` per §9):
+    we resample the per-eval column with replacement and recompute
+    ``np.var(.., ddof=0)`` on each draw. The §9 paired cluster
+    bootstrap is the aggregate-statistic shape (outer=eval, inner=
+    variant) — its math doesn't apply to a single-eval column; for
+    per-eval CIs the single-axis bootstrap on the variants in that
+    eval is the right specialization. Degenerate columns (constant
+    values across variants, or any NaN) get ``ci_lower=ci_upper=None``
+    and ``degenerate_flag=True``.
+
+    ``seed`` defaults to ``0`` for byte-stable re-signs of the same
+    run (matches the §15 influence path).
 
     The ImportError catches are split by intent: a missing ``numpy`` is
     expected on a ``topofuzz[verify]``-only install (no signing, voo
@@ -522,18 +616,59 @@ def compute_voo_for_attestation(
     matrix = result.matrix
     if matrix.size == 0 or matrix.shape[0] < 1 or matrix.shape[1] < 1:
         return None
-    # ddof=0 matches the variance_across_orderings convention (BLUEPRINT
-    # §9 point estimate). We compute per-eval variance across the variant
-    # axis. If any cell in an eval column is NaN, np.var of that column
-    # is NaN — we emit point=None for that eval rather than NaN (JSON
-    # has no native NaN; rfc8785 would refuse).
-    per_eval = np.var(matrix, axis=0, ddof=0)
+
+    n_variants = matrix.shape[0]
+    alpha = (1.0 - conf) / 2.0
     out: list[dict[str, Any]] = []
-    for eid, v in zip(result.eval_ids, per_eval, strict=True):
-        if np.isnan(v) or np.isinf(v):
-            out.append({"eval_id": eid, "point": None})
-        else:
-            out.append({"eval_id": eid, "point": float(v)})
+    for j, eid in enumerate(result.eval_ids):
+        column = matrix[:, j]
+        finite = np.isfinite(column)
+        if not finite.all() or column.size == 0:
+            # Any NaN in the column → §9 point is NaN; mark degenerate.
+            # We don't impute on the attest path (the loader is the
+            # right place to surface missing cells; per the §9 docstring).
+            out.append({
+                "eval_id": eid,
+                "point": None,
+                "ci_lower": None,
+                "ci_upper": None,
+                "degenerate_flag": True,
+            })
+            continue
+        point = float(np.var(column, ddof=0))
+        if n_variants < 2 or bool(np.all(column == column[0])):
+            # Constant column or singleton variant axis: variance is
+            # structurally 0 (or trivially defined), bootstrap is a
+            # point — mark degenerate so the report doesn't draw a
+            # zero-width error bar.
+            out.append({
+                "eval_id": eid,
+                "point": point,
+                "ci_lower": None,
+                "ci_upper": None,
+                "degenerate_flag": True,
+            })
+            continue
+        # Audit RT-M7: per-column RNG seed so each column's bootstrap
+        # is byte-stable in isolation. A single shared RNG would mean
+        # column j's CI depends on the entire history of columns
+        # 0..j-1 — adding or reordering eval columns would silently
+        # shift every subsequent column's signed CI across the rc1→GA
+        # boundary, defeating step 13's release pipeline contract.
+        col_seed: int | None = None if seed is None else int(seed) + j
+        col_rng = np.random.default_rng(col_seed)
+        indices = col_rng.integers(
+            0, n_variants, size=(n_resamples, n_variants)
+        )
+        resampled = column[indices]
+        variances = np.var(resampled, axis=1, ddof=0)
+        out.append({
+            "eval_id": eid,
+            "point": point,
+            "ci_lower": float(np.quantile(variances, alpha)),
+            "ci_upper": float(np.quantile(variances, 1.0 - alpha)),
+            "degenerate_flag": False,
+        })
     return out
 
 
@@ -664,6 +799,323 @@ def compute_influence_for_attestation(
     return out if out else None
 
 
+def _resolve_original_variant_index(
+    manifest: dict[str, Any],
+    variant_ids: tuple[str, ...],
+) -> int | None:
+    """Locate the §6 "original" variant's row index in the score matrix.
+
+    Per the locked step-15a decision: the original is
+    ``manifest.variant_canonical_hashes[0]`` (kickoff insertion order).
+    The score-matrix variant axis is canonical_hash lex (step 9 handoff
+    decision C), so we find the index of that hash in ``variant_ids``.
+
+    **Audit Pass-1 RT-B1 / RT-B2 hardening:** refuses to resolve when
+    the manifest hash list contains duplicates (``.index()`` would
+    silently pick the first lex-sorted occurrence — a wrong-axis vector
+    that gets signed with DSSE confidence) or when the manifest's
+    set-of-hashes is not a subset of the score-matrix axis (signals a
+    canonical_hash recipe drift between kickoff and finalize). Both
+    refusals log at WARNING so a corrupted run shows in operator logs.
+
+    Returns ``None`` (and never raises) on any malformed input. The
+    caller (attest path) treats ``None`` as "metric not computable"
+    and skips with a stable null in the headline.
+    """
+    log = logging.getLogger(__name__)
+    if not isinstance(manifest, dict):
+        return None
+    hashes = manifest.get("variant_canonical_hashes")
+    if not isinstance(hashes, list) or not hashes:
+        return None
+    # Audit RT-B1: duplicate hashes in the manifest list mean the
+    # `[0]`-resolved original could be ambiguous against a lex-sorted
+    # axis that also contains the duplicate. Refuse rather than guess.
+    if len(set(hashes)) != len(hashes):
+        log.warning(
+            "manifest.variant_canonical_hashes has duplicate entries; "
+            "headline metrics requiring original_index skipped"
+        )
+        return None
+    original_hash = hashes[0]
+    if not isinstance(original_hash, str):
+        return None
+    # Audit Pass-2 M1 reversal: only require that the ORIGINAL hash is
+    # in the score-matrix axis. The original pass-1 fix checked
+    # ``set(hashes).issubset(set(variant_ids))`` to catch
+    # canonical_hash drift, but ``read_score_matrix`` filters cells
+    # with ``failure_reason IS NOT NULL`` (score_matrix.py:153-162),
+    # so a variant whose cells all failed is dropped from
+    # ``sm.variant_ids``. In the legitimate "12-variant run, 11
+    # succeeded, 1 fully aborted" case the manifest is a SUPERSET of
+    # the matrix axis — that's normal partial-success behavior, not
+    # drift. The strict subset gate killed verdict_flip / κ / BA-drop
+    # on every such run.
+    #
+    # The original-only check still catches the wrong-axis vector
+    # RT-B2 was concerned with: if the producer's canonical_hash
+    # recipe drifted between kickoff and finalize, the manifest's
+    # ``[0]`` will not match anything in the matrix and
+    # ``.index()`` returns ValueError → None below.
+    if original_hash not in variant_ids:
+        log.warning(
+            "manifest.variant_canonical_hashes[0]=%r not present in "
+            "score-matrix variant_ids; headline metrics skipped "
+            "(canonical_hash drift or the original variant fully "
+            "failed all cells)",
+            original_hash,
+        )
+        return None
+    # Surface (but don't block on) the inverse signal: matrix
+    # variant_ids that aren't in the manifest mean a cell was
+    # persisted under a hash the kickoff didn't declare —
+    # genuinely a drift signal that the operator should investigate.
+    extra_in_matrix = set(variant_ids) - set(hashes)
+    if extra_in_matrix:
+        log.warning(
+            "score-matrix variant_ids contains hashes absent from "
+            "manifest.variant_canonical_hashes: %r; continuing with "
+            "manifest-declared original",
+            sorted(extra_in_matrix),
+        )
+    return variant_ids.index(original_hash)
+
+
+def _extract_ground_truth_binary(
+    manifest: dict[str, Any],
+    eval_ids: tuple[str, ...],
+) -> "Any":
+    """Return a numpy 0/1 array aligned with ``eval_ids``, or None.
+
+    Reads ``manifest.eval_ground_truth`` (parallel to
+    ``manifest.eval_ids``). Each entry must be 0 / 1 / None. Any null
+    entry, missing field, or length mismatch → returns ``None`` (the
+    BA-drop metric is then degenerate; the legacy κ-vs-truth path
+    already null-handles).
+
+    The aligned-by-eval-ids guarantee: the orchestrator writes
+    ``eval_ground_truth`` in the SAME ORDER as ``eval_ids``; the score
+    matrix's eval axis is in insertion order; so positional alignment
+    holds without re-indexing. We still cross-check the manifest's
+    ``eval_ids`` against the score matrix's ``eval_ids`` to catch a
+    refactor that broke the convention.
+    """
+    if not isinstance(manifest, dict):
+        return None
+    gt_raw = manifest.get("eval_ground_truth")
+    eids_manifest = manifest.get("eval_ids")
+    if not isinstance(gt_raw, list) or not isinstance(eids_manifest, list):
+        return None
+    if len(gt_raw) != len(eval_ids):
+        return None
+    if tuple(eids_manifest) != tuple(eval_ids):
+        # Audit RT-M6: this mismatch is a structural refactor-bug
+        # signal — log it at ERROR so a regression that breaks the
+        # eval-axis ordering invariant doesn't silently degrade
+        # BA-drop to "ground truth unavailable" on EVERY signed
+        # attestation thereafter. Step 22 PDFs that quote
+        # ``balanced_accuracy_drop=None`` would otherwise look like
+        # "this run has no ground-truth signal" when in fact the
+        # producer's wiring is broken.
+        logging.getLogger(__name__).error(
+            "eval-axis ordering mismatch in attestation path: "
+            "manifest.eval_ids=%r score_matrix.eval_ids=%r — "
+            "BA-drop skipped (structural bug, not a per-run condition)",
+            eids_manifest, eval_ids,
+        )
+        return None
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    if any(v is None for v in gt_raw):
+        return None
+    try:
+        arr = np.asarray(gt_raw, dtype=int)
+    except (TypeError, ValueError):
+        return None
+    if not bool(np.all((arr == 0) | (arr == 1))):
+        return None
+    return arr
+
+
+def compute_verdict_flip_for_attestation(
+    run_dir: Path,
+    run_id: str,
+    manifest: dict[str, Any],
+    *,
+    n_resamples: int = 5000,
+    conf: float = 0.95,
+    seed: int | None = 0,
+) -> dict[str, Any] | None:
+    """§14 step 15a (c) attestation wire-up for verdict-flip rate.
+
+    Returns ``{point, ci_lower, ci_upper, degenerate_flag}`` or ``None``
+    when the metric isn't computable (numpy missing, score matrix
+    unreadable, single-variant fixture, original-hash not in matrix axis).
+
+    Verdict-flip is the THE pull-quote number for step 22's CEO outreach
+    PDF (BLUEPRINT line 416). The "original" variant is identified by
+    ``manifest.variant_canonical_hashes[0]`` (the §6 contract).
+    """
+    log = logging.getLogger(__name__)
+    try:
+        import numpy as np  # noqa: F401 — numpy presence gate
+    except ImportError:
+        return None
+    try:
+        import sqlite3
+
+        from topofuzz.metrics import compute_verdict_flip_rate, read_score_matrix
+    except ImportError as e:
+        log.warning(
+            "topofuzz.metrics unavailable; verdict_flip skipped in attestation: %s",
+            e,
+        )
+        return None
+    try:
+        sm = read_score_matrix(
+            run_dir,
+            run_id=run_id,
+            allow_empty_rubric_hash=True,
+        )
+    except (FileNotFoundError, ValueError, OSError, sqlite3.DatabaseError):
+        return None
+    if sm.matrix.size == 0 or sm.matrix.shape[0] < 2 or sm.matrix.shape[1] < 1:
+        return None
+    orig_idx = _resolve_original_variant_index(manifest, sm.variant_ids)
+    if orig_idx is None:
+        return None
+    try:
+        result = compute_verdict_flip_rate(
+            sm.matrix, orig_idx, n_resamples=n_resamples, conf=conf, seed=seed
+        )
+    except (ValueError, ImportError) as e:
+        log.warning(
+            "verdict_flip computation failed in attestation path: %s", e
+        )
+        return None
+    return {
+        "point": result.point,
+        "ci_lower": result.ci_lower,
+        "ci_upper": result.ci_upper,
+        "degenerate_flag": result.degenerate_flag,
+    }
+
+
+def compute_kappa_orig_vs_perm_for_attestation(
+    run_dir: Path,
+    run_id: str,
+    manifest: dict[str, Any],
+) -> float | None:
+    """§14 step 15a (d) attestation wire-up for κ original-vs-permuted.
+
+    Returns a scalar in ``[-1, 1]`` or ``None`` when the metric isn't
+    computable. Distinct from the legacy ``cohens_kappa_vs_truth`` —
+    this κ compares the original variant against the union of all
+    permuted variants (no ground-truth column required).
+    """
+    log = logging.getLogger(__name__)
+    try:
+        import numpy as np  # noqa: F401
+    except ImportError:
+        return None
+    try:
+        import sqlite3
+
+        from topofuzz.metrics import (
+            cohens_kappa_original_vs_permuted,
+            read_score_matrix,
+        )
+    except ImportError as e:
+        log.warning(
+            "topofuzz.metrics unavailable; kappa_orig_vs_perm skipped: %s", e
+        )
+        return None
+    try:
+        sm = read_score_matrix(
+            run_dir, run_id=run_id, allow_empty_rubric_hash=True
+        )
+    except (FileNotFoundError, ValueError, OSError, sqlite3.DatabaseError):
+        return None
+    if sm.matrix.size == 0 or sm.matrix.shape[0] < 2 or sm.matrix.shape[1] < 1:
+        return None
+    orig_idx = _resolve_original_variant_index(manifest, sm.variant_ids)
+    if orig_idx is None:
+        return None
+    try:
+        kappa = cohens_kappa_original_vs_permuted(sm.matrix, orig_idx)
+    except (ValueError, ImportError) as e:
+        log.warning(
+            "kappa_orig_vs_perm computation failed in attestation path: %s", e
+        )
+        return None
+    if kappa is None:
+        return None
+    return float(kappa)
+
+
+def compute_ba_drop_for_attestation(
+    run_dir: Path,
+    run_id: str,
+    manifest: dict[str, Any],
+) -> dict[str, Any] | None:
+    """§14 step 15a (e) attestation wire-up for balanced-accuracy drop.
+
+    Returns ``{original, mean_permuted, drop}`` or ``None`` when
+    ground_truth is absent from the manifest, the metric is degenerate,
+    or the score matrix is unreadable.
+
+    Ground truth is sourced from ``manifest.eval_ground_truth`` (a
+    list of 0/1/null parallel to ``manifest.eval_ids``). Step 22
+    consumers MUST treat a ``None`` return as "this run has no
+    ground-truth signal" and not assert on BA-drop in that case.
+    """
+    log = logging.getLogger(__name__)
+    try:
+        import numpy as np  # noqa: F401
+    except ImportError:
+        return None
+    try:
+        import sqlite3
+
+        from topofuzz.metrics import balanced_accuracy_drop, read_score_matrix
+    except ImportError as e:
+        log.warning(
+            "topofuzz.metrics unavailable; ba_drop skipped in attestation: %s",
+            e,
+        )
+        return None
+    try:
+        sm = read_score_matrix(
+            run_dir, run_id=run_id, allow_empty_rubric_hash=True
+        )
+    except (FileNotFoundError, ValueError, OSError, sqlite3.DatabaseError):
+        return None
+    if sm.matrix.size == 0 or sm.matrix.shape[0] < 2 or sm.matrix.shape[1] < 1:
+        return None
+    orig_idx = _resolve_original_variant_index(manifest, sm.variant_ids)
+    if orig_idx is None:
+        return None
+    gt = _extract_ground_truth_binary(manifest, sm.eval_ids)
+    if gt is None:
+        return None
+    try:
+        result = balanced_accuracy_drop(sm.matrix, gt, orig_idx)
+    except (ValueError, ImportError) as e:
+        log.warning(
+            "ba_drop computation failed in attestation path: %s", e
+        )
+        return None
+    if result.degenerate_flag or result.original is None:
+        return None
+    return {
+        "original": result.original,
+        "mean_permuted": result.mean_permuted,
+        "drop": result.drop,
+    }
+
+
 def compute_findings(
     run_dir: Path,
     run_id: str,
@@ -702,17 +1154,43 @@ def emit_run_attestation(
     total_cost_usd: float,
     elapsed_s: float,
     signer: Signer,
+    judge_failure_rate: float | None = None,
+    judge_independence: dict[str, Any] | None = None,
 ) -> Path:
     """Orchestrator's one-call attestation emit.
 
-    Computes the headline (voo best-effort), digests ``run.sqlite`` if
-    present, builds the payload, signs, and writes
-    ``<run_dir>/attestation.json``. Returns the path written. Raises
-    only if signing or disk-write fails — the orchestrator should call
-    this in a try/except and log-and-continue on failure so a bad sign
-    never tanks a successful run.
+    Computes the headline (voo + verdict_flip + κ + BA-drop +
+    judge_failure_rate + judge_independence on the best-effort path),
+    digests ``run.sqlite`` if present, builds the payload, signs, and
+    writes ``<run_dir>/attestation.json`` plus the step-15a (h) plain
+    ``<run_dir>/report.json`` mirror. Returns the path of the signed
+    envelope. Raises only if signing or disk-write fails — the
+    orchestrator should call this in a try/except and log-and-continue
+    on failure so a bad sign never tanks a successful run.
+
+    Step 15a kwargs (BLUEPRINT §14 (f) + (g)):
+
+    * ``judge_failure_rate`` — cell-level §8 rate sourced from the
+      orchestrator's ``cost_state['judge_failure_cells'] / n_total_cells``.
+      Defaults to ``None`` to keep backwards-compatibility with
+      pre-15a callers (the legacy in-tree call site at
+      ``orchestrator._maybe_emit_attestation`` is upgraded to pass it).
+    * ``judge_independence`` — pre-assembled §8 dict produced by the
+      orchestrator (it has direct access to the judge instance + the
+      topology IR for the config-overlap computation). Defaults to
+      ``None`` when no judge is attached.
     """
-    voo = compute_voo_for_attestation(run_dir, run_id)
+    # Audit RT-M8: pass seed=0 explicitly at every call site so a
+    # future refactor of any callee's default doesn't silently lose
+    # the rc1→GA byte-stable contract.
+    voo = compute_voo_for_attestation(run_dir, run_id, seed=0)
+    verdict_flip = compute_verdict_flip_for_attestation(
+        run_dir, run_id, manifest, seed=0
+    )
+    kappa_orig_vs_perm = compute_kappa_orig_vs_perm_for_attestation(
+        run_dir, run_id, manifest
+    )
+    ba_drop = compute_ba_drop_for_attestation(run_dir, run_id, manifest)
     headline = compute_headline(
         status=status,
         n_successful_cells=successful_cells,
@@ -722,10 +1200,28 @@ def emit_run_attestation(
         total_cost_usd=total_cost_usd,
         elapsed_s=elapsed_s,
         voo_per_eval=voo,
+        verdict_flip_rate=verdict_flip,
+        kappa_original_vs_permuted=kappa_orig_vs_perm,
+        balanced_accuracy_drop=ba_drop,
+        judge_failure_rate=judge_failure_rate,
+        judge_independence=judge_independence,
     )
-    findings = compute_findings(run_dir, run_id, manifest)
+    findings = compute_findings(run_dir, run_id, manifest, seed=0)
     sqlite_path = run_dir / "run.sqlite"
-    sqlite_sha = sha256_file(sqlite_path) if sqlite_path.exists() else ""
+    if sqlite_path.exists():
+        sqlite_sha = sha256_file(sqlite_path)
+    else:
+        # Audit RT-m1: surface the "no sqlite at finalize" case so the
+        # operator's logs distinguish an intentionally-aborted run
+        # from a writer-crashed-mid-finalize bug. INFO not WARNING:
+        # the verify path treats empty sha as a vacuous pass, so this
+        # is not an error — just a data point worth recording.
+        logging.getLogger(__name__).info(
+            "emit_run_attestation: run.sqlite missing at %s; "
+            "signing payload with empty run_sqlite_sha256",
+            sqlite_path,
+        )
+        sqlite_sha = ""
     payload = build_attestation_payload(
         run_id=run_id,
         manifest=manifest,
@@ -733,4 +1229,9 @@ def emit_run_attestation(
         findings=findings,
         run_sqlite_sha256=sqlite_sha,
     )
-    return emit_attestation(payload, signer, run_dir / ATTESTATION_FILENAME)
+    return emit_attestation(
+        payload,
+        signer,
+        run_dir / ATTESTATION_FILENAME,
+        report_path=run_dir / REPORT_FILENAME,
+    )

@@ -376,3 +376,249 @@ def cohens_kappa_vs_truth(
         degenerate_flag=False,
         collapse_flag=collapse_flag,
     )
+
+
+# ---------------------------------------------------------------------------
+# §14 step 15a (d) + (e): original-vs-permuted comparisons
+#
+# These are distinct from ``cohens_kappa_vs_truth`` above:
+#   * ``cohens_kappa_vs_truth`` compares every variant against ground
+#     truth, then averages — measures "do the variants agree with
+#     reality, on average?"
+#   * ``cohens_kappa_original_vs_permuted`` compares the original
+#     variant's verdicts against the union of all permuted variants'
+#     verdicts — measures "does the original agree with its own
+#     semantically-equivalent permutations?" (Landis-Koch < 0.4 → poor
+#     agreement is the headline gate for step 22.)
+#   * ``balanced_accuracy_drop`` is the difference between the
+#     original's BA-vs-truth and the mean permuted BA-vs-truth —
+#     measures "does permuting the topology degrade correctness?"
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BalancedAccuracyDropResult:
+    """Output of :func:`balanced_accuracy_drop`.
+
+    ``original`` and ``mean_permuted`` are the two BA-vs-truth values
+    being compared. ``drop`` is ``original - mean_permuted`` — a
+    positive drop means permutation degrades correctness (the
+    BLUEPRINT §22 framing). All three are ``None`` when the metric is
+    degenerate (single variant, < 2 evals, all-NaN, ground_truth
+    not binary, etc.).
+    """
+
+    original: float | None
+    mean_permuted: float | None
+    drop: float | None
+    degenerate_flag: bool
+
+
+def cohens_kappa_original_vs_permuted(
+    score_matrix: "np.ndarray",
+    original_index: int,
+    *,
+    threshold: float = 0.5,
+) -> float | None:
+    """§14 step 15a (d): κ between original-variant and permuted-variant verdicts.
+
+    **Locked semantics — "union" pairing, NOT per-eval majority vote:**
+    pairs the original variant's binarised verdicts (length n_evals)
+    against the FLATTENED concatenation of all permuted variants'
+    binarised verdicts (length (n_variants-1) × n_evals_valid). The
+    original column is repeated to match length so Cohen's κ sees
+    paired raters. Cells where either side is NaN are dropped from
+    both sides in lockstep so the pair count is honest.
+
+    Audit Pass-1 CR-M2 noted that an alternative reading — collapse
+    permuted variants to a per-eval majority verdict and then compare
+    one-to-one with the original — would also satisfy the BLUEPRINT
+    §14 (d) phrasing "union of all permuted variants' binary
+    verdicts." We deliberately chose UNION pairing because (i)
+    majority-vote collapse discards the per-variant disagreement
+    signal that motivates topofuzz in the first place — a topology
+    where 3 permuted variants tie 2-1 vs the original is materially
+    different from one where they tie 3-0, and only union pairing
+    surfaces that, and (ii) the resulting κ is the standard
+    pairwise-raters statistic auditors will recognise. The choice
+    is locked in this docstring; do not change without re-aligning
+    step 22's pull-quote interpretation.
+
+    Args:
+        score_matrix: ``(n_variants, n_evals)`` float matrix of
+            continuous judge scores in ``[0, 1]``. NaN cells are
+            dropped from both raters in lockstep.
+        original_index: Row index of the "original" variant in
+            ``score_matrix``. Caller resolves from
+            ``manifest.variant_canonical_hashes[0]``.
+        threshold: Cutoff for binarising. Defaults to 0.5.
+
+    Returns:
+        κ in ``[-1, 1]``, or ``None`` when the metric is degenerate
+        (n_variants < 2, no valid pairs after NaN drop, ground_truth
+        not provided here — that's the BA-drop function's domain).
+
+    Raises:
+        ImportError: numpy missing.
+        ValueError: ``score_matrix`` not 2D, ``original_index`` out
+            of range, ``threshold`` out of [0, 1].
+    """
+    try:
+        import numpy as np
+    except ImportError as e:
+        raise ImportError(
+            "topofuzz.metrics.cohens_kappa_original_vs_permuted requires "
+            "numpy (install via `pip install topofuzz[stats]`)."
+        ) from e
+
+    arr = np.asarray(score_matrix, dtype=np.float64)
+    if arr.ndim != 2:
+        raise ValueError(
+            f"score_matrix must be 2D (n_variants, n_evals); got "
+            f"ndim={arr.ndim}"
+        )
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError(f"threshold must be in [0, 1]; got {threshold!r}")
+
+    n_variants, n_evals = arr.shape
+    if not (0 <= original_index < n_variants):
+        raise ValueError(
+            f"original_index={original_index!r} out of range for "
+            f"n_variants={n_variants}"
+        )
+    if n_variants < 2 or n_evals < 1:
+        return None
+
+    valid = np.isfinite(arr)
+    preds = (arr >= threshold).astype(int)
+
+    orig_preds = preds[original_index, :]
+    orig_valid = valid[original_index, :]
+
+    perm_mask = np.ones(n_variants, dtype=bool)
+    perm_mask[original_index] = False
+    perm_preds = preds[perm_mask, :]
+    perm_valid = valid[perm_mask, :]
+
+    # For each (perm_row, eval) cell, keep iff BOTH original and
+    # permuted cells are valid. Build the paired-raters arrays from
+    # the surviving cells. Use ``perm_preds.shape`` directly for the
+    # broadcast target (audit CR-m2: avoid an unused ``n_perm`` local).
+    pair_mask = perm_valid & orig_valid[None, :]
+    if pair_mask.sum() == 0:
+        return None
+
+    a = np.broadcast_to(orig_preds[None, :], perm_preds.shape)[pair_mask]
+    b = perm_preds[pair_mask]
+    if a.size == 0:
+        return None
+    return cohens_kappa(a, b)
+
+
+def balanced_accuracy_drop(
+    score_matrix: "np.ndarray",
+    ground_truth_binary: "np.ndarray",
+    original_index: int,
+    *,
+    threshold: float = 0.5,
+) -> BalancedAccuracyDropResult:
+    """§14 step 15a (e): BA(original) − mean BA(permuted) against ground truth.
+
+    Args:
+        score_matrix: ``(n_variants, n_evals)`` continuous-score matrix.
+            NaN cells in a given variant row drop that variant's
+            BA-vs-truth from the comparison (the variant is skipped,
+            not zeroed).
+        ground_truth_binary: ``(n_evals,)`` 0/1 ground-truth array.
+            Length must match ``score_matrix.shape[1]``. NaN-aware
+            indexing keeps the alignment.
+        original_index: Row index of the "original" variant.
+        threshold: Cutoff for binarising.
+
+    Returns:
+        :class:`BalancedAccuracyDropResult`. Degenerate when
+        n_variants < 2, ground_truth has < 2 distinct values, or
+        the original variant's row has no valid cells.
+
+    Raises:
+        ImportError: numpy missing.
+        ValueError: shape mismatch; ``original_index`` out of range;
+            ``threshold`` out of [0, 1]; ground_truth not binary.
+    """
+    try:
+        import numpy as np
+    except ImportError as e:
+        raise ImportError(
+            "topofuzz.metrics.balanced_accuracy_drop requires numpy "
+            "(install via `pip install topofuzz[stats]`)."
+        ) from e
+
+    arr = np.asarray(score_matrix, dtype=np.float64)
+    gt = np.asarray(ground_truth_binary).ravel().astype(int)
+
+    if arr.ndim != 2:
+        raise ValueError(
+            f"score_matrix must be 2D; got ndim={arr.ndim}"
+        )
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError(f"threshold must be in [0, 1]; got {threshold!r}")
+    if not np.all((gt == 0) | (gt == 1)):
+        raise ValueError("ground_truth_binary must contain only 0/1 values")
+
+    n_variants, n_evals = arr.shape
+    if arr.shape[1] != gt.shape[0]:
+        raise ValueError(
+            f"score_matrix has {arr.shape[1]} evals but ground_truth_binary "
+            f"has {gt.shape[0]}; lengths must match."
+        )
+    if not (0 <= original_index < n_variants):
+        raise ValueError(
+            f"original_index={original_index!r} out of range for "
+            f"n_variants={n_variants}"
+        )
+    if n_variants < 2 or n_evals < 1 or len(set(gt.tolist())) < 2:
+        return BalancedAccuracyDropResult(
+            original=None,
+            mean_permuted=None,
+            drop=None,
+            degenerate_flag=True,
+        )
+
+    valid = np.isfinite(arr)
+    preds = (arr >= threshold).astype(int)
+
+    def _ba_one_row(row_idx: int) -> float | None:
+        m = valid[row_idx]
+        if not m.any():
+            return None
+        return balanced_accuracy(gt[m], preds[row_idx, m])
+
+    ba_orig = _ba_one_row(original_index)
+    if ba_orig is None:
+        return BalancedAccuracyDropResult(
+            original=None,
+            mean_permuted=None,
+            drop=None,
+            degenerate_flag=True,
+        )
+
+    perm_indices = [i for i in range(n_variants) if i != original_index]
+    perm_bas: list[float] = []
+    for i in perm_indices:
+        ba_i = _ba_one_row(i)
+        if ba_i is not None:
+            perm_bas.append(ba_i)
+    if not perm_bas:
+        return BalancedAccuracyDropResult(
+            original=float(ba_orig),
+            mean_permuted=None,
+            drop=None,
+            degenerate_flag=True,
+        )
+    mean_perm = float(sum(perm_bas) / len(perm_bas))
+    return BalancedAccuracyDropResult(
+        original=float(ba_orig),
+        mean_permuted=mean_perm,
+        drop=float(ba_orig) - mean_perm,
+        degenerate_flag=False,
+    )
