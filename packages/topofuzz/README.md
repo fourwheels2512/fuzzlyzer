@@ -21,6 +21,38 @@ v1.0.0 reference vectors. Verify-only install path (`pip install
 topofuzz`, no LangGraph, no LLM SDKs, ~15 MB) is the design contract,
 not an afterthought.
 
+## Disclaimers
+
+topofuzz is **research and engineering software**, distributed under
+Apache-2.0 **with no warranty** (see `LICENSE` §7–§8).
+
+- **Not a certification.** topofuzz measures one specific property —
+  how much a multi-agent system's answers change when you shuffle the
+  agent order. It does not certify safety, security, alignment,
+  correctness, or fitness for any purpose, and makes no claim of
+  compliance with HIPAA, GDPR, SOC 2, FedRAMP, FINRA, the EU AI Act,
+  or any other regulatory regime.
+- **No PII guidance.** Reports embed your eval inputs verbatim and
+  LLM responses verbatim. If your eval set contains personal,
+  confidential, or regulated data, treat `report.html`, `report.json`,
+  `manifest.json`, and `run.sqlite` as carrying that data classification.
+- **Topology fixtures execute Python.** `topofuzz run path/to/fx.py:g`
+  calls `importlib.util.spec_from_file_location` and `exec_module` on
+  the file you point at. Only run fixtures you trust; never run a
+  fixture from an untrusted source (a Discord paste, an unverified PR,
+  etc.).
+- **Sigstore Rekor is permanent and public.** `--rekor` posts the
+  DSSE envelope (containing manifest digest, judge model id, eval
+  count, and timing) to a globally-replicated, immutable transparency
+  log. There is no delete. Do not enable `--rekor` on runs whose
+  metadata you would not publish on GitHub.
+- **`[DEV-KEY]` is not a third-party-verifiable signature.** The
+  developer key lives unencrypted at `~/.topofuzz/dev.pem`; anyone
+  with read access to that file can forge attestations
+  indistinguishably. See
+  [`SECURITY.md`](https://github.com/kirannayudu/topofuzz/blob/main/SECURITY.md)
+  for the v0.5 threat model.
+
 ## What it does
 
 1. Reads your compiled LangGraph and lifts it to a typed

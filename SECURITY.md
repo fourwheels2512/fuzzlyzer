@@ -221,6 +221,59 @@ cache format to JSON-only to remove this surface entirely.
   Use `--no-cache` and a fresh per-run keypair in ephemeral CI
   containers; treat the resulting attestation as `[DEV-KEY]`-tagged.
 
+## What topofuzz protects and does not protect against
+
+### Protects
+
+* **DSSE envelope tampering.** A bit-flipped `attestation.json`,
+  `manifest.json`, or `run.sqlite` fails `topofuzz verify` (Ed25519
+  signature + JCS round-trip + sqlite digest match all checked).
+* **Orphan-attestation replay across run dirs.** The signed payload
+  binds the attestation to the run-dir digests; copying
+  `attestation.json` into a different run dir fails verify.
+* **Cache poisoning of non-score types.** `fuzzeval/cache.py` refuses
+  to round-trip any value that is not a `ContinuousScore` /
+  `BinaryScore` / `bytes`.
+* **Transparency-log integrity for `--rekor` runs.** When `--rekor`
+  succeeds, the signed envelope is posted to the Sigstore Public Good
+  Instance, where third-party inclusion proofs are independently
+  retrievable. A tampered `report.json.dsse.rekor.json` is detectable
+  against the live log.
+
+### Does not protect
+
+* **Prompt injection of the agents under test.** topofuzz is the
+  measurement instrument; if your topology's agents are vulnerable to
+  prompt injection from eval inputs, topofuzz will faithfully measure
+  the resulting instability, not prevent it.
+* **LLM-as-judge corruption.** The judge is itself an LLM call; a
+  judge model that is biased, lying, or jailbroken will produce a
+  biased, lying, or jailbroken score. `--jury-of-3` reduces
+  single-vendor bias but does not eliminate adversarial judge
+  behavior.
+* **Untrusted topology fixtures.** `load_topology` calls
+  `importlib.exec_module` on user-supplied Python. A hostile fixture
+  has full host privileges (same as `python path/to/fixture.py`). The
+  one-shot stderr warning emitted at import time is the only
+  in-process mitigation; v0.6 may add an `--allow-untrusted-fixture`
+  opt-in. Do not feed topofuzz fixtures from sources you would not
+  `python` directly.
+* **Key compromise via shared `$HOME`.** Two users on the same
+  machine with read access to each other's home dirs can read each
+  other's `~/.topofuzz/dev.pem` and forge attestations. POSIX `0600`
+  and Windows ACL guidance live in the operator checklist above;
+  topofuzz does not enforce them at sign time.
+* **Rekor takedown.** Sigstore Public Good Instance commits are
+  permanent. topofuzz cannot remove a submission after the fact.
+  Treat `--rekor` as a publication action, not a private signing
+  step.
+* **Third-party LLM provider TOS / availability / pricing.** The
+  judge and agent calls reach external services (Gemini, Anthropic,
+  OpenAI, etc.). topofuzz cannot guarantee provider uptime, refuse
+  rate limits, or compliance posture; the run-status taxonomy
+  surfaces `degraded` / `cost_cap_hit` / `failed` outcomes but the
+  underlying provider behavior is out of scope.
+
 ## Reporting vulnerabilities
 
 For findings that can be safely disclosed publicly, open an issue at
