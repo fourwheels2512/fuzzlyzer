@@ -166,8 +166,8 @@ def percentile_cluster_bootstrap(
 ) -> BootstrapResult:
     """Two-level paired cluster bootstrap on a 2D score matrix.
 
-    Resamples outer clusters (TSF: ``eval_id``, axis 1) and inner clusters
-    (TSF: ``variant_id``, axis 0) each with replacement. The same inner
+    Resamples outer clusters (topofuzz: ``eval_id``, axis 1) and inner clusters
+    (topofuzz: ``variant_id``, axis 0) each with replacement. The same inner
     resampling is applied across every chosen outer cluster on each draw —
     that's the "paired" part — so within-row correlation structure across
     evals is preserved. ``statistic`` is evaluated on the original matrix
@@ -199,9 +199,9 @@ def percentile_cluster_bootstrap(
             meaningful percentile CI.
         conf: confidence level in (0, 1). Default 0.95.
         outer_axis: axis whose clusters are sampled at the outer level
-            (TSF: eval_id, default 1).
+            (topofuzz: eval_id, default 1).
         inner_axis: axis whose clusters are sampled (paired) at the inner
-            level (TSF: variant_id, default 0).
+            level (topofuzz: variant_id, default 0).
         seed: RNG seed for ``np.random.default_rng``; ``None`` is
             non-deterministic.
 

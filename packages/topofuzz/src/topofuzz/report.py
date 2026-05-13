@@ -27,8 +27,9 @@ Banner conditionals (§11 line 304):
   of ``topofuzz verify``. The v0.5 attestation pipeline only knows dev
   keys (BLUEPRINT_v5plus.md §17a), so file presence == dev-key.
 * ``[JURY]`` — emitted iff ``manifest['cli_args']['jury_of_3']`` is
-  truthy. v0.5 always refuses ``--jury-of-3`` with exit 2, so this
-  banner is forward-compat for v0.6.
+  truthy. Step 12b (Weekend 4) wired ``--jury-of-3`` past the prior
+  bad-usage gate; the banner now lights up for live jury runs, not
+  just forward-compat manifest fixtures.
 * ``[DEGRADED]`` — emitted iff the ``runs.status`` row reads exactly
   ``"degraded"``. The other §A non-success states (``failed``,
   ``cost_cap_hit``, ``interrupted``) are surfaced through the status

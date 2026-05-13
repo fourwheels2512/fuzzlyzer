@@ -210,10 +210,13 @@ class SingleJudge:
     """One LLM call per cell. Returns ``ContinuousScore`` in ``[0, 1]``.
 
     Implements the :class:`Judge` protocol (sync ``.score``). Step 7's
-    blueprint position: "Single Claude call per (variant, eval).
-    Cached via ``mbcore.cache.JudgeCache``. Rubric prompt drafted and
+    blueprint position: "Single Claude call per (variant, eval). Cached
+    via ``fuzzeval.cache.JudgeCache``. Rubric prompt drafted and
     committed." V0.5 defaults to ``google/gemini-2.5-pro`` rather than
     Claude per ``project_llm_api_access`` (only Gemini key confirmed).
+    (BLUEPRINT_v5plus.md predates the rename and still spells
+    ``mbcore.cache.JudgeCache``; the real module is ``fuzzeval.cache``
+    per [[project_topofuzz_names]].)
 
     Args:
         model: LiteLLM model id (e.g. ``"google/gemini-2.5-pro"``).

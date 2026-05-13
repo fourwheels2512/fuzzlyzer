@@ -588,11 +588,19 @@ def run(
     # instance. Done here (CLI scope) rather than via manifest plumbing
     # to keep the step-12b surface minimal — promoting to manifest is a
     # v0.5.1 schema bump per the JuryJudge class docstring.
+    #
+    # Polish-audit DRIFT-3 fix: this rate is the VENDOR-CALL failure
+    # rate (across all three vendors, across all cells), not the
+    # BLUEPRINT §8 cell-level ``judge_failure_rate`` (= fraction of
+    # cells where ALL three vendors failed). The §8 cell-level gate
+    # lives in :func:`topofuzz.metrics.classify_run_status`; the label
+    # here is explicit so a user can't confuse the two numbers.
     if isinstance(judge, JuryJudge):
         typer.echo(
-            f"Jury judge_failure_rate: {judge.judge_failure_rate:.2%} "
+            f"Jury vendor-call failure rate: {judge.judge_failure_rate:.2%} "
             f"({judge.failed_vendor_calls}/{judge.total_vendor_calls} "
-            "vendor calls)"
+            "vendor calls; cell-level §8 rate reported separately by "
+            "metrics)"
         )
         typer.echo(
             "Jury judge_independence.vendor_overlap: "
@@ -639,18 +647,19 @@ def _preflight_cost(
     still cost real money; the judge stub does not). The estimator
     itself is judge-mode agnostic; we annotate downstream.
 
-    ``jury_of_3=True`` annotates the printed estimate to flag that the
-    real billing will be ~3× the displayed judge column (the estimator
-    prices a single-judge call; the jury fans out to three vendors).
-    Pass-1 CR-M4 / RT-10 audit fix: without this, the preflight prompt
-    silently under-displays jury cost by ~3×.
+    ``jury_of_3=True`` selects ``judge_mode="jury_of_3"`` in the
+    underlying estimator so the judge column reflects three vendor
+    calls per cell instead of one (BLUEPRINT §6 trio). Polish-audit
+    improvement: this drops the prior ``~3×`` disclaimer in favor of
+    an honest displayed total — the estimator's
+    ``_JUDGE_CALLS_PER_CELL["jury_of_3"] == 3`` already pices the trio.
     """
     from fuzzeval.costest import estimate as _estimate
 
     sample = eval_rows[: min(5, len(eval_rows))]
     est = _estimate(
         sample_rows=sample,
-        judge_mode="single",
+        judge_mode="jury_of_3" if jury_of_3 else "single",
         n_total_rows=len(eval_rows),
         n_variants=len(plan.variants),
         agent_model=plan.topology.nodes[0].llm_config.model
@@ -701,9 +710,8 @@ def _preflight_cost(
         )
     if jury_of_3 and not dry_run:
         typer.echo(
-            "  (--jury-of-3: actual judge cost ~3× the displayed column; "
-            "the v0.5 estimator prices a single-judge call. The jury fans "
-            "out to Anthropic + OpenAI + Gemini per BLUEPRINT §6.)"
+            "  (--jury-of-3: judge column already prices the 3-vendor "
+            "trio — Anthropic + OpenAI + Gemini per BLUEPRINT §6.)"
         )
     typer.echo(f"Estimated wallclock: {est.wallclock_estimate_s:.0f}s")
     if plan.max_cost_usd is not None:

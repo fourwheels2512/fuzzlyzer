@@ -539,14 +539,27 @@ async def execute_run(
                 status, metrics_exit_code = classify_run_status(
                     n_failed_cells=n_failed,
                     n_total_cells=n_planned,
+                    n_judge_failure_cells=cost_state["judge_failure_cells"],
                 )
 
+            # Polish-audit DRIFT-2 fix: write the actual judge protocol
+            # so report HTML + §A consumers can see which judging mode
+            # was used. JuryJudge is recognized structurally by the
+            # presence of the ``judge_independence`` attribute — avoids
+            # a fuzzeval.judge import here (the orchestrator keeps the
+            # CLI's lazy-import policy intact).
+            if judge is None:
+                judge_protocol = None
+            elif hasattr(judge, "judge_independence"):
+                judge_protocol = "jury_of_3"
+            else:
+                judge_protocol = "single"
             writer.finalize(
                 status=status,
                 cost_actual_usd=cost_state["total_cost_usd"],
                 n_variants=len(plan.variants),
                 n_evals=len(plan.eval_rows),
-                judge_protocol="single" if judge is not None else None,
+                judge_protocol=judge_protocol,
             )
     finally:
         if llm_cache is not None:

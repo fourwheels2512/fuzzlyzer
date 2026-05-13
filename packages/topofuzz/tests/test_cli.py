@@ -651,8 +651,10 @@ def test_run_jury_of_3_plumbs_into_manifest_cli_args(tmp_path, monkeypatch):
     assert "openai" in manifest["judge_model"]
     assert "gemini" in manifest["judge_model"]
     # Post-run accounting echo must appear in CLI output (DoD #14
-    # falsifiability surface).
-    assert "judge_failure_rate" in result.output.lower()
+    # falsifiability surface). Polish-audit DRIFT-3: the label is now
+    # "vendor-call failure rate" to disambiguate it from the §8
+    # cell-level judge_failure_rate.
+    assert "vendor-call failure rate" in result.output.lower()
     assert "vendor_overlap" in result.output.lower()
 
 

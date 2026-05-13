@@ -1941,10 +1941,11 @@ def test_runner_jury_judge_dry_run_returns_half(tmp_path):
 
 
 def test_runner_jury_judge_n10_accounting_accumulates(tmp_path):
-    """BLUEPRINT line 445 soft-DoD analogue: `tsf run --jury-of-3 --n 10`
-    completes with a coherent judge_failure_rate. Here we drive 10
-    cells against a stub jury where one vendor flakes on every call —
-    failure_rate must be 10/30 = 1/3."""
+    """BLUEPRINT line 445 soft-DoD analogue: ``topofuzz run --jury-of-3
+    --n 10`` (BLUEPRINT spells the legacy ``tsf`` CLI; real binary is
+    ``topofuzz``) completes with a coherent judge_failure_rate. Here we
+    drive 10 cells against a stub jury where one vendor flakes on every
+    call — failure_rate must be 10/30 = 1/3."""
     topo = _toy_topology(n=1)
 
     from fuzzeval.judge import JuryJudge
