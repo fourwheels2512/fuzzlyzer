@@ -86,20 +86,52 @@ def test_run_rejects_each_reserved_flag(flag, tmp_path):
     assert "reserved for v1.0" in result.output.lower()
 
 
-def test_run_jury_of_3_rejected_in_v05(tmp_path):
+def test_run_jury_of_3_accepted_past_parse_layer(tmp_path):
+    """Step 12b: --jury-of-3 is no longer a hard CLI reject. It now flows
+    past the parse layer; downstream failures (missing fixture, missing
+    eval, no env keys) surface as their normal exit codes — NOT as the
+    pre-12b "v0.5 has Gemini only" usage error.
+
+    Trip an error downstream of the parse layer (missing fixture path)
+    to verify --jury-of-3 isn't trapped at the gate, and confirm the
+    stderr hint about env keys is present.
+    """
     eval_path = tmp_path / "e.jsonl"
     eval_path.write_text('{"id": "e1", "input": "x"}\n', encoding="utf-8")
     result = CliRunner().invoke(
         app,
         [
             "run",
-            "fixture.py:graph",
+            "nonexistent/path.py:graph",
             "--eval", str(eval_path),
             "--jury-of-3",
         ],
     )
+    # Non-zero exit is from the missing-fixture branch, not the old
+    # jury rejection. The hint about env keys is informational — it
+    # routes to stderr at parse time, BEFORE the fixture load fails,
+    # so it must appear regardless of the downstream exit code.
     assert result.exit_code == 2
-    assert "jury-of-3" in result.output.lower()
+    # Typer's default CliRunner mixes stderr into ``output``; both the
+    # env-key hint and the downstream "failed to load fixture" message
+    # land there. The hint is what proves --jury-of-3 made it past the
+    # parse layer (it's emitted AFTER the reserved-flag gate and
+    # BEFORE the fixture load).
+    # Pass-1 RT-6 audit fix: loosen the substring matchers to a
+    # case-insensitive regex so a future "ANTHROPIC API key" / "Anthropic
+    # API key" copy-edit of the hint doesn't break the test. The load-
+    # bearing claim is "the message mentions all three vendor env-key
+    # names"; exact substring is too brittle.
+    import re
+
+    combined = result.output or ""
+    assert re.search(r"anthropic[_ ]api[_ ]key", combined, re.IGNORECASE)
+    assert re.search(r"openai[_ ]api[_ ]key", combined, re.IGNORECASE)
+    assert re.search(r"gemini[_ ]api[_ ]key", combined, re.IGNORECASE)
+    assert re.search(r"failed to load fixture", combined, re.IGNORECASE)
+    # Negative assertion: must NOT carry the pre-12b "v0.5 has Gemini
+    # only" message — that means the bad-usage exit is gone.
+    assert not re.search(r"v0\.5 has gemini only", combined, re.IGNORECASE)
 
 
 def test_run_friendly_error_on_missing_fixture(tmp_path):
@@ -530,6 +562,255 @@ def test_run_dry_run_flag_skips_llm_judge(tmp_path, monkeypatch):
     for kind, value in rows:
         assert kind == "continuous"
         assert value == 0.5
+
+
+def test_run_jury_of_3_plumbs_into_manifest_cli_args(tmp_path, monkeypatch):
+    """Pass-1 RT-M5 audit fix: end-to-end CLI run with --jury-of-3 --dry-run
+    must write a manifest whose ``cli_args.jury_of_3 == True`` AND whose
+    ``judge_model`` reflects the synthetic jury identity. This closes the
+    chain the [JURY] banner depends on (see ``topofuzz.report.render_report``).
+    """
+    pytest.importorskip("langgraph")
+
+    fixture = tmp_path / "fx.py"
+    fixture.write_text(
+        "from langgraph.graph import END, START, StateGraph\n"
+        "from typing import TypedDict\n"
+        "from topofuzz.ir import LLMConfig\n"
+        "\n"
+        "class _S(TypedDict, total=False):\n"
+        "    x: str\n"
+        "\n"
+        "def _a(s): return s\n"
+        "\n"
+        "def build_graph():\n"
+        "    g = StateGraph(_S)\n"
+        "    g.add_node('a', _a)\n"
+        "    g.add_edge(START, 'a')\n"
+        "    g.add_edge('a', END)\n"
+        "    return g.compile()\n"
+        "\n"
+        "LLM_CONFIGS = {'a': LLMConfig(model='google/gemini-2.5-pro')}\n",
+        encoding="utf-8",
+    )
+    eval_path = tmp_path / "e.jsonl"
+    eval_path.write_text(
+        '{"id": "e1", "input": "x", "ground_truth_decision": "approve"}\n',
+        encoding="utf-8",
+    )
+
+    async def fake_llm(**kwargs):
+        return {
+            "choices": [{"message": {"content": "agent decision: ok"}}],
+            "model": kwargs["model"],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+
+    from topofuzz import orchestrator as orch_mod
+    real_execute_run = orch_mod.execute_run
+
+    async def execute_run_with_fake(plan, **kwargs):
+        kwargs.setdefault("llm_callable", fake_llm)
+        return await real_execute_run(plan, **kwargs)
+
+    monkeypatch.setattr(orch_mod, "execute_run", execute_run_with_fake)
+
+    out_dir = tmp_path / "runs"
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            f"{fixture}:build_graph",
+            "--eval", str(eval_path),
+            "--n", "1",
+            "--variants", "1",
+            "--out", str(out_dir),
+            "--no-cache",
+            "--dry-run",
+            "--jury-of-3",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    import json
+    run_dirs = [p for p in out_dir.iterdir() if p.is_dir()]
+    assert len(run_dirs) == 1
+    manifest = json.loads(
+        (run_dirs[0] / "manifest.json").read_text(encoding="utf-8")
+    )
+    # Falsifiability of the [JURY] banner: report.py:165 reads
+    # manifest["cli_args"]["jury_of_3"]. If this field doesn't survive
+    # CLI → write_manifest plumbing, the banner is dead.
+    assert manifest["cli_args"]["jury_of_3"] is True
+    # The user's --judge value is still preserved in cli_args for
+    # forensic completeness, but the plan's judge_model reflects the
+    # synthetic jury identity per the locked design.
+    assert manifest["judge_model"].startswith("jury_of_3:")
+    assert "anthropic" in manifest["judge_model"]
+    assert "openai" in manifest["judge_model"]
+    assert "gemini" in manifest["judge_model"]
+    # Post-run accounting echo must appear in CLI output (DoD #14
+    # falsifiability surface).
+    assert "judge_failure_rate" in result.output.lower()
+    assert "vendor_overlap" in result.output.lower()
+
+
+def test_run_jury_of_3_warns_when_cache_intent_dropped(tmp_path, monkeypatch):
+    """Pass-1 CR-M1 / RT-M3 audit fix: --jury-of-3 + --cache <path>
+    drops the cache silently in v0.5. Emit a stderr hint so the user
+    isn't surprised — and so a v0.5.1 per-vendor cache slicing follow-up
+    has a clear remediation pointer.
+    """
+    pytest.importorskip("langgraph")
+
+    fixture = tmp_path / "fx.py"
+    fixture.write_text(
+        "from langgraph.graph import END, START, StateGraph\n"
+        "from typing import TypedDict\n"
+        "from topofuzz.ir import LLMConfig\n"
+        "\n"
+        "class _S(TypedDict, total=False):\n"
+        "    x: str\n"
+        "\n"
+        "def _a(s): return s\n"
+        "\n"
+        "def build_graph():\n"
+        "    g = StateGraph(_S)\n"
+        "    g.add_node('a', _a)\n"
+        "    g.add_edge(START, 'a')\n"
+        "    g.add_edge('a', END)\n"
+        "    return g.compile()\n"
+        "\n"
+        "LLM_CONFIGS = {'a': LLMConfig(model='google/gemini-2.5-pro')}\n",
+        encoding="utf-8",
+    )
+    eval_path = tmp_path / "e.jsonl"
+    eval_path.write_text(
+        '{"id": "e1", "input": "x", "ground_truth_decision": "approve"}\n',
+        encoding="utf-8",
+    )
+
+    async def fake_llm(**kwargs):
+        return {
+            "choices": [{"message": {"content": "ok"}}],
+            "model": kwargs["model"],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+
+    from topofuzz import orchestrator as orch_mod
+    real_execute_run = orch_mod.execute_run
+
+    async def execute_run_with_fake(plan, **kwargs):
+        kwargs.setdefault("llm_callable", fake_llm)
+        return await real_execute_run(plan, **kwargs)
+
+    monkeypatch.setattr(orch_mod, "execute_run", execute_run_with_fake)
+
+    user_cache = tmp_path / "user-supplied-cache-dir"
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            f"{fixture}:build_graph",
+            "--eval", str(eval_path),
+            "--n", "1",
+            "--variants", "1",
+            "--out", str(tmp_path / "runs"),
+            "--cache", str(user_cache),
+            "--jury-of-3",
+            "--dry-run",
+            "--yes",
+        ],
+    )
+    # Run completes (dry-run, fake LLM); warning is present in mixed stderr.
+    # Pass-2 RT MINOR-5 audit fix: regex match keeps the assertion robust
+    # against future copy-edits of the hint message.
+    import re
+
+    assert result.exit_code == 0, result.output
+    assert re.search(
+        r"disables\s+the\s+judge\s*cache", result.output, re.IGNORECASE
+    )
+    assert "ignored" in result.output.lower()
+
+
+def test_run_jury_of_3_silent_when_cache_not_supplied(tmp_path, monkeypatch):
+    """Pass-2 CR-Critical / RT-MAJOR-1 audit fix: a bare ``--jury-of-3``
+    with NO ``--cache`` argument must NOT trigger the "you supplied"
+    warning. Before pass-2, the typer default ``Path('.cache/topofuzz')``
+    made every jury run claim the user supplied a path they hadn't.
+    """
+    pytest.importorskip("langgraph")
+
+    fixture = tmp_path / "fx.py"
+    fixture.write_text(
+        "from langgraph.graph import END, START, StateGraph\n"
+        "from typing import TypedDict\n"
+        "from topofuzz.ir import LLMConfig\n"
+        "\n"
+        "class _S(TypedDict, total=False):\n"
+        "    x: str\n"
+        "\n"
+        "def _a(s): return s\n"
+        "\n"
+        "def build_graph():\n"
+        "    g = StateGraph(_S)\n"
+        "    g.add_node('a', _a)\n"
+        "    g.add_edge(START, 'a')\n"
+        "    g.add_edge('a', END)\n"
+        "    return g.compile()\n"
+        "\n"
+        "LLM_CONFIGS = {'a': LLMConfig(model='google/gemini-2.5-pro')}\n",
+        encoding="utf-8",
+    )
+    eval_path = tmp_path / "e.jsonl"
+    eval_path.write_text(
+        '{"id": "e1", "input": "x", "ground_truth_decision": "approve"}\n',
+        encoding="utf-8",
+    )
+
+    async def fake_llm(**kwargs):
+        return {
+            "choices": [{"message": {"content": "ok"}}],
+            "model": kwargs["model"],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+
+    from topofuzz import orchestrator as orch_mod
+    real_execute_run = orch_mod.execute_run
+
+    async def execute_run_with_fake(plan, **kwargs):
+        kwargs.setdefault("llm_callable", fake_llm)
+        return await real_execute_run(plan, **kwargs)
+
+    monkeypatch.setattr(orch_mod, "execute_run", execute_run_with_fake)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            f"{fixture}:build_graph",
+            "--eval", str(eval_path),
+            "--n", "1",
+            "--variants", "1",
+            "--out", str(tmp_path / "runs"),
+            # No --cache argument!
+            "--jury-of-3",
+            "--dry-run",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # The cache-disabled hint must NOT appear — user did not supply --cache.
+    import re
+
+    assert not re.search(
+        r"disables\s+the\s+judge\s*cache", result.output, re.IGNORECASE
+    ), f"Cache-disable warning fired without --cache. Output:\n{result.output}"
+    # But the env-key hint about jury should still appear (it's
+    # unconditional on --jury-of-3).
+    assert re.search(r"anthropic[_ ]api[_ ]key", result.output, re.IGNORECASE)
 
 
 def test_run_dry_run_threads_renderer_into_orchestrator(tmp_path, monkeypatch):

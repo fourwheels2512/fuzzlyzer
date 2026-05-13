@@ -300,9 +300,13 @@ def run(
         help="Parent directory for run artifacts. The run id is appended.",
     ),
     cache_dir: Path | None = typer.Option(
-        Path(".cache/topofuzz"),
+        None,
         "--cache",
-        help="LLMCache + JudgeCache root.",
+        help=(
+            "LLMCache + JudgeCache root. Defaults to .cache/topofuzz "
+            "when omitted; passing a value here lets the CLI distinguish "
+            "user-supplied from default for jury-disable warnings."
+        ),
     ),
     no_cache: bool = typer.Option(
         False,
@@ -347,7 +351,7 @@ def run(
     # is the §11a "verify-path-safe" contract: ``topofuzz verify``
     # and ``topofuzz keygen`` must NOT pull langgraph / LLM SDKs at
     # import time. Step 10b ships the regression-guard test.
-    from fuzzeval.judge import SingleJudge
+    from fuzzeval.judge import JuryJudge, SingleJudge
 
     from topofuzz.loaders import load_eval_rows, load_topology
     from topofuzz.orchestrator import RunPlan, write_manifest
@@ -364,12 +368,25 @@ def run(
     _reject_unknown_extras(list(ctx.args))
 
     if jury_of_3:
+        # Step 12b: wire the opt-in jury per BLUEPRINT_v5plus.md §12b.
+        # The runtime check that ANTHROPIC_API_KEY + OPENAI_API_KEY +
+        # GEMINI_API_KEY env vars exist happens lazily at first call —
+        # LiteLLM raises an authentication error which JuryJudge.score
+        # accumulates as a failed vendor call. The cell ends up
+        # judge_failure=True if all three vendors fail; §A's degraded
+        # badge surfaces it in the report.
+        #
+        # We do NOT preflight-check env keys here because the soft DoD
+        # (BLUEPRINT line 445) explicitly allows jury infra to have
+        # known issues without blocking ship — file a v0.5.1 issue
+        # instead. Emitting the hint to stderr is the right surface.
         typer.echo(
-            "topofuzz: --jury-of-3 requires Anthropic + OpenAI + Gemini keys; "
-            "v0.5 has Gemini only. File a v0.5.1 issue or supply the missing keys.",
+            "topofuzz: --jury-of-3 invokes Anthropic + OpenAI + Gemini "
+            "judges per BLUEPRINT §6. Missing env keys "
+            "(ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY) will "
+            "surface as judge_failure cells, not a kickoff error.",
             err=True,
         )
-        raise typer.Exit(code=_BAD_USAGE_EXIT)
 
     try:
         topology = load_topology(fixture)
@@ -448,24 +465,74 @@ def run(
     # 0.5 and silently skip the real judge call, corrupting the §9 score
     # matrix (audit B2). Forcing no-cache in dry-run also matches user
     # intent — a dry-run is throwaway by definition.
-    effective_cache_dir = None if (no_cache or dry_run) else cache_dir
+    #
+    # --jury-of-3 ALSO implies --no-cache. The v0.5 JudgeCache keys on a
+    # single ``judge_model_version`` string, which can't distinguish a
+    # cached single-judge row from a cached jury row (and per-vendor
+    # cache slicing is deferred to v0.5.1 per the JuryJudge docstring).
+    # Disabling the cache for jury runs sidesteps the foot-gun; jury
+    # runs are expensive enough that re-running uncached is acceptable.
+    #
+    # Pass-2 CR-Critical / RT-MAJOR-1 audit fix: distinguish a
+    # user-supplied --cache value from the typer-applied default by
+    # checking ``cache_dir is not None`` AFTER the option default is set
+    # to ``None``. Then resolve the default in the body. Without this
+    # split, every --jury-of-3 invocation tripped the "you supplied" hint
+    # for a path the user never typed.
+    user_supplied_cache = cache_dir is not None
+    resolved_cache_dir = (
+        cache_dir if cache_dir is not None else Path(".cache/topofuzz")
+    )
+    effective_cache_dir = (
+        None if (no_cache or dry_run or jury_of_3) else resolved_cache_dir
+    )
+
+    # Pass-1 CR-M1 / RT-M3 audit fix: when --jury-of-3 forces the cache
+    # off but the user ALSO supplied --cache (i.e., they had a positive
+    # intent to cache), echo a hint so the disabled cache isn't a silent
+    # surprise. Compared to the dry-run code path this hint is more
+    # important — dry-run is throwaway by definition; jury is a billed
+    # run the user expected to cache. We surface the hint even under
+    # --dry-run because the user's --cache value is still being silently
+    # ignored — only --no-cache is interpreted as positive consent.
+    if jury_of_3 and user_supplied_cache and not no_cache:
+        typer.echo(
+            f"topofuzz: --jury-of-3 disables the JudgeCache in v0.5; the "
+            f"--cache {str(cache_dir)!r} you supplied is ignored. Per-vendor "
+            "cache slicing is tracked for v0.5.1.",
+            err=True,
+        )
 
     # Construct the judge. Falls back to the packaged rubric if --rubric
-    # was not supplied. SingleJudge reads the file at construction so
-    # bad paths / empty files surface here, before the cost-estimator
-    # prompt runs.
+    # was not supplied. Both SingleJudge and JuryJudge read the rubric
+    # file at construction so bad paths / empty files surface here,
+    # before the cost-estimator prompt runs.
     effective_rubric_path = (
         rubric_path if rubric_path is not None else _packaged_default_rubric_path()
     )
     try:
-        judge = SingleJudge(
-            model=judge_model,
-            rubric_path=effective_rubric_path,
-            dry_run=dry_run,
-        )
+        if jury_of_3:
+            judge = JuryJudge(
+                rubric_path=effective_rubric_path,
+                dry_run=dry_run,
+            )
+        else:
+            judge = SingleJudge(
+                model=judge_model,
+                rubric_path=effective_rubric_path,
+                dry_run=dry_run,
+            )
     except (FileNotFoundError, ValueError) as e:
         typer.echo(f"topofuzz: bad rubric: {e}", err=True)
         raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+
+    # When jury is on, the user-supplied ``--judge`` value is ignored
+    # (the trio comes from BLUEPRINT §6). Reflect that in the manifest's
+    # ``judge_model`` field so downstream readers (report HTML, audits)
+    # see the jury identity rather than a stale single-judge id. The raw
+    # ``--judge`` value still lands in ``cli_args["judge"]`` for
+    # forensic completeness — it preserves what the user actually typed.
+    effective_judge_model = judge.model if jury_of_3 else judge_model
 
     plan = RunPlan(
         topology=topology,
@@ -475,14 +542,14 @@ def run(
         run_dir=run_dir,
         cache_dir=effective_cache_dir,
         max_cost_usd=max_cost_usd,
-        judge_model=judge_model,
+        judge_model=effective_judge_model,
         semaphore_size=_DEFAULT_SEMAPHORE_SIZE,
         rubric_hash=judge.rubric_hash,
     )
 
     _preflight_cost(
         plan, eval_rows=eval_rows, judge_model=judge_model,
-        yes=yes, dry_run=dry_run,
+        yes=yes, dry_run=dry_run, jury_of_3=jury_of_3,
     )
 
     cli_args = {
@@ -517,6 +584,20 @@ def run(
         f"completed / {result.total_cells} planned"
     )
     typer.echo(f"Cost (priced cells only): ${result.total_cost_usd:.4f}")
+    # Step 12b: surface §B DoD #14 jury accounting from the JuryJudge
+    # instance. Done here (CLI scope) rather than via manifest plumbing
+    # to keep the step-12b surface minimal — promoting to manifest is a
+    # v0.5.1 schema bump per the JuryJudge class docstring.
+    if isinstance(judge, JuryJudge):
+        typer.echo(
+            f"Jury judge_failure_rate: {judge.judge_failure_rate:.2%} "
+            f"({judge.failed_vendor_calls}/{judge.total_vendor_calls} "
+            "vendor calls)"
+        )
+        typer.echo(
+            "Jury judge_independence.vendor_overlap: "
+            f"{judge.judge_independence['vendor_overlap']!r}"
+        )
     if result.cap_tripped:
         # Resume is intentionally not exposed from the CLI in v0.5 —
         # every invocation mints a fresh run_id (audit RT M-3). Partial
@@ -545,6 +626,7 @@ def _preflight_cost(
     judge_model: str,
     yes: bool,
     dry_run: bool = False,
+    jury_of_3: bool = False,
 ) -> None:
     """Cost estimate + ``Continue? [y/N]`` prompt before kickoff.
 
@@ -556,6 +638,12 @@ def _preflight_cost(
     the user sees the run's *actual* expected billing (agent calls
     still cost real money; the judge stub does not). The estimator
     itself is judge-mode agnostic; we annotate downstream.
+
+    ``jury_of_3=True`` annotates the printed estimate to flag that the
+    real billing will be ~3× the displayed judge column (the estimator
+    prices a single-judge call; the jury fans out to three vendors).
+    Pass-1 CR-M4 / RT-10 audit fix: without this, the preflight prompt
+    silently under-displays jury cost by ~3×.
     """
     from fuzzeval.costest import estimate as _estimate
 
@@ -611,6 +699,12 @@ def _preflight_cost(
             "  (dry-run total reflects agent rollouts only; "
             "judge column subtracted)"
         )
+    if jury_of_3 and not dry_run:
+        typer.echo(
+            "  (--jury-of-3: actual judge cost ~3× the displayed column; "
+            "the v0.5 estimator prices a single-judge call. The jury fans "
+            "out to Anthropic + OpenAI + Gemini per BLUEPRINT §6.)"
+        )
     typer.echo(f"Estimated wallclock: {est.wallclock_estimate_s:.0f}s")
     if plan.max_cost_usd is not None:
         typer.echo(f"Hard cap: ${plan.max_cost_usd:.2f}")
@@ -622,7 +716,7 @@ def _preflight_cost(
         raise typer.Exit(code=0)
 
 
-def _run_with_signal_handling(plan: RunPlan, *, judge: SingleJudge | None = None) -> Any:
+def _run_with_signal_handling(plan: RunPlan, *, judge: Any = None) -> Any:
     """Run the orchestrator with SIGINT → cancel-event wiring.
 
     On Ctrl+C the orchestrator's cancel event is set; the runner stops

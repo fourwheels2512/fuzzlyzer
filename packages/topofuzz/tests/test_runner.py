@@ -1742,3 +1742,260 @@ def test_cost_for_call_rejects_bool_and_negative():
     assert cost_for_call("google/gemini-2.5-pro", True, 50) is None
     assert cost_for_call("google/gemini-2.5-pro", 100, -1) is None
     assert cost_for_call("google/gemini-2.5-pro", 100, 1.5) is None  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Step 12b soft-DoD integration: run_variant + JuryJudge with stub clients
+#
+# Per BLUEPRINT_v5plus.md §12b line 400 and DoD #14 line 445: prove the
+# jury infrastructure plugs into the existing runner contract without
+# special-casing — the runner sees a Judge, JuryJudge IS a Judge, and
+# all three failure-mode buckets (3/3 parseable, 1-or-2 fail, 3/3 fail)
+# route through the same _run_judge path.
+#
+# Stub clients only — only Gemini key is confirmed in v0.5 per
+# [[project_llm_api_access]]; real-keys integration is deferred to
+# v0.5.1.
+# ---------------------------------------------------------------------------
+
+
+def _stub_jury(
+    tmp_path,
+    *,
+    responses_by_vendor: dict[str, str],
+    dry_run: bool = False,
+):
+    """Build a JuryJudge whose 3 SingleJudges each have a one-response stub.
+
+    Inline the StubLLM shape (mirrors fuzzeval.tests.test_judge._StubLLM)
+    so this integration test has no cross-test dependency.
+    """
+    from fuzzeval.judge import JuryJudge
+
+    class _StubLLM:
+        def __init__(self, responses):
+            self._responses = list(responses)
+            self.calls: list[dict] = []
+
+        def __call__(self, **kwargs):
+            self.calls.append(kwargs)
+            text = self._responses.pop(0)
+            return {
+                "choices": [{"message": {"content": text}}],
+                "model": kwargs["model"],
+            }
+
+    rubric = tmp_path / "rubric.txt"
+    rubric.write_text(
+        "Variant: {variant_id}\n"
+        "Applicant: {applicant_blurb}\n"
+        "Truth: {ground_truth_decision}\n"
+        "Output: {agent_output}\n"
+        "Score: <int 0-10>\nRationale: <text>\n",
+        encoding="utf-8",
+    )
+    callables = {v: _StubLLM([r]) for v, r in responses_by_vendor.items()}
+    return JuryJudge(
+        rubric_path=rubric,
+        llm_callables=callables,
+        dry_run=dry_run,
+    )
+
+
+def _eval_row_with_truth():
+    return {"id": "e1", "input": "applicant blurb", "ground_truth_decision": "approve"}
+
+
+def test_runner_accepts_jury_judge_all_three_parse(tmp_path):
+    """Soft DoD #14: a JuryJudge plugs into run_variant unchanged and the
+    Cell carries a ContinuousScore == mean of the 3 parseable votes."""
+    topo = _toy_topology(n=1)
+    judge = _stub_jury(
+        tmp_path,
+        responses_by_vendor={
+            "anthropic": "Score: 4\nRationale: a",
+            "openai": "Score: 6\nRationale: o",
+            "gemini": "Score: 8\nRationale: g",
+        },
+    )
+    cell = _run(
+        run_variant(
+            topo,
+            _eval_row_with_truth(),
+            llm_callable=FakeLLM(),
+            judge=judge,
+            judge_prompt_renderer=judge.render_prompt,
+            rubric_hash=judge.rubric_hash,
+            judge_model_version=judge.model,
+        )
+    )
+    assert isinstance(cell.judge_result, ContinuousScore)
+    assert cell.judge_result.value == pytest.approx(0.6)
+    assert cell.judge_failure is False
+    # DoD #14: vendor_overlap reflects all three vendors that produced a vote.
+    assert judge.judge_independence == {
+        "vendor_overlap": ["anthropic", "gemini", "openai"],
+    }
+    assert judge.judge_failure_rate == 0.0
+
+
+def test_runner_accepts_jury_judge_one_unparseable(tmp_path):
+    """1 of 3 vendors unparseable → Cell still gets a ContinuousScore
+    (mean of the surviving 2), judge_failure stays False, JuryJudge
+    accounting reflects the partial failure."""
+    topo = _toy_topology(n=1)
+    judge = _stub_jury(
+        tmp_path,
+        responses_by_vendor={
+            "anthropic": "no score line here",
+            "openai": "Score: 6\nRationale: o",
+            "gemini": "Score: 8\nRationale: g",
+        },
+    )
+    cell = _run(
+        run_variant(
+            topo,
+            _eval_row_with_truth(),
+            llm_callable=FakeLLM(),
+            judge=judge,
+            judge_prompt_renderer=judge.render_prompt,
+            rubric_hash=judge.rubric_hash,
+            judge_model_version=judge.model,
+        )
+    )
+    assert isinstance(cell.judge_result, ContinuousScore)
+    assert cell.judge_result.value == pytest.approx(0.7)
+    assert cell.judge_failure is False
+    assert judge.judge_failure_rate == pytest.approx(1 / 3)
+    assert judge.judge_independence == {
+        "vendor_overlap": ["gemini", "openai"],
+    }
+
+
+def test_runner_marks_judge_failure_when_all_three_unparseable(tmp_path):
+    """All 3 vendors unparseable → JuryJudge.score raises
+    JudgeUnparseableError → runner's _run_judge catches it and produces
+    a judge_failure=True Cell. This is what §8's degraded-status logic
+    consumes."""
+    topo = _toy_topology(n=1)
+    judge = _stub_jury(
+        tmp_path,
+        responses_by_vendor={
+            "anthropic": "no score 1",
+            "openai": "no score 2",
+            "gemini": "no score 3",
+        },
+    )
+    cell = _run(
+        run_variant(
+            topo,
+            _eval_row_with_truth(),
+            llm_callable=FakeLLM(),
+            judge=judge,
+            judge_prompt_renderer=judge.render_prompt,
+            rubric_hash=judge.rubric_hash,
+            judge_model_version=judge.model,
+        )
+    )
+    assert cell.judge_result is None
+    assert cell.judge_failure is True
+    assert "JudgeUnparseableError" in (cell.judge_failure_reason or "")
+    assert judge.judge_failure_rate == 1.0
+
+
+def test_runner_jury_judge_dry_run_returns_half(tmp_path):
+    """Dry-run jury never calls any LLM — every cell gets ContinuousScore(0.5)."""
+    topo = _toy_topology(n=1)
+
+    def boom(**_kwargs):
+        raise AssertionError("dry-run must not call any LLM")
+
+    from fuzzeval.judge import JuryJudge
+
+    rubric = tmp_path / "rubric.txt"
+    rubric.write_text(
+        "Variant: {variant_id}\nApplicant: {applicant_blurb}\n"
+        "Truth: {ground_truth_decision}\nOutput: {agent_output}\n"
+        "Score: <int 0-10>\nRationale: <text>\n",
+        encoding="utf-8",
+    )
+    judge = JuryJudge(
+        rubric_path=rubric,
+        llm_callables={"anthropic": boom, "openai": boom, "gemini": boom},
+        dry_run=True,
+    )
+    cell = _run(
+        run_variant(
+            topo,
+            _eval_row_with_truth(),
+            llm_callable=FakeLLM(),
+            judge=judge,
+            judge_prompt_renderer=judge.render_prompt,
+            rubric_hash=judge.rubric_hash,
+            judge_model_version=judge.model,
+        )
+    )
+    assert isinstance(cell.judge_result, ContinuousScore)
+    assert cell.judge_result.value == 0.5
+    assert cell.judge_failure is False
+
+
+def test_runner_jury_judge_n10_accounting_accumulates(tmp_path):
+    """BLUEPRINT line 445 soft-DoD analogue: `tsf run --jury-of-3 --n 10`
+    completes with a coherent judge_failure_rate. Here we drive 10
+    cells against a stub jury where one vendor flakes on every call —
+    failure_rate must be 10/30 = 1/3."""
+    topo = _toy_topology(n=1)
+
+    from fuzzeval.judge import JuryJudge
+
+    class _CycleStub:
+        """Returns the same response on every call (vs the single-shot
+        stub in _stub_jury which exhausts after one use)."""
+
+        def __init__(self, text):
+            self._text = text
+            self.calls = 0
+
+        def __call__(self, **kwargs):
+            self.calls += 1
+            return {
+                "choices": [{"message": {"content": self._text}}],
+                "model": kwargs["model"],
+            }
+
+    rubric = tmp_path / "rubric.txt"
+    rubric.write_text(
+        "Variant: {variant_id}\nApplicant: {applicant_blurb}\n"
+        "Truth: {ground_truth_decision}\nOutput: {agent_output}\n"
+        "Score: <int 0-10>\nRationale: <text>\n",
+        encoding="utf-8",
+    )
+    judge = JuryJudge(
+        rubric_path=rubric,
+        llm_callables={
+            "anthropic": _CycleStub("no score here"),
+            "openai": _CycleStub("Score: 6\nRationale: o"),
+            "gemini": _CycleStub("Score: 8\nRationale: g"),
+        },
+    )
+    for i in range(10):
+        cell = _run(
+            run_variant(
+                topo,
+                {"id": f"e{i}", "input": "x", "ground_truth_decision": "approve"},
+                llm_callable=FakeLLM(),
+                judge=judge,
+                judge_prompt_renderer=judge.render_prompt,
+                rubric_hash=judge.rubric_hash,
+                judge_model_version=judge.model,
+            )
+        )
+        assert isinstance(cell.judge_result, ContinuousScore)
+        assert cell.judge_result.value == pytest.approx(0.7)
+    assert judge.total_vendor_calls == 30
+    assert judge.failed_vendor_calls == 10
+    assert judge.judge_failure_rate == pytest.approx(1 / 3)
+    assert judge.judge_independence == {
+        "vendor_overlap": ["gemini", "openai"],
+    }

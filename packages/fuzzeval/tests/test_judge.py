@@ -514,3 +514,533 @@ def test_binary_from_continuous_rejects_non_continuous():
 def test_binary_from_continuous_rejects_threshold_out_of_range(bad):
     with pytest.raises(ValueError):
         binary_from_continuous(ContinuousScore(value=0.5), threshold=bad)
+
+
+# ---------------------------------------------------------------------------
+# JuryJudge — Weekend 4 step 12b
+#
+# Tests use stub LLM callables per the locked step-12b decision: only
+# Gemini key is confirmed available, so the unit tests are vendor-name-
+# agnostic and inject responses per-vendor. Real-keys integration is
+# deferred to v0.5.1.
+# ---------------------------------------------------------------------------
+
+
+from fuzzeval.judge import JuryJudge  # noqa: E402
+
+
+def _score_response(score: int, rationale: str = "stub") -> str:
+    return f"Score: {score}\nRationale: {rationale}\n"
+
+
+def _jury_stubs(
+    responses_by_vendor: dict[str, str],
+) -> dict[str, _StubLLM]:
+    """Build a fresh _StubLLM per vendor from a single-response mapping."""
+    return {v: _StubLLM([r]) for v, r in responses_by_vendor.items()}
+
+
+def _make_jury(
+    tmp_path: Path,
+    *,
+    callables: dict[str, _StubLLM] | None = None,
+    dry_run: bool = False,
+    vendor_models: dict[str, str] | None = None,
+) -> JuryJudge:
+    rubric = _write_rubric(tmp_path / "r.txt")
+    return JuryJudge(
+        rubric_path=rubric,
+        vendor_models=vendor_models,
+        llm_callables=callables,
+        dry_run=dry_run,
+    )
+
+
+# --- construction + validation -------------------------------------------
+
+
+def test_jury_judge_constructs_with_default_vendors(tmp_path):
+    j = _make_jury(tmp_path)
+    assert set(j.vendors) == {"anthropic", "openai", "gemini"}
+    assert j.model == "jury_of_3:anthropic+gemini+openai"  # sorted
+    # rubric_hash equals what a SingleJudge over the same rubric produces.
+    single = SingleJudge(model="m", rubric_path=j.rubric_path)
+    assert j.rubric_hash == single.rubric_hash
+    assert j.dry_run is False
+    assert j.judge_failure_rate == 0.0
+    assert j.judge_independence == {"vendor_overlap": []}
+
+
+def test_jury_judge_rejects_wrong_vendor_count(tmp_path):
+    rubric = _write_rubric(tmp_path / "r.txt")
+    with pytest.raises(ValueError, match="exactly 3"):
+        JuryJudge(
+            rubric_path=rubric,
+            vendor_models={"anthropic": "a/x", "openai": "o/y"},
+        )
+    with pytest.raises(ValueError, match="exactly 3"):
+        JuryJudge(
+            rubric_path=rubric,
+            vendor_models={
+                "anthropic": "a/x",
+                "openai": "o/y",
+                "gemini": "g/z",
+                "extra": "e/w",
+            },
+        )
+
+
+def test_jury_judge_rejects_empty_vendor_name(tmp_path):
+    rubric = _write_rubric(tmp_path / "r.txt")
+    with pytest.raises(ValueError, match="non-empty"):
+        JuryJudge(
+            rubric_path=rubric,
+            vendor_models={"": "a/x", "openai": "o/y", "gemini": "g/z"},
+        )
+
+
+def test_jury_judge_rejects_unknown_callable_vendor(tmp_path):
+    rubric = _write_rubric(tmp_path / "r.txt")
+    with pytest.raises(ValueError, match="not in vendor_models"):
+        JuryJudge(
+            rubric_path=rubric,
+            llm_callables={"meta": _StubLLM(["Score: 5"])},
+        )
+
+
+def test_jury_judge_uses_same_rubric_path_for_all_vendors(tmp_path):
+    j = _make_jury(tmp_path)
+    # All three SingleJudges share the same on-disk rubric, so the
+    # public rubric_path equals the constructor's argument.
+    expected = (tmp_path / "r.txt").resolve()
+    assert j.rubric_path.resolve() == expected
+
+
+def test_jury_judge_render_prompt_matches_single_judge(tmp_path):
+    j = _make_jury(tmp_path)
+    single = SingleJudge(model="m", rubric_path=j.rubric_path)
+    assert j.render_prompt(_payload()) == single.render_prompt(_payload())
+
+
+# --- aggregation ---------------------------------------------------------
+
+
+def test_jury_judge_means_three_parseable_votes(tmp_path):
+    stubs = _jury_stubs(
+        {
+            "anthropic": _score_response(4),  # 0.4
+            "openai": _score_response(6),  # 0.6
+            "gemini": _score_response(8),  # 0.8
+        }
+    )
+    j = _make_jury(tmp_path, callables=stubs)
+    result = j.score(_payload())
+    assert isinstance(result, ContinuousScore)
+    # Mean of 0.4, 0.6, 0.8 == 0.6 (exact in float arithmetic for these
+    # decimals but use approx anyway for forward-compat).
+    assert result.value == pytest.approx(0.6)
+    assert j.judge_failure_rate == 0.0
+    assert j.judge_independence == {
+        "vendor_overlap": ["anthropic", "gemini", "openai"],
+    }
+
+
+def test_jury_judge_drops_unparseable_vote_and_means_survivors(tmp_path):
+    stubs = _jury_stubs(
+        {
+            "anthropic": "I refuse to give a score (no Score: line)",
+            "openai": _score_response(6),  # 0.6
+            "gemini": _score_response(8),  # 0.8
+        }
+    )
+    j = _make_jury(tmp_path, callables=stubs)
+    result = j.score(_payload())
+    # Mean of 0.6 and 0.8 == 0.7 — anthropic's vote dropped.
+    assert result.value == pytest.approx(0.7)
+    assert j.judge_failure_rate == pytest.approx(1 / 3)
+    assert j.judge_independence == {
+        "vendor_overlap": ["gemini", "openai"],
+    }
+
+
+def test_jury_judge_raises_when_all_vendors_unparseable(tmp_path):
+    stubs = _jury_stubs(
+        {
+            "anthropic": "no score line",
+            "openai": "still no score",
+            "gemini": "neither here",
+        }
+    )
+    j = _make_jury(tmp_path, callables=stubs)
+    with pytest.raises(JudgeUnparseableError, match="all 3 vendors failed"):
+        j.score(_payload())
+    assert j.judge_failure_rate == 1.0
+    assert j.judge_independence == {"vendor_overlap": []}
+
+
+def test_jury_judge_treats_sdk_exception_as_failure(tmp_path):
+    """Vendor SDK / network error counts as a failed vendor call — not a
+    crash. The BLUEPRINT §8 judge_failure_rate is the right surface."""
+
+    def explode(**kwargs):
+        raise ConnectionError("provider timeout")
+
+    callables = {
+        "anthropic": explode,  # not a _StubLLM — a raw callable that raises
+        "openai": _StubLLM([_score_response(6)]),
+        "gemini": _StubLLM([_score_response(8)]),
+    }
+    j = _make_jury(tmp_path, callables=callables)
+    result = j.score(_payload())
+    assert result.value == pytest.approx(0.7)
+    assert j.judge_failure_rate == pytest.approx(1 / 3)
+    assert "anthropic" not in j.judge_independence["vendor_overlap"]
+
+
+# --- accounting across multiple calls ------------------------------------
+
+
+def test_jury_judge_accounting_accumulates_across_calls(tmp_path):
+    """3 score() calls, anthropic fails on each → failure_rate == 1/3 of 9
+    vendor calls. Other two vendors parse all three calls."""
+    rubric = _write_rubric(tmp_path / "r.txt")
+    callables = {
+        "anthropic": _StubLLM(["no score"] * 3),
+        "openai": _StubLLM([_score_response(6)] * 3),
+        "gemini": _StubLLM([_score_response(8)] * 3),
+    }
+    j = JuryJudge(rubric_path=rubric, llm_callables=callables)
+    for _ in range(3):
+        r = j.score(_payload())
+        assert r.value == pytest.approx(0.7)
+    assert j.judge_failure_rate == pytest.approx(3 / 9)
+    assert j.judge_independence == {
+        "vendor_overlap": ["gemini", "openai"],
+    }
+
+
+def test_jury_judge_vendor_overlap_records_any_parseable_vote(tmp_path):
+    """A vendor that parses on call 1 but fails on call 2 still appears in
+    vendor_overlap — the field is "vendors with at least one parseable
+    vote", not "vendors that parsed every call"."""
+    rubric = _write_rubric(tmp_path / "r.txt")
+    callables = {
+        "anthropic": _StubLLM([_score_response(5), "no score"]),
+        "openai": _StubLLM([_score_response(6), _score_response(7)]),
+        "gemini": _StubLLM([_score_response(8), _score_response(9)]),
+    }
+    j = JuryJudge(rubric_path=rubric, llm_callables=callables)
+    j.score(_payload())
+    j.score(_payload())
+    assert sorted(j.judge_independence["vendor_overlap"]) == [
+        "anthropic", "gemini", "openai",
+    ]
+    # 1 fail out of 6 calls = 1/6.
+    assert j.judge_failure_rate == pytest.approx(1 / 6)
+
+
+# --- dry-run -------------------------------------------------------------
+
+
+def test_jury_judge_dry_run_returns_half_with_no_llm(tmp_path):
+    def boom(**kwargs):
+        raise AssertionError("dry-run must not call any LLM")
+
+    callables = {
+        "anthropic": boom,
+        "openai": boom,
+        "gemini": boom,
+    }
+    j = _make_jury(tmp_path, callables=callables, dry_run=True)
+    r = j.score(_payload())
+    assert r.value == 0.5
+    # Dry-run is parseable by construction — vendor_overlap has all three.
+    assert j.judge_independence == {
+        "vendor_overlap": ["anthropic", "gemini", "openai"],
+    }
+    assert j.judge_failure_rate == 0.0
+
+
+# --- rubric_hash invariants ----------------------------------------------
+
+
+def test_jury_judge_rubric_hash_matches_single_judge_on_same_rubric(tmp_path):
+    body = "X {variant_id} {applicant_blurb} {ground_truth_decision} {agent_output}"
+    rubric = _write_rubric(tmp_path / "r.txt", body=body)
+    j = JuryJudge(rubric_path=rubric)
+    single = SingleJudge(model="m", rubric_path=rubric)
+    assert j.rubric_hash == single.rubric_hash
+
+
+def test_jury_judge_rubric_hash_is_eol_agnostic(tmp_path):
+    body_lf = (
+        "{variant_id}\n{applicant_blurb}\n"
+        "{ground_truth_decision}\n{agent_output}\n"
+    )
+    p_lf = tmp_path / "lf.txt"
+    p_lf.write_bytes(body_lf.encode("utf-8"))
+    p_crlf = tmp_path / "crlf.txt"
+    p_crlf.write_bytes(body_lf.replace("\n", "\r\n").encode("utf-8"))
+    assert (
+        JuryJudge(rubric_path=p_lf).rubric_hash
+        == JuryJudge(rubric_path=p_crlf).rubric_hash
+    )
+
+
+# --- protocol structural conformance -------------------------------------
+
+
+def test_jury_judge_conforms_to_judge_protocol(tmp_path):
+    from fuzzeval.judge import Judge
+
+    j: Judge = _make_jury(
+        tmp_path,
+        callables=_jury_stubs(
+            {
+                "anthropic": _score_response(5),
+                "openai": _score_response(5),
+                "gemini": _score_response(5),
+            }
+        ),
+    )
+    r = j.score(_payload())
+    assert isinstance(r, ContinuousScore)
+    assert r.value == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Pass-1 audit-fix coverage
+# ---------------------------------------------------------------------------
+
+
+# RT-M2 — vendor name normalization (strip + lowercase) and dup-VALUE rejection.
+
+
+def test_jury_judge_normalizes_vendor_names(tmp_path):
+    """Case-variant + whitespace-decorated keys collapse to canonical form."""
+    rubric = _write_rubric(tmp_path / "r.txt")
+    j = JuryJudge(
+        rubric_path=rubric,
+        vendor_models={
+            "  Anthropic ": "anthropic/claude-opus-4-7",
+            "OpenAI": "openai/gpt-5",
+            "GEMINI": "google/gemini-2.5-pro",
+        },
+    )
+    assert set(j.vendors) == {"anthropic", "openai", "gemini"}
+    assert j.model == "jury_of_3:anthropic+gemini+openai"  # sorted
+
+
+def test_jury_judge_rejects_case_variant_duplicates(tmp_path):
+    """Two raw keys normalizing to the same canonical name → loud failure."""
+    rubric = _write_rubric(tmp_path / "r.txt")
+    with pytest.raises(ValueError, match="collide after normalization"):
+        JuryJudge(
+            rubric_path=rubric,
+            vendor_models={
+                "anthropic": "anthropic/claude-opus-4-7",
+                "Anthropic ": "anthropic/claude-3",  # collides post-strip+lower
+                "openai": "openai/gpt-5",
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "vendor_models",
+    [
+        # All three same value.
+        {
+            "anthropic": "google/gemini-2.5-pro",
+            "openai": "google/gemini-2.5-pro",
+            "gemini": "google/gemini-2.5-pro",
+        },
+        # Two same, one different — pass-2 RT MINOR-1 audit fix:
+        # the original test only covered the unanimous-collision
+        # case. Adding the partial-collision parametrization guards
+        # a future regression that loosened the check to "all three
+        # same".
+        {
+            "anthropic": "google/gemini-2.5-pro",
+            "openai": "google/gemini-2.5-pro",
+            "gemini": "openai/gpt-5",
+        },
+    ],
+)
+def test_jury_judge_rejects_duplicate_model_values(tmp_path, vendor_models):
+    """Vendors pointing at the same LiteLLM model id defeat the
+    independence claim. Rejected at construction in both all-same and
+    partial-collision configurations."""
+    rubric = _write_rubric(tmp_path / "r.txt")
+    with pytest.raises(ValueError, match="vendor models must be distinct"):
+        JuryJudge(rubric_path=rubric, vendor_models=vendor_models)
+
+
+def test_jury_judge_normalizes_callables_keys(tmp_path):
+    """Caller passes case-variant callable keys → they bind to the
+    same canonical vendors, not silently mis-route."""
+    rubric = _write_rubric(tmp_path / "r.txt")
+    stubs = {
+        "Anthropic ": _StubLLM([_score_response(4)]),
+        "OPENAI": _StubLLM([_score_response(6)]),
+        "Gemini": _StubLLM([_score_response(8)]),
+    }
+    j = JuryJudge(rubric_path=rubric, llm_callables=stubs)
+    result = j.score(_payload())
+    assert result.value == pytest.approx(0.6)
+    assert j.judge_failure_rate == 0.0
+
+
+# CR-M2 / RT-M4 — concurrency lock smoke test. We don't try to *force*
+# a race (that's flaky); we instead prove the accumulators stay
+# internally consistent under threaded fan-out.
+
+
+def test_jury_judge_accounting_is_consistent_under_threaded_score(tmp_path):
+    """**Coherence smoke test** — NOT a race-reproducer.
+
+    Drives 50 concurrent ``score()`` calls × 3 vendors via an 8-worker
+    thread pool. Verifies the accumulators land at exactly the expected
+    cumulative values: ``total_vendor_calls == 150``,
+    ``failed_vendor_calls == 0``, ``judge_failure_rate == 0.0``,
+    ``vendor_overlap`` covers all three.
+
+    **Caveat (pass-2 RT MAJOR-2):** the stub does pure-Python compute
+    with no I/O, so the GIL serializes most of the per-call work; the
+    test would likely PASS even without the accounting lock because
+    Python's ``int.__iadd__`` is effectively atomic for the single
+    ``self._total_vendor_calls += local_total`` line. The right
+    falsifiability surface for a race would inject ``time.sleep`` mid-
+    call to release the GIL — that's deferred to v0.5.1 if a real
+    contention issue surfaces in production. The lock is documented at
+    the write site (``score()``) and the read sites (the four property
+    accessors) so a future audit can trust the contract by inspection
+    rather than via this test.
+    """
+    import concurrent.futures
+
+    rubric = _write_rubric(tmp_path / "r.txt")
+
+    class _AlwaysParseable:
+        """Thread-safe stub returning a parseable response every call."""
+
+        def __call__(self, **kwargs):
+            return {
+                "choices": [{"message": {"content": _score_response(5)}}],
+                "model": kwargs["model"],
+            }
+
+    j = JuryJudge(
+        rubric_path=rubric,
+        llm_callables={
+            "anthropic": _AlwaysParseable(),
+            "openai": _AlwaysParseable(),
+            "gemini": _AlwaysParseable(),
+        },
+    )
+
+    n_calls = 50
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(lambda _: j.score(_payload()), range(n_calls)))
+
+    assert j.total_vendor_calls == 3 * n_calls
+    assert j.failed_vendor_calls == 0
+    assert j.judge_failure_rate == 0.0
+    assert j.judge_independence == {
+        "vendor_overlap": ["anthropic", "gemini", "openai"],
+    }
+
+
+# RT-M1 — by-design acknowledgement: 3 vendors unanimously returning
+# the same low score IS a legitimate consensus, NOT a failure. This
+# test pins the contract so a future RT specialist doesn't re-raise it
+# as a silent-pass hole.
+
+
+def test_jury_judge_unanimous_low_score_is_legitimate(tmp_path):
+    """3 stubs all returning "Score: 0" → mean 0.0, vendor_overlap full,
+    judge_failure_rate 0. This is by-design per the mean-of-parseable
+    aggregation contract — unanimous consensus is a strong signal even
+    when the consensus value is low."""
+    stubs = _jury_stubs(
+        {
+            "anthropic": _score_response(0),
+            "openai": _score_response(0),
+            "gemini": _score_response(0),
+        }
+    )
+    j = _make_jury(tmp_path, callables=stubs)
+    result = j.score(_payload())
+    assert result.value == 0.0
+    assert j.judge_failure_rate == 0.0
+    assert j.judge_independence == {
+        "vendor_overlap": ["anthropic", "gemini", "openai"],
+    }
+
+
+# RT-9 — BinaryScore from a vendor is treated as a failure (the
+# JuryJudge contract is mean-of-CONTINUOUS scores; a vendor returning a
+# different result type can't be aggregated into the mean).
+
+
+def test_jury_judge_treats_non_continuous_score_as_failure(tmp_path):
+    """A vendor returning a non-ContinuousScore (e.g., BinaryScore via a
+    custom Judge subclass) gets its vote dropped and accumulates as a
+    failed vendor call."""
+    from fuzzeval.judge import BinaryScore
+
+    rubric = _write_rubric(tmp_path / "r.txt")
+
+    class _BinaryReturningJudge:
+        """Stub that returns a BinaryScore — not the ContinuousScore
+        that SingleJudge would return. Bypasses the SingleJudge layer
+        entirely by injecting via the per-vendor SingleJudge's
+        llm_callable... actually no, we need a custom path here:
+        we mock the SingleJudge.score by patching the instance method
+        after construction."""
+
+        pass
+
+    j = JuryJudge(
+        rubric_path=rubric,
+        llm_callables={
+            "anthropic": _StubLLM([_score_response(5)]),
+            "openai": _StubLLM([_score_response(7)]),
+            "gemini": _StubLLM([_score_response(9)]),
+        },
+    )
+    # Patch one judge's score method to return a BinaryScore.
+    j._judges["anthropic"].score = lambda payload: BinaryScore(
+        passed=True, rationale="off-protocol"
+    )
+    result = j.score(_payload())
+    # Mean of the surviving two parseable continuous votes: (0.7 + 0.9) / 2 = 0.8.
+    assert result.value == pytest.approx(0.8)
+    assert j.judge_failure_rate == pytest.approx(1 / 3)
+    assert j.judge_independence == {
+        "vendor_overlap": ["gemini", "openai"],
+    }
+
+
+# RT-pass-1 implicit — KeyboardInterrupt propagation. A user Ctrl+C in
+# the middle of a jury call must NOT be swallowed as a vendor failure.
+
+
+def test_jury_judge_does_not_swallow_keyboard_interrupt(tmp_path):
+    rubric = _write_rubric(tmp_path / "r.txt")
+
+    def boom(**kwargs):
+        raise KeyboardInterrupt
+
+    j = JuryJudge(
+        rubric_path=rubric,
+        llm_callables={
+            "anthropic": boom,
+            "openai": _StubLLM([_score_response(6)]),  # never called
+            "gemini": _StubLLM([_score_response(8)]),  # never called
+        },
+    )
+    with pytest.raises(KeyboardInterrupt):
+        j.score(_payload())
+    # And: the partial state is NOT committed — total_vendor_calls
+    # stays 0 because the lock-batched apply never ran.
+    assert j.total_vendor_calls == 0

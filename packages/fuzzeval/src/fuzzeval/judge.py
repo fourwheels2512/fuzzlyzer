@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -77,7 +78,7 @@ JudgeResult = ContinuousScore | BinaryScore
 
 
 class Judge(Protocol):
-    """Judge protocol. Implementations: :class:`SingleJudge`, JuryOf3 (step 12b).
+    """Judge protocol. Implementations: :class:`SingleJudge`, :class:`JuryJudge`.
 
     ``payload`` is a rubric-specific dict. Topofuzz will pass:
         {"variant_id", "eval_row", "agent_output"}
@@ -512,6 +513,449 @@ def _extract_judge_text(response: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# JuryJudge — Weekend 4 step 12b
+# ---------------------------------------------------------------------------
+
+
+# BLUEPRINT_v5plus.md §6 line 220 names the opt-in jury trio. Vendor
+# names are the LiteLLM provider prefixes (matching what ``model``
+# starts with) so they're independent of the *specific* model id chosen
+# for that vendor — a future config update from "claude-opus-4-7" to
+# "claude-opus-5" preserves the "anthropic" vendor name in the
+# accumulator. Stored as a ``dict[str, str]`` because both the names
+# AND the model ids are needed at construction (see
+# :class:`JuryJudge.__init__`).
+_DEFAULT_JURY_VENDOR_MODELS: dict[str, str] = {
+    "anthropic": "anthropic/claude-opus-4-7",
+    "openai": "openai/gpt-5",
+    "gemini": "google/gemini-2.5-pro",
+}
+
+
+# Number of judges in the jury. BLUEPRINT §6 line 220 is explicit: "Three
+# judges". Promoted to a named constant so a future v0.6 "jury-of-N"
+# experiment can lift this without searching for magic threes.
+_JURY_SIZE = 3
+
+
+# Sentinel-typed mapping for the optional per-vendor test injection. Each
+# value is the same ``SyncLLMCallable`` shape as ``SingleJudge``'s
+# ``llm_callable`` arg — supplied per-vendor so a test can simulate a
+# parseable Anthropic response and an unparseable Gemini response in the
+# same JuryJudge.
+LLMCallables = dict[str, SyncLLMCallable]
+
+
+class JuryJudge:
+    """Three-vendor jury wrapper around :class:`SingleJudge`.
+
+    Fans one ``score(payload)`` call out to three single-vendor judges
+    (default: Anthropic + OpenAI + Gemini per BLUEPRINT_v5plus.md §6
+    line 220), aggregates parseable continuous scores by **arithmetic
+    mean**, and exposes run-level accounting for the §12b DoD #14
+    falsifiability targets.
+
+    Aggregation contract (handoff decision locked at step-12b kickoff):
+
+    * **Mean of parseable scores** in ``[0, 1]``. Each vendor's
+      :class:`SingleJudge` returns ``ContinuousScore``; we collect
+      ``.value`` from the calls that did not raise
+      :class:`JudgeUnparseableError`, then mean.
+    * **UNPARSEABLE fallback.** If 1 or 2 vendors raise
+      ``JudgeUnparseableError``, drop their votes and mean the
+      survivors. If **all** vendors raise, re-raise
+      ``JudgeUnparseableError`` so the runner (:mod:`topofuzz.runner`)
+      marks the cell ``judge_failure=True`` (§8 ``judge_failure_rate >
+      5% → degraded`` accounting).
+
+    Accounting (DoD #14, BLUEPRINT line 445 — INFORMATIONAL only at
+    v0.5, promoted to HARD at TDS-Regulator):
+
+    * :attr:`judge_failure_rate` — cumulative ratio
+      ``failed_vendor_calls / total_vendor_calls`` across **all**
+      ``score()`` calls. So 1-of-3 failures on each of 10 calls reports
+      ``10/30 = 0.333…`` (not 1.0).
+    * :attr:`judge_independence` — ``{"vendor_overlap": [...]}`` where
+      the list is the sorted, deduplicated set of vendor names that
+      produced at least one parseable vote across the run. Per the
+      locked field-shape decision this is *minimal* — the list-of-pairs
+      variant is deferred to a future v0.5.x schema bump if needed.
+
+    Sequencing: the three vendor calls happen **sequentially** on the
+    calling thread. The :class:`Judge` protocol is sync (the runner
+    offloads to ``asyncio.to_thread``), so parallelizing within
+    JuryJudge would force a sync↔async boundary right where the cache
+    layer is. Step 12b ships the sequential version per
+    [[feedback_minimalist_scope]]; async fan-out is a v0.5.1
+    optimization.
+
+    Cache compatibility: the v0.5 :class:`JudgeCache` keys on a single
+    ``judge_model_version`` string, which doesn't model "this row was
+    produced by a jury". The CLI side disables the JudgeCache when
+    ``--jury-of-3`` is set (see ``topofuzz.cli.run``) — jury runs are
+    rare and expensive enough that uncached is acceptable. Per-vendor
+    cache slicing is a v0.5.1 follow-up.
+
+    Args:
+        rubric_path: Path to the rubric template. Same arg as
+            :class:`SingleJudge`; all three vendor judges read the same
+            file at construction so :attr:`rubric_hash` is a single
+            scalar (and we double-check the per-vendor hashes match —
+            see ``_rubric_hash_pin``).
+        vendor_models: Optional ``{vendor_name: litellm_model_id}``
+            mapping. Default is the BLUEPRINT trio. Pass-1 RT-M2 audit
+            fix: vendor names are stripped and lowercased before the
+            uniqueness check, so ``"  Anthropic "`` and ``"anthropic"``
+            collide and raise. Model VALUES must also be distinct
+            (three vendors pointing at the same LiteLLM model id
+            defeats the independence claim of
+            :attr:`judge_independence`).
+        dry_run: When ``True``, every vendor judge is dry-run
+            (deterministic ``ContinuousScore(0.5)`` per
+            :class:`SingleJudge.score`). The jury mean is therefore
+            also 0.5 and no real LLM calls are billed.
+        llm_callables: Optional per-vendor sync LLM callable for tests.
+            Same shape as :class:`SingleJudge.llm_callable` but keyed
+            by vendor name (same normalization rules as
+            ``vendor_models``). Unsupplied vendors fall back to
+            :mod:`litellm`.
+        max_tokens: Cap passed through to each vendor's
+            :class:`SingleJudge`. Default 256.
+
+    Raises:
+        ValueError: ``vendor_models`` has the wrong count
+            (``!= _JURY_SIZE``); a vendor name is non-``str`` or empty
+            after strip; two names collide after strip+lowercase
+            normalization; two vendors point at the same model id; an
+            ``llm_callables`` key is not present in ``vendor_models``;
+            or any vendor's :class:`SingleJudge` rejects its model /
+            max_tokens.
+        FileNotFoundError / ValueError: forwarded from the per-vendor
+            :class:`SingleJudge` rubric load (bad path / empty / non-UTF8).
+    """
+
+    def __init__(
+        self,
+        rubric_path: Path | str,
+        *,
+        vendor_models: dict[str, str] | None = None,
+        dry_run: bool = False,
+        llm_callables: LLMCallables | None = None,
+        max_tokens: int = _DEFAULT_MAX_TOKENS,
+    ) -> None:
+        raw_models = (
+            dict(_DEFAULT_JURY_VENDOR_MODELS)
+            if vendor_models is None
+            else dict(vendor_models)
+        )
+        # Pass-1 RT-M2 audit fix: normalize vendor keys (strip whitespace,
+        # lowercase) before the uniqueness check so "Anthropic" and
+        # "anthropic " can't both appear in vendor_overlap as case-variant
+        # duplicates. The BLUEPRINT line 445 falsifiability claim — "vendor_overlap
+        # includes 'anthropic' if Claude is in the jury" — depends on the
+        # lowercase convention; normalize at the gate, not at the read site.
+        models: dict[str, str] = {}
+        for raw_vendor, model in raw_models.items():
+            if not isinstance(raw_vendor, str):
+                raise ValueError(
+                    f"JuryJudge vendor names must be str; got {type(raw_vendor).__name__}"
+                )
+            vendor = raw_vendor.strip().lower()
+            if not vendor:
+                raise ValueError(
+                    f"JuryJudge vendor name must be non-empty after strip; got {raw_vendor!r}"
+                )
+            if vendor in models:
+                # Two raw keys normalized to the same canonical name
+                # (e.g., "anthropic" + "Anthropic ") — fail loud rather
+                # than silently collapse.
+                raise ValueError(
+                    f"JuryJudge vendor names collide after normalization: "
+                    f"{raw_vendor!r} → {vendor!r} already present."
+                )
+            models[vendor] = model
+        if len(models) != _JURY_SIZE:
+            raise ValueError(
+                f"JuryJudge requires exactly {_JURY_SIZE} vendor entries; "
+                f"got {len(models)}: {sorted(models)!r}"
+            )
+
+        # Pass-1 RT-M2 audit fix: reject duplicate model VALUES. Three
+        # vendors all pointing at the same LiteLLM model id (e.g., all
+        # three set to "google/gemini-2.5-pro") would produce a "jury"
+        # whose three votes are statistically dependent — the
+        # judge_independence.vendor_overlap signal becomes a lie.
+        if len(set(models.values())) != _JURY_SIZE:
+            raise ValueError(
+                f"JuryJudge vendor models must be distinct; got duplicates in "
+                f"{models!r}. Three vendors pointing at the same model defeats "
+                "the independence claim of vendor_overlap."
+            )
+
+        # Normalize llm_callables keys the same way so caller-side
+        # casing inconsistencies surface here, not at score() time when
+        # the callable would silently never be invoked.
+        raw_callables = dict(llm_callables) if llm_callables else {}
+        callables: dict[str, SyncLLMCallable] = {}
+        for raw_vendor, cb in raw_callables.items():
+            if not isinstance(raw_vendor, str):
+                raise ValueError(
+                    "llm_callables keys must be str; got "
+                    f"{type(raw_vendor).__name__}"
+                )
+            vendor = raw_vendor.strip().lower()
+            if vendor not in models:
+                raise ValueError(
+                    f"llm_callables key {raw_vendor!r} not in vendor_models; "
+                    f"valid keys: {sorted(models)!r}"
+                )
+            callables[vendor] = cb
+
+        # Per-vendor SingleJudge. Stable iteration order: the dict's
+        # insertion order (Python 3.7+ guarantee). Reports rely on this
+        # for reproducible ``vendor_overlap`` listings.
+        self._judges: dict[str, SingleJudge] = {}
+        for vendor, model in models.items():
+            self._judges[vendor] = SingleJudge(
+                model=model,
+                rubric_path=rubric_path,
+                dry_run=dry_run,
+                llm_callable=callables.get(vendor),
+                max_tokens=max_tokens,
+            )
+
+        # Pin the rubric_hash from the first vendor's SingleJudge and
+        # *assert* every other vendor produced the same hash. They share
+        # ``rubric_path``, so the only way they could differ is if the
+        # SingleJudge constructor's EOL/BOM normalization stopped being
+        # deterministic — a defensive check that would catch a future
+        # regression in :class:`SingleJudge` rather than silently
+        # accepting a split cache key.
+        first = next(iter(self._judges.values()))
+        self._rubric_hash = first.rubric_hash
+        self._rubric_path = first.rubric_path
+        self._dry_run = dry_run
+        for vendor, judge in self._judges.items():
+            if judge.rubric_hash != self._rubric_hash:
+                raise RuntimeError(
+                    f"JuryJudge rubric_hash mismatch: vendor {vendor!r} "
+                    f"produced {judge.rubric_hash!r}, "
+                    f"expected {self._rubric_hash!r}. This is a SingleJudge "
+                    "regression — file a bug."
+                )
+
+        # Run-level accounting accumulators. Mutated only inside
+        # :meth:`score`; readers should treat them as snapshots — the
+        # values reflect calls completed up to the most recent
+        # ``score()`` return.
+        #
+        # Pass-1 CR-M2 / RT-M4 audit fix: the runner offloads
+        # :meth:`score` to ``asyncio.to_thread`` and the orchestrator
+        # runs cells concurrently under a semaphore. Two cells may
+        # therefore execute :meth:`score` on different worker threads
+        # at the same time, racing the counters. A ``threading.Lock``
+        # makes the per-call accounting update atomic — at the cost of
+        # serializing the *bookkeeping*, not the vendor calls themselves
+        # (those release the GIL while waiting on litellm). The lock is
+        # held for microseconds at a time.
+        self._total_vendor_calls: int = 0
+        self._failed_vendor_calls: int = 0
+        self._parseable_vendors: set[str] = set()
+        self._accounting_lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Public read-only state — mirrors :class:`SingleJudge`'s surface so
+    # the runner / CLI / cache layer can treat the two interchangeably
+    # except where the cache key is concerned (see class docstring).
+    # ------------------------------------------------------------------
+
+    @property
+    def model(self) -> str:
+        """Synthetic combined model id for manifest / cli_args display.
+
+        Format: ``"jury_of_3:<vendor1>+<vendor2>+<vendor3>"`` with
+        vendors sorted alphabetically for stability. NOT a real LiteLLM
+        id — never pass this string to ``litellm.completion``.
+        """
+        return "jury_of_3:" + "+".join(sorted(self._judges))
+
+    @property
+    def rubric_path(self) -> Path:
+        return self._rubric_path
+
+    @property
+    def rubric_hash(self) -> str:
+        return self._rubric_hash
+
+    @property
+    def dry_run(self) -> bool:
+        return self._dry_run
+
+    @property
+    def vendors(self) -> tuple[str, ...]:
+        """Tuple of vendor names in construction order."""
+        return tuple(self._judges)
+
+    # ------------------------------------------------------------------
+    # Prompt rendering — delegates to the first vendor. All three vendor
+    # SingleJudges share the same rubric file and render arguments, so
+    # the rendered prompt is byte-identical across them; the runner's
+    # JudgeCache prompt-hash slot is therefore well-defined even though
+    # the cache itself is disabled for jury runs.
+    # ------------------------------------------------------------------
+
+    def render_prompt(self, payload: dict) -> str:
+        first = next(iter(self._judges.values()))
+        return first.render_prompt(payload)
+
+    # ------------------------------------------------------------------
+    # score() — the Judge.score contract
+    # ------------------------------------------------------------------
+
+    def score(self, payload: dict) -> ContinuousScore:
+        """Fan ``payload`` out to all three vendor judges; mean parseable.
+
+        See class docstring for aggregation + UNPARSEABLE fallback +
+        accounting semantics.
+        """
+        # Buffer the per-call decisions then apply them under the
+        # accounting lock at the end so the accumulators advance
+        # atomically as one batch (CR-M2 / RT-M4 audit fix). Without
+        # batching, two threads interleaving their per-vendor
+        # increments could produce a transient state like
+        # ``failed_vendor_calls > total_vendor_calls`` if a reader
+        # snapshots between the two ``+=`` statements.
+        votes: list[float] = []
+        parseable_this_call: list[str] = []
+        per_call_errors: list[tuple[str, str]] = []
+        local_total = 0
+        local_failed = 0
+        for vendor, judge in self._judges.items():
+            local_total += 1
+            try:
+                result = judge.score(payload)
+            except JudgeUnparseableError as e:
+                local_failed += 1
+                per_call_errors.append((vendor, f"{type(e).__name__}: {e}"))
+                _log.warning(
+                    "JuryJudge vendor %s unparseable: %s", vendor, e,
+                )
+                continue
+            except (KeyboardInterrupt, SystemExit):
+                # RT pass-1 implicit: don't swallow user-initiated
+                # cancellation as a vendor failure. Mirrors
+                # :class:`SingleJudge.score`'s behavior and the runner's
+                # cancellation handling. Note: the partial state
+                # accumulated so far stays in the local buffers and is
+                # NOT applied — the JuryJudge accumulators do not see
+                # this aborted call.
+                raise
+            except Exception as e:  # noqa: BLE001 — boundary: vendor SDK
+                # Network / SDK / quota failures get the same treatment as
+                # UNPARSEABLE for accounting: drop the vote, record the
+                # vendor as failed, keep going. Without this, an Anthropic
+                # 429 would crash the whole jury run mid-cell; the
+                # BLUEPRINT's "judge_failure_rate" contract is the right
+                # surface for surfacing these and §A's degraded badge is
+                # the right escalation.
+                local_failed += 1
+                per_call_errors.append((vendor, f"{type(e).__name__}: {e}"))
+                _log.warning(
+                    "JuryJudge vendor %s raised %s: %s",
+                    vendor, type(e).__name__, e,
+                )
+                continue
+            # Defensive: SingleJudge always returns ContinuousScore in
+            # its current implementation, but the Judge Protocol allows
+            # BinaryScore. The mean operation isn't defined on a mix, so
+            # bail out clearly rather than silently dropping the value
+            # and producing a misleading mean.
+            if not isinstance(result, ContinuousScore):
+                local_failed += 1
+                per_call_errors.append(
+                    (
+                        vendor,
+                        f"non-ContinuousScore {type(result).__name__}",
+                    )
+                )
+                _log.warning(
+                    "JuryJudge vendor %s returned %s; expected ContinuousScore. "
+                    "Dropping vote.",
+                    vendor, type(result).__name__,
+                )
+                continue
+            votes.append(result.value)
+            parseable_this_call.append(vendor)
+
+        # Apply the per-call accumulator updates atomically.
+        with self._accounting_lock:
+            self._total_vendor_calls += local_total
+            self._failed_vendor_calls += local_failed
+            self._parseable_vendors.update(parseable_this_call)
+
+        if not votes:
+            raise JudgeUnparseableError(
+                f"JuryJudge: all {len(self._judges)} vendors failed. "
+                f"Errors: {per_call_errors!r}"
+            )
+        mean = sum(votes) / len(votes)
+        # Mean of values in [0, 1] is itself in [0, 1] — no clamp needed.
+        return ContinuousScore(value=mean)
+
+    # ------------------------------------------------------------------
+    # Run-level accounting — DoD #14 falsifiability surface.
+    # ------------------------------------------------------------------
+
+    @property
+    def total_vendor_calls(self) -> int:
+        """Cumulative count of vendor calls (parseable + failed)."""
+        with self._accounting_lock:
+            return self._total_vendor_calls
+
+    @property
+    def failed_vendor_calls(self) -> int:
+        """Cumulative count of vendor calls that did not produce a vote.
+
+        Includes both :class:`JudgeUnparseableError` and other vendor SDK
+        exceptions (network / quota / non-ContinuousScore return).
+        """
+        with self._accounting_lock:
+            return self._failed_vendor_calls
+
+    @property
+    def judge_failure_rate(self) -> float:
+        """Fraction of vendor calls (across the run) that did not parse.
+
+        Returns 0.0 before any ``score()`` call so a fresh JuryJudge in
+        an aborted run reports a finite, well-defined value rather than
+        NaN. Reads the two counters under :attr:`_accounting_lock` so the
+        snapshot is internally consistent — without the lock, a reader
+        interleaved between a writer's two ``+=`` increments could see a
+        ratio > 1.0.
+        """
+        with self._accounting_lock:
+            total = self._total_vendor_calls
+            failed = self._failed_vendor_calls
+        if total == 0:
+            return 0.0
+        return failed / total
+
+    @property
+    def judge_independence(self) -> dict[str, list[str]]:
+        """Minimal vendor-overlap record per the locked field shape.
+
+        ``vendor_overlap`` is the sorted, deduplicated list of vendor
+        names that produced at least one parseable vote across the run.
+        BLUEPRINT line 445 makes this falsifiable: "includes
+        'anthropic' if Claude is in the jury" — i.e., if the Anthropic
+        single-judge parsed at least once, "anthropic" must appear.
+        """
+        with self._accounting_lock:
+            snapshot = sorted(self._parseable_vendors)
+        return {"vendor_overlap": snapshot}
+
+
+# ---------------------------------------------------------------------------
 # binary_from_continuous — metrics-layer helper for step 9 Cohen's κ
 # ---------------------------------------------------------------------------
 
@@ -561,6 +1005,7 @@ __all__ = [
     "Judge",
     "JudgeResult",
     "JudgeUnparseableError",
+    "JuryJudge",
     "SingleJudge",
     "binary_from_continuous",
 ]
