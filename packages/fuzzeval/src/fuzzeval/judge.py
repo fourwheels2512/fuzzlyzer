@@ -482,6 +482,14 @@ class SingleJudge:
                     "`pip install topofuzz[full]` or inject a custom "
                     "llm_callable into the SingleJudge constructor."
                 ) from e
+            # Translate the project-canonical model id (e.g.
+            # ``"google/gemini-2.5-flash"``) to LiteLLM's provider-
+            # prefixed form (``"gemini/gemini-2.5-flash"``) JUST at
+            # the call boundary. ``self._model`` is the canonical name
+            # for cache / attestation / §8 vendor-overlap purposes;
+            # only the outbound LiteLLM call sees the translation.
+            from fuzzeval._litellm_alias import litellm_model_id
+            kwargs["model"] = litellm_model_id(kwargs["model"])
             response = completion(**kwargs)
         return _extract_judge_text(response)
 

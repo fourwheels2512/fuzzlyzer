@@ -84,6 +84,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from fuzzeval._litellm_alias import litellm_model_id as _litellm_model_id
 from fuzzeval.cache import JudgeCache, LLMCache
 from fuzzeval.canonical import canonical_hash
 from fuzzeval.costest import cost_for_call
@@ -499,6 +500,15 @@ async def _call_llm(
             "install via `pip install topofuzz[full]` or inject a custom "
             "llm_callable into run_variant()."
         ) from e
+    # Translate the project-canonical model id to LiteLLM's provider-
+    # prefixed form JUST at the call boundary. Internal cache keys,
+    # manifest, attestation, and §8 vendor-overlap all keep the
+    # canonical name (e.g. ``"google/gemini-2.5-flash"``); only the
+    # outbound LiteLLM call sees the translated form
+    # (``"gemini/gemini-2.5-flash"`` for Google AI Studio direct).
+    # The mapping lives in :mod:`fuzzeval._litellm_alias` so the same
+    # alias also applies to :mod:`fuzzeval.judge`'s SingleJudge call.
+    kwargs["model"] = _litellm_model_id(kwargs["model"])
     return await acompletion(**kwargs)
 
 

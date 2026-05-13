@@ -2000,3 +2000,54 @@ def test_runner_jury_judge_n10_accounting_accumulates(tmp_path):
     assert judge.judge_independence == {
         "vendor_overlap": ["gemini", "openai"],
     }
+
+
+# ---------------------------------------------------------------------------
+# LiteLLM model-id alias at the call boundary
+# ---------------------------------------------------------------------------
+
+
+def test_litellm_model_id_translates_google_prefix() -> None:
+    """``google/gemini-X`` is the project-canonical name; LiteLLM needs
+    ``gemini/gemini-X``. The alias fires at the call boundary so the
+    internal cache key, manifest, attestation, and §8 vendor overlap
+    all keep the canonical form."""
+    from topofuzz.runner import _litellm_model_id
+
+    assert _litellm_model_id("google/gemini-2.5-flash") == (
+        "gemini/gemini-2.5-flash"
+    )
+    assert _litellm_model_id("google/gemini-2.5-pro") == (
+        "gemini/gemini-2.5-pro"
+    )
+
+
+def test_litellm_model_id_passes_through_other_providers() -> None:
+    """Anthropic, OpenAI, and bare model ids that LiteLLM already
+    recognises pass through unchanged."""
+    from topofuzz.runner import _litellm_model_id
+
+    assert (
+        _litellm_model_id("anthropic/claude-opus-4-7")
+        == "anthropic/claude-opus-4-7"
+    )
+    assert _litellm_model_id("openai/gpt-4o") == "openai/gpt-4o"
+    # Bare model id (no slash) — passthrough.
+    assert _litellm_model_id("gpt-4o") == "gpt-4o"
+    # Unknown prefix — passthrough; lets a forward-compat fixture
+    # opt into a LiteLLM-native id (e.g. vertex_ai/) without our
+    # alias getting in the way.
+    assert (
+        _litellm_model_id("vertex_ai/gemini-2.5-pro")
+        == "vertex_ai/gemini-2.5-pro"
+    )
+
+
+def test_litellm_model_id_non_string_passes_through() -> None:
+    """Defensive: a fake ``llm_callable`` injected by a test can use
+    any sentinel for ``model``. The alias must not crash on non-str."""
+    from topofuzz.runner import _litellm_model_id
+
+    sentinel = object()
+    assert _litellm_model_id(sentinel) is sentinel  # type: ignore[arg-type]
+    assert _litellm_model_id(None) is None  # type: ignore[arg-type]
