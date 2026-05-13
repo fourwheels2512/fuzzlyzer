@@ -157,6 +157,9 @@ def render_report(run_dir: Path) -> Path:
     influence_svg, influence_rows = _render_influence_panel(
         matrix, variant_ids, manifest
     )
+    worstcase_ctx = _render_worstcase_panel(
+        matrix, variant_ids, eval_ids_from_db, run_dir, run_id, manifest
+    )
 
     # Banner gates. attestation.json presence is the structural check,
     # but we additionally require the file to parse as JSON shaped like
@@ -231,6 +234,7 @@ def render_report(run_dir: Path) -> Path:
         show_jury=show_jury,
         show_degraded=show_degraded,
         matrix_warning=matrix_warning,
+        worstcase=worstcase_ctx,
     )
 
     out_path = run_dir / "report.html"
@@ -734,6 +738,129 @@ def _render_influence_bar_svg(rows: list[dict[str, Any]]) -> str:
     finally:
         plt.close(fig)
     return _strip_svg_preamble(buf.getvalue())
+
+
+# ---------------------------------------------------------------------------
+# Worst-case viewer (§10a / step 16) — Jinja-side adapter
+# ---------------------------------------------------------------------------
+
+
+def _render_worstcase_panel(
+    matrix: "np.ndarray",
+    variant_ids: tuple[str, ...],
+    eval_ids: tuple[str, ...],
+    run_dir: Path,
+    run_id: str,
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the Jinja context dict for the §10a worst-case section.
+
+    The data layer lives in :mod:`topofuzz.metrics.worstcase` (step 16).
+    Here we degrade gracefully on any failure — a crash inside the
+    panel must not take down the rest of the report (banners, voo,
+    heatmap, influence). On ANY exception we surface a one-line
+    warning and return a disabled-state context with a diagnostic
+    reason.
+    """
+    try:
+        from topofuzz.metrics import compute_worstcase_panel
+    except ImportError as e:
+        _log.warning(
+            "report: worstcase metrics unavailable (%s) — section disabled",
+            e,
+        )
+        return {
+            "disabled": True,
+            "disabled_reason": "metrics module unavailable",
+            "cases": [],
+        }
+
+    try:
+        panel = compute_worstcase_panel(
+            matrix,
+            variant_ids,
+            eval_ids,
+            run_dir=run_dir,
+            run_id=run_id,
+            manifest=manifest,
+        )
+    except (
+        ValueError, ImportError, TypeError, OSError,
+        sqlite3.DatabaseError, json.JSONDecodeError,
+    ) as e:
+        # Audit pass-2 RT-MAJOR-4: narrowed from ``Exception`` so
+        # ``MemoryError``/``RecursionError``/``KeyboardInterrupt`` /
+        # ``SystemExit`` propagate. The exception text is NOT
+        # interpolated into the log because the underlying message can
+        # carry chunks of user prompt data (e.g. a malformed
+        # ``node_outputs_json`` row whose ``e.args[0]`` is the
+        # offending JSON); centralised log shippers would then quietly
+        # exfiltrate. Type + the file/run pair is enough for an
+        # operator to find the row themselves.
+        _log.warning(
+            "report: worstcase panel raised %s — section disabled "
+            "(run_dir=%s, run_id=%r)",
+            type(e).__name__, run_dir, run_id,
+        )
+        return {
+            "disabled": True,
+            "disabled_reason": "computation error",
+            "cases": [],
+        }
+
+    if panel.disabled:
+        return {
+            "disabled": True,
+            "disabled_reason": panel.disabled_reason,
+            "cases": [],
+        }
+
+    # Convert the frozen dataclasses to plain dicts. Jinja can iterate
+    # dataclass attrs directly but the template stays readable when it
+    # walks dicts, and the test suite asserts panel-side dataclass
+    # semantics separately.
+    cases_out = []
+    for case in panel.cases:
+        cases_out.append(
+            {
+                "eval_id": case.eval_id,
+                "flip_count": case.flip_count,
+                "n_pairs": case.n_pairs,
+                "variant_a": _side_to_dict(case.variant_a),
+                "variant_b": _side_to_dict(case.variant_b),
+            }
+        )
+    return {
+        "disabled": False,
+        "disabled_reason": None,
+        "cases": cases_out,
+    }
+
+
+def _side_to_dict(side: Any) -> dict[str, Any]:
+    """Convert :class:`VariantSideView` to a Jinja-friendly dict.
+
+    Both the truncated display label and the full canonical_hash are
+    surfaced so the rendered card can show a clipped hash inline AND
+    a ``title=`` tooltip for the operator who needs the full value
+    (audit RT-MINOR-6).
+    """
+    return {
+        "variant_id": side.variant_id,
+        "variant_id_short": _short(side.variant_id, limit=16),
+        "ordering": list(side.ordering),
+        "score": side.score,
+        "verdict": bool(side.verdict),
+        "rationale": side.rationale,
+        "node_outputs": [
+            {
+                "node_id": n.node_id,
+                "role": n.role,
+                "response_text": n.response_text,
+            }
+            for n in side.node_outputs
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -758,3 +758,289 @@ def test_cli_import_does_not_load_report_module() -> None:
         f"topofuzz.cli transitively loaded topofuzz.report.\n"
         f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Step 16: §10a worst-case viewer integration coverage
+# ---------------------------------------------------------------------------
+
+
+def _populate_cells_for_worstcase(
+    run_dir: Path,
+    *,
+    run_id: str = "run-test",
+    variant_ids: list[str],
+    eval_ids: list[str],
+    response_text: str = "trace excerpt",
+) -> None:
+    """Insert minimal cells rows for every (variant, eval) pair.
+
+    Step 16 reads ``cells.node_outputs_json`` to build side-by-side
+    trace excerpts. Existing :func:`_make_run_dir` populates
+    ``judge_results`` but not ``cells`` — for the report-level
+    worst-case tests we seed cells too.
+    """
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    try:
+        for vid in variant_ids:
+            for eid in eval_ids:
+                node_outs = [
+                    {
+                        "node_id": f"agent-1-{vid}",
+                        "role": "decision",
+                        "response_text": (
+                            f"{response_text} for ({vid}, {eid})"
+                        ),
+                    }
+                ]
+                db.execute(
+                    "INSERT INTO cells "
+                    "(run_id, variant_id, eval_id, ir_canonical_hash, "
+                    " node_outputs_json) VALUES (?, ?, ?, ?, ?)",
+                    (run_id, vid, eid, vid, json.dumps(node_outs)),
+                )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _rewrite_scores_for_flip(
+    run_dir: Path,
+    *,
+    flips: dict[str, dict[str, float]],
+    run_id: str = "run-test",
+) -> None:
+    """Overwrite ``judge_results.score_value`` with the given pattern.
+
+    ``flips`` is ``{variant_id: {eval_id: score}}``. Wipes existing
+    judge_results rows for the run_id first so the deterministic
+    pattern from :func:`_make_run_dir` doesn't bleed through.
+    """
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    try:
+        db.execute(
+            "DELETE FROM judge_results WHERE run_id = ?", (run_id,)
+        )
+        for vid, by_eval in flips.items():
+            for eid, score in by_eval.items():
+                db.execute(
+                    "INSERT INTO judge_results "
+                    "(run_id, variant_id, eval_id, judge_kind, "
+                    " score_value, passed, rationale, failure_reason) "
+                    "VALUES (?, ?, ?, 'continuous', ?, NULL, ?, NULL)",
+                    (
+                        run_id, vid, eid, score,
+                        f"rationale for ({vid}, {eid})",
+                    ),
+                )
+        db.commit()
+    finally:
+        db.close()
+
+
+_WC_SECTION_BEGIN = "<!-- WORSTCASE-SECTION-BEGIN -->"
+_WC_SECTION_END = "<!-- WORSTCASE-SECTION-END -->"
+
+
+def _extract_worstcase_section(body: str) -> str:
+    """Return the §10a section between sentinel HTML comments.
+
+    Audit pass-2 RT-MAJOR-1 / RT-MAJOR-2: assertions on the full body
+    can match SVG-placeholder copy or future-section content elsewhere.
+    Scoping to the worst-case section makes the substring/grep tests
+    a real localised contract.
+    """
+    start = body.index(_WC_SECTION_BEGIN)
+    end = body.index(_WC_SECTION_END, start + len(_WC_SECTION_BEGIN))
+    return body[start : end + len(_WC_SECTION_END)]
+
+
+def test_report_worstcase_section_renders_when_verdicts_flip(
+    tmp_path: Path,
+) -> None:
+    """When the score matrix has a flipping pair AND per-column
+    variance clears the DoD #13 gate, the §10a section renders with at
+    least one WORST card and the eval_id appears in that section."""
+    run_dir = _make_run_dir(tmp_path, n_variants=2, n_evals=2)
+    _populate_cells_for_worstcase(
+        run_dir,
+        variant_ids=["var00", "var01"],
+        eval_ids=["eval-0", "eval-1"],
+    )
+    # eval-0: var=0.16 above gate; eval-1: var=0.16 above gate.
+    _rewrite_scores_for_flip(
+        run_dir,
+        flips={
+            "var00": {"eval-0": 0.9, "eval-1": 0.1},
+            "var01": {"eval-0": 0.1, "eval-1": 0.9},
+        },
+    )
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_worstcase_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    assert "Worst-case viewer" in section
+    assert "WORST #1" in section
+    assert "eval-0" in section
+    # Trace excerpt + rationale propagation, scoped to the section.
+    assert "trace excerpt for (var00, eval-0)" in section
+    assert "rationale for (var01, eval-0)" in section
+    assert "No instability detected" not in section
+
+
+def test_report_worstcase_banner_when_all_agree(tmp_path: Path) -> None:
+    """When every variant produces the same verdict on every eval, the
+    §10a section renders the 'no instability detected' banner copy."""
+    run_dir = _make_run_dir(tmp_path, n_variants=2, n_evals=3)
+    _populate_cells_for_worstcase(
+        run_dir,
+        variant_ids=["var00", "var01"],
+        eval_ids=["eval-0", "eval-1", "eval-2"],
+    )
+    _rewrite_scores_for_flip(
+        run_dir,
+        flips={
+            v: {e: 0.85 for e in ("eval-0", "eval-1", "eval-2")}
+            for v in ("var00", "var01")
+        },
+    )
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_worstcase_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    assert "Worst-case viewer" in section
+    assert "No instability detected" in section
+    assert "WORST #" not in section
+
+
+def test_report_worstcase_disabled_when_score_matrix_empty(
+    tmp_path: Path,
+) -> None:
+    """An empty score matrix routes through a distinct 'no continuous-
+    judge cells to rank' banner — NOT the 'no instability detected'
+    copy reserved for the BLUEPRINT line 300 stable case (audit pass-1
+    RT MAJOR-3 + pass-2 MAJOR-1 scoping)."""
+    run_dir = _make_run_dir(tmp_path)
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    try:
+        db.execute("DELETE FROM judge_results")
+        db.commit()
+    finally:
+        db.close()
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_worstcase_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    assert "Worst-case viewer" in section
+    assert "no continuous-judge cells to rank" in section
+    # MUST NOT masquerade as the BLUEPRINT line 300 stable banner.
+    assert "No instability detected" not in section
+    assert "WORST #" not in section
+
+
+def test_report_worstcase_banner_copy_is_blueprint_verbatim(
+    tmp_path: Path,
+) -> None:
+    """The stable-case banner reproduces BLUEPRINT line 300 verbatim
+    (audit pass-1 RT-MAJOR-2 / pass-2 RT-MAJOR-1 scoping). Step 22's
+    CEO outreach PDF will grep-verify this copy against the spec; any
+    drift breaks the screenshot."""
+    run_dir = _make_run_dir(tmp_path, n_variants=2, n_evals=3)
+    _populate_cells_for_worstcase(
+        run_dir,
+        variant_ids=["var00", "var01"],
+        eval_ids=["eval-0", "eval-1", "eval-2"],
+    )
+    _rewrite_scores_for_flip(
+        run_dir,
+        flips={
+            v: {e: 0.85 for e in ("eval-0", "eval-1", "eval-2")}
+            for v in ("var00", "var01")
+        },
+    )
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_worstcase_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    # The BLUEPRINT_v5plus.md §10a line 300 copy, verbatim, scoped to
+    # the §10a section so a stray placeholder string elsewhere can't
+    # satisfy the assertion.
+    spec_copy = (
+        "No instability detected — your topology produced consistent "
+        "answers across all orderings."
+    )
+    assert spec_copy in section, (
+        "Banner copy must reproduce BLUEPRINT §10a line 300 verbatim "
+        "for step 22 grep verification."
+    )
+
+
+def test_report_worstcase_visual_regression_snapshot(tmp_path: Path) -> None:
+    """BLUEPRINT DoD #13 (line 533): visual regression on a fixture run.
+
+    Builds a deterministic fixture run dir, renders the report twice,
+    and asserts (a) the §10a section is byte-identical across renders
+    (determinism) and (b) the rendered fragment contains the expected
+    structural anchors. Extraction uses HTML sentinel comments (audit
+    pass-2 RT-MAJOR-2) so a future template re-flow (e.g. step 17
+    moving sections) doesn't silently mask the snapshot's coverage.
+    """
+    run_dir = _make_run_dir(tmp_path, n_variants=2, n_evals=3)
+    _populate_cells_for_worstcase(
+        run_dir,
+        variant_ids=["var00", "var01"],
+        eval_ids=["eval-0", "eval-1", "eval-2"],
+    )
+    # Two evals flip with high per-column variance; one is stable.
+    # Expected: cards for eval-0 and eval-1 in lex order, eval-2 omitted.
+    _rewrite_scores_for_flip(
+        run_dir,
+        flips={
+            "var00": {"eval-0": 0.95, "eval-1": 0.90, "eval-2": 0.85},
+            "var01": {"eval-0": 0.05, "eval-1": 0.10, "eval-2": 0.80},
+        },
+    )
+
+    def _render_section() -> str:
+        result = CliRunner().invoke(app, ["report", str(run_dir)])
+        assert result.exit_code == 0, result.output
+        body = (run_dir / "report.html").read_text(encoding="utf-8")
+        return _extract_worstcase_section(body)
+
+    first = _render_section()
+    second = _render_section()
+    # Determinism: same fixture → byte-identical rendered section.
+    assert first == second, (
+        "Worst-case section is not deterministic across renders"
+    )
+
+    # Structural anchors, scoped to the section.
+    assert "WORST #1" in first
+    assert "WORST #2" in first
+    assert "WORST #3" not in first  # only two flipping evals
+    # Top-K selection is ordered by flip count (both 1 here) then by
+    # eval-id lex — so eval-0 precedes eval-1 in the rendered HTML.
+    assert first.index("eval-0") < first.index("eval-1")
+    # Both variants appear in side labels.
+    assert "var00" in first
+    assert "var01" in first
+    # Stable eval (eval-2) is NOT promoted to a card.
+    assert "eval-2" not in first
+
+
+def test_report_worstcase_section_sentinels_present(tmp_path: Path) -> None:
+    """The HTML sentinel comments wrap the §10a section in every
+    rendered report — the snapshot extractor depends on them, so we
+    pin the contract here so a template refactor that drops the
+    sentinels surfaces immediately (audit pass-2 RT-MAJOR-2)."""
+    run_dir = _make_run_dir(tmp_path)
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    body = (run_dir / "report.html").read_text(encoding="utf-8")
+    assert _WC_SECTION_BEGIN in body
+    assert _WC_SECTION_END in body
+    assert body.index(_WC_SECTION_BEGIN) < body.index(_WC_SECTION_END)

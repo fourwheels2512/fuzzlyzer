@@ -59,6 +59,13 @@ from topofuzz.metrics.voo import (
     variance_across_orderings,
     variance_across_orderings_ci,
 )
+from topofuzz.metrics.worstcase import (
+    NodeOutputView,
+    VariantSideView,
+    WorstCaseEntry,
+    WorstCasePanel,
+    compute_worstcase_panel,
+)
 
 __all__ = [
     "AgentInfluence",
@@ -66,9 +73,13 @@ __all__ = [
     "ECRResult",
     "InfluenceComputation",
     "KappaResult",
+    "NodeOutputView",
     "OrderingAlignmentError",
     "ScoreMatrixResult",
+    "VariantSideView",
     "VerdictFlipResult",
+    "WorstCaseEntry",
+    "WorstCasePanel",
     "align_orderings_to_matrix",
     "balanced_accuracy",
     "balanced_accuracy_drop",
@@ -78,6 +89,7 @@ __all__ = [
     "cohens_kappa_vs_truth",
     "compute_influence",
     "compute_verdict_flip_rate",
+    "compute_worstcase_panel",
     "error_correction_rate",
     "read_score_matrix",
     "variance_across_orderings",

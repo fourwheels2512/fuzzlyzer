@@ -28,6 +28,70 @@
   .banner-dev-key { background: #fff3b0; color: #6b5b00; border: 1px solid #d9c45a; }
   .banner-jury    { background: #d6e4ff; color: #1e3a8a; border: 1px solid #6f8fce; }
   .banner-degraded { background: #ffd6d6; color: #7a1f1f; border: 1px solid #c95757; }
+  .wc-stable {
+    background: #e0f5e0;
+    border-left: 4px solid #3da06e;
+    padding: .5rem .75rem;
+    margin: .75rem 0;
+    color: #1f5f3a;
+    font-size: .9rem;
+  }
+  .wc-card {
+    border: 1px solid #cfcfcf;
+    border-radius: 4px;
+    margin: 1rem 0;
+    overflow: hidden;
+    background: #fff;
+  }
+  .wc-head {
+    background: #f0f3f8;
+    padding: .4rem .65rem;
+    font-size: .9rem;
+    border-bottom: 1px solid #cfcfcf;
+  }
+  .wc-tag {
+    display: inline-block;
+    background: #1a1a1a;
+    color: #fff;
+    padding: .05rem .4rem;
+    border-radius: 2px;
+    font-size: .75rem;
+    margin-right: .4rem;
+    letter-spacing: .04em;
+  }
+  .wc-eval { font-weight: bold; }
+  .wc-flip { color: #555; margin-left: .6rem; font-size: .8rem; }
+  .wc-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0;
+  }
+  .wc-side {
+    padding: .55rem .65rem;
+    border-right: 1px dashed #d8d8d8;
+    font-size: .82rem;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+  }
+  .wc-side:last-child { border-right: none; }
+  .wc-side-head {
+    margin-bottom: .35rem;
+    padding-bottom: .25rem;
+    border-bottom: 1px solid #eee;
+    color: #333;
+  }
+  .wc-verdict-pass { color: #1f5f3a; font-weight: bold; }
+  .wc-verdict-fail { color: #7a1f1f; font-weight: bold; }
+  .wc-trace p { margin: .2rem 0; }
+  .wc-trace .nid { color: #1e3a8a; font-weight: bold; }
+  .wc-trace .role { color: #777; font-size: .76rem; }
+  .wc-rationale {
+    margin-top: .35rem;
+    padding-top: .25rem;
+    border-top: 1px solid #eee;
+    color: #555;
+    font-style: italic;
+  }
   .warning {
     background: #fff0d6;
     border-left: 4px solid #d99700;
@@ -84,6 +148,62 @@
 {% endfor %}
 </table>
 {% endif %}
+
+<!-- WORSTCASE-SECTION-BEGIN -->
+<h2>Worst-case viewer (§10a)</h2>
+{% if worstcase.disabled %}
+<div class="wc-stable">
+  {% if worstcase.disabled_reason == 'no instability detected' %}
+  No instability detected — your topology produced consistent answers across all orderings.
+  {% elif worstcase.disabled_reason == 'matrix empty' or worstcase.disabled_reason == 'no continuous-judge cells' %}
+  Worst-case section unavailable — no continuous-judge cells to rank.
+  {% elif worstcase.disabled_reason == 'no valid differing-verdict pair' %}
+  Worst-case section unavailable — no valid differing-verdict pair (data may be partial).
+  {% else %}
+  Worst-case section unavailable
+  {% if worstcase.disabled_reason %}<span style="color:#777;font-size:.78rem;">({{ worstcase.disabled_reason }})</span>{% endif %}
+  {% endif %}
+</div>
+{% else %}
+<p style="color:#555;font-size:.85rem;margin:.25rem 0 .75rem 0;">
+  Top {{ worstcase.cases | length }} eval rows with the most cross-ordering verdict disagreements.
+  Each card shows the two variants that produced the largest score gap on a flipping pair.
+</p>
+{% for case in worstcase.cases %}
+<div class="wc-card">
+  <div class="wc-head">
+    <span class="wc-tag">WORST #{{ loop.index }}</span>
+    <span class="wc-eval">eval_id = {{ case.eval_id }}</span>
+    <span class="wc-flip">{{ case.flip_count }} of {{ case.n_pairs }} variant pairs disagree</span>
+  </div>
+  <div class="wc-grid">
+    {% for side in [case.variant_a, case.variant_b] %}
+    <div class="wc-side">
+      <div class="wc-side-head">
+        <strong>Variant {{ 'A' if loop.index == 1 else 'B' }}:</strong>
+        <code title="{{ side.variant_id }}">{{ side.variant_id_short }}</code><br>
+        {% if side.ordering %}Ordering: {{ side.ordering | join(' → ') }}<br>{% endif %}
+        Score: {{ '%.3f' % side.score }} ·
+        Verdict:
+        {% if side.verdict %}<span class="wc-verdict-pass">PASS</span>{% else %}<span class="wc-verdict-fail">FAIL</span>{% endif %}
+      </div>
+      <div class="wc-trace">
+        {% if side.node_outputs %}
+        {% for n in side.node_outputs %}
+        <p><span class="nid">{{ n.node_id }}</span> <span class="role">[{{ n.role }}]</span>: {{ n.response_text }}</p>
+        {% endfor %}
+        {% else %}
+        <p style="color:#888;font-size:.78rem;">(no per-node trace available for this cell)</p>
+        {% endif %}
+      </div>
+      {% if side.rationale %}<div class="wc-rationale">Judge: {{ side.rationale }}</div>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endfor %}
+{% endif %}
+<!-- WORSTCASE-SECTION-END -->
 
 <h2>Per-eval variance across orderings</h2>
 <figure>
