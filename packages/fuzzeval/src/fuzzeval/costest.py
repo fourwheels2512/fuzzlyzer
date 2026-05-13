@@ -60,6 +60,43 @@ def _line_cost(n_calls: int, rate_per_1k: float) -> float:
     return n_calls * _TOKENS_PER_CALL * rate_per_1k / 1000.0
 
 
+def cost_for_call(
+    model: str,
+    input_tokens: int | None,
+    output_tokens: int | None,
+) -> float | None:
+    """Per-call USD cost from token counts and the static rate table.
+
+    Returns ``None`` when:
+
+    * the model is absent from :data:`_RATE_USD_PER_1K` (don't silently
+      substitute the default rate — runner code stores ``None`` so the
+      cap can warn that part of the run is un-priced), or
+    * either token count is ``None`` (provider didn't report ``usage``).
+
+    Blended (input + output) rate — separate input/output rates land
+    when step 6's measured-rate update replaces the static table.
+    Negative or non-int token counts are treated as missing for safety
+    (``_extract_usage`` already strips those, but :func:`cost_for_call`
+    is a public helper — defensive validation here keeps callers honest).
+    """
+    if input_tokens is None or output_tokens is None:
+        return None
+    if (
+        isinstance(input_tokens, bool)
+        or isinstance(output_tokens, bool)
+        or not isinstance(input_tokens, int)
+        or not isinstance(output_tokens, int)
+    ):
+        return None
+    if input_tokens < 0 or output_tokens < 0:
+        return None
+    rate = _RATE_USD_PER_1K.get(model)
+    if rate is None:
+        return None
+    return (input_tokens + output_tokens) * rate / 1000.0
+
+
 def estimate(
     sample_rows: list,
     judge_mode: str,

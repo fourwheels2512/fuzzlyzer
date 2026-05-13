@@ -995,7 +995,7 @@ def test_run_writer_persists_schema_version_pragma(tmp_path):
         ver = db.execute("PRAGMA user_version").fetchone()[0]
     finally:
         db.close()
-    assert ver == 1
+    assert ver == 2  # bumped in step 6.0 (cost telemetry)
 
 
 def test_run_writer_resume_preserves_original_created_at(tmp_path):
@@ -1328,3 +1328,390 @@ def test_run_writer_safe_close_swallows_exception_during_close(tmp_path):
         # Make sure the real connection is actually closed so tmp_path
         # cleanup doesn't trip on a held file handle on Windows.
         real_db.close()
+
+
+# ---------------------------------------------------------------------------
+# Step 6.0 — cost telemetry
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FakeLLMWithUsage:
+    """FakeLLM variant that echoes a ``usage`` block in the response."""
+
+    prompt_tokens: int = 100
+    completion_tokens: int = 50
+    served_override: str | None = None
+    omit_usage: bool = False
+    use_object_shape: bool = False
+
+    async def __call__(self, **kwargs: Any) -> Any:
+        served = self.served_override or kwargs["model"]
+        text = f"<resp from {kwargs['model']}>"
+        if self.use_object_shape:
+            import types
+            msg = types.SimpleNamespace(content=text)
+            choice = types.SimpleNamespace(message=msg)
+            obj = types.SimpleNamespace(
+                choices=[choice],
+                model=served,
+            )
+            if not self.omit_usage:
+                obj.usage = types.SimpleNamespace(
+                    prompt_tokens=self.prompt_tokens,
+                    completion_tokens=self.completion_tokens,
+                )
+            return obj
+        envelope: dict = {
+            "choices": [{"message": {"content": text}}],
+            "model": served,
+        }
+        if not self.omit_usage:
+            envelope["usage"] = {
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+            }
+        return envelope
+
+
+def test_node_output_token_cost_fields_default_to_none():
+    """Additive change to NodeOutput: existing positional usage still works."""
+    from topofuzz.runner import NodeOutput as NO
+    no = NO(
+        node_id="n0",
+        role="r",
+        response_text="x",
+        model_served_version="m",
+        cache_hit=False,
+        latency_ms=10,
+    )
+    assert no.input_tokens is None
+    assert no.output_tokens is None
+    assert no.cost_usd is None
+
+
+def test_runner_records_token_counts_from_dict_usage():
+    topo = _toy_topology(n=1, model="google/gemini-2.5-pro")
+    cell = _run(
+        run_variant(
+            topo,
+            {"id": "e1", "input": "x"},
+            llm_callable=FakeLLMWithUsage(prompt_tokens=200, completion_tokens=80),
+        )
+    )
+    no = cell.node_outputs[0]
+    assert no.input_tokens == 200
+    assert no.output_tokens == 80
+    # gemini-2.5-pro rate is 0.020 / 1K → 280 * 0.020 / 1000 = 0.0056
+    assert no.cost_usd is not None
+    assert abs(no.cost_usd - 0.0056) < 1e-9
+
+
+def test_runner_records_token_counts_from_object_usage():
+    topo = _toy_topology(n=1, model="google/gemini-2.5-pro")
+    cell = _run(
+        run_variant(
+            topo,
+            {"id": "e1", "input": "x"},
+            llm_callable=FakeLLMWithUsage(
+                prompt_tokens=10, completion_tokens=5, use_object_shape=True
+            ),
+        )
+    )
+    no = cell.node_outputs[0]
+    assert no.input_tokens == 10
+    assert no.output_tokens == 5
+    assert no.cost_usd is not None
+
+
+def test_runner_leaves_tokens_none_when_usage_absent():
+    topo = _toy_topology(n=1, model="google/gemini-2.5-pro")
+    cell = _run(
+        run_variant(
+            topo,
+            {"id": "e1", "input": "x"},
+            llm_callable=FakeLLMWithUsage(omit_usage=True),
+        )
+    )
+    no = cell.node_outputs[0]
+    assert no.input_tokens is None
+    assert no.output_tokens is None
+    assert no.cost_usd is None
+
+
+def test_runner_cost_none_when_model_not_in_rate_table():
+    """Unknown model → usage captured but cost_usd None.
+
+    Don't silently substitute the default rate; the cap would understate
+    cost. The §7 deviation is documented in NodeOutput's docstring.
+    """
+    topo = _toy_topology(n=1, model="unknown/model-xyz")
+    cell = _run(
+        run_variant(
+            topo,
+            {"id": "e1", "input": "x"},
+            llm_callable=FakeLLMWithUsage(prompt_tokens=100, completion_tokens=50),
+        )
+    )
+    no = cell.node_outputs[0]
+    assert no.input_tokens == 100
+    assert no.output_tokens == 50
+    assert no.cost_usd is None
+
+
+def test_runner_cache_hit_leaves_cost_none(tmp_path):
+    """Cache hits are not billed → cost_usd stays None even though the
+    cold call recorded tokens. Test it explicitly so a future regression
+    that 'helpfully' carries forward the cold cost gets caught."""
+    topo = _toy_topology(n=1, model="google/gemini-2.5-pro")
+    llm_cache = LLMCache(tmp_path)
+    fake = FakeLLMWithUsage(prompt_tokens=100, completion_tokens=50)
+
+    cold = _run(run_variant(
+        topo, {"id": "e1", "input": "x"},
+        llm_callable=fake, llm_cache=llm_cache,
+    ))
+    assert cold.node_outputs[0].cost_usd is not None
+
+    warm = _run(run_variant(
+        topo, {"id": "e1", "input": "x"},
+        llm_callable=fake, llm_cache=llm_cache,
+    ))
+    assert warm.node_outputs[0].cache_hit is True
+    assert warm.node_outputs[0].cost_usd is None
+    assert warm.node_outputs[0].input_tokens is None
+    assert warm.node_outputs[0].output_tokens is None
+    llm_cache.close()
+
+
+def test_runner_extract_usage_rejects_negative_and_bool():
+    """``_extract_usage`` strips garbage (bool, negatives, non-int) →
+    NodeOutput.input_tokens / output_tokens stay None on misbehaving
+    providers rather than slipping a poison value into the cost cap.
+
+    Stringified ints (``"100"``) ARE accepted — some older provider
+    proxies return them as strings (audit RT m-8). Anything that
+    fails ``int()`` is rejected.
+    """
+    from topofuzz.runner import _extract_usage
+
+    bad_envelopes = [
+        {"usage": {"prompt_tokens": -1, "completion_tokens": 5}},
+        {"usage": {"prompt_tokens": True, "completion_tokens": 5}},
+        {"usage": {"prompt_tokens": 1.5, "completion_tokens": 5}},
+        {"usage": {"prompt_tokens": "not-a-number", "completion_tokens": 5}},
+    ]
+    for env in bad_envelopes:
+        i, o = _extract_usage(env)
+        assert i is None, f"expected None for {env}, got {i}"
+        # output remains valid in these cases
+        assert o == 5
+
+    # New positive: stringified int is coerced.
+    i, o = _extract_usage(
+        {"usage": {"prompt_tokens": "100", "completion_tokens": "50"}}
+    )
+    assert i == 100
+    assert o == 50
+
+
+def test_runwriter_persists_cell_cost_usd(tmp_path):
+    """``cells.cell_cost_usd`` is the aggregated cost across NodeOutputs.
+
+    Step 6's orchestrator sums this column to drive ``--max-cost-usd``.
+    The sum across a fresh run = sum of per-node cost_usd values.
+    """
+    topo = _toy_topology(n=2, model="google/gemini-2.5-pro")
+    cell = _run(run_variant(
+        topo, {"id": "e1", "input": "x"},
+        llm_callable=FakeLLMWithUsage(prompt_tokens=100, completion_tokens=50),
+    ))
+    with RunWriter(tmp_path, "run-1", topo) as w:
+        w.write(cell)
+
+    db = sqlite3.connect(str(tmp_path / "run.sqlite"))
+    try:
+        row = db.execute(
+            "SELECT cell_cost_usd FROM cells WHERE eval_id = ?", ("e1",)
+        ).fetchone()
+    finally:
+        db.close()
+    expected = sum(o.cost_usd for o in cell.node_outputs)
+    assert row[0] is not None
+    assert abs(row[0] - expected) < 1e-9
+
+
+def test_runwriter_cell_cost_null_when_no_tokens(tmp_path):
+    topo = _toy_topology(n=1, model="google/gemini-2.5-pro")
+    cell = _run(run_variant(
+        topo, {"id": "e1", "input": "x"},
+        llm_callable=FakeLLMWithUsage(omit_usage=True),
+    ))
+    with RunWriter(tmp_path, "run-1", topo) as w:
+        w.write(cell)
+
+    db = sqlite3.connect(str(tmp_path / "run.sqlite"))
+    try:
+        row = db.execute(
+            "SELECT cell_cost_usd FROM cells WHERE eval_id = ?", ("e1",)
+        ).fetchone()
+    finally:
+        db.close()
+    assert row[0] is None
+
+
+def test_runwriter_migrates_v1_db_in_place(tmp_path):
+    """An on-disk schema-v1 DB (no cell_cost_usd column) opened by today's
+    RunWriter must be ALTERed to v2 in place, NOT rebuilt. Forensic
+    preservation of any pre-existing rows matters.
+
+    The DDL below mirrors the v1 schema shipped at commit ``6da01c8``
+    (verified via ``git show 6da01c8:packages/topofuzz/src/topofuzz/
+    runner.py``). If the v1 shipped DDL ever changes, this fixture
+    must too — audit B-1 raised the concern that a hand-crafted v1
+    that drifts from reality would let a real-DB migration regression
+    slip past CI. Pinning the cells/runs/judge_results column lists
+    here is the cheap defense.
+    """
+    topo = _toy_topology(n=1, model="google/gemini-2.5-pro")
+    db_path = tmp_path / "run.sqlite"
+
+    # Hand-craft a v1 DB matching the pre-step-6 schema literally.
+    legacy = sqlite3.connect(str(db_path))
+    try:
+        legacy.executescript("""
+            PRAGMA user_version = 1;
+            CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY,
+                topology_canonical_hash TEXT NOT NULL,
+                topology_name TEXT NOT NULL,
+                tds_version TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE TABLE cells (
+                run_id TEXT NOT NULL,
+                variant_id TEXT NOT NULL,
+                eval_id TEXT NOT NULL,
+                ir_canonical_hash TEXT NOT NULL,
+                node_outputs_json TEXT NOT NULL,
+                error TEXT,
+                PRIMARY KEY (run_id, variant_id, eval_id)
+            );
+            CREATE TABLE judge_results (
+                run_id TEXT NOT NULL,
+                variant_id TEXT NOT NULL,
+                eval_id TEXT NOT NULL,
+                judge_kind TEXT NOT NULL,
+                score_value REAL,
+                passed INTEGER,
+                rationale TEXT,
+                failure_reason TEXT,
+                PRIMARY KEY (run_id, variant_id, eval_id)
+            );
+        """)
+        legacy.execute(
+            "INSERT INTO runs VALUES (?, ?, ?, ?, ?)",
+            ("legacy-run", topo.canonical_hash(), topo.name,
+             topo.tds_version, 0.0),
+        )
+        legacy.execute(
+            "INSERT INTO cells (run_id, variant_id, eval_id, "
+            "ir_canonical_hash, node_outputs_json, error) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("legacy-run", "old-variant", "old-eval",
+             topo.canonical_hash(), "[]", None),
+        )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    # Re-open via RunWriter → migration runs, legacy row survives.
+    with RunWriter(tmp_path, "legacy-run", topo) as w:
+        # Write a fresh cell to confirm the new column accepts writes.
+        cell = _run(run_variant(
+            topo, {"id": "e1", "input": "x"},
+            llm_callable=FakeLLMWithUsage(prompt_tokens=10, completion_tokens=5),
+        ))
+        w.write(cell)
+
+    db = sqlite3.connect(str(db_path))
+    try:
+        # Schema bumped.
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        # Legacy row preserved with NULL in the new column.
+        legacy_row = db.execute(
+            "SELECT cell_cost_usd FROM cells WHERE eval_id = 'old-eval'"
+        ).fetchone()
+        assert legacy_row is not None
+        assert legacy_row[0] is None
+        # New row carries the aggregated cost.
+        new_row = db.execute(
+            "SELECT cell_cost_usd FROM cells WHERE eval_id = 'e1'"
+        ).fetchone()
+        assert new_row[0] is not None
+    finally:
+        db.close()
+
+
+def test_runwriter_refuses_future_schema(tmp_path):
+    """A run.sqlite written by a newer topofuzz (PRAGMA user_version > 2)
+    must NOT be silently downgraded — refuse with a clear error."""
+    topo = _toy_topology(n=1)
+    db_path = tmp_path / "run.sqlite"
+
+    legacy = sqlite3.connect(str(db_path))
+    try:
+        legacy.executescript("""
+            PRAGMA user_version = 99;
+            CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY,
+                topology_canonical_hash TEXT NOT NULL,
+                topology_name TEXT NOT NULL,
+                tds_version TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE TABLE cells (run_id TEXT, variant_id TEXT, eval_id TEXT,
+                ir_canonical_hash TEXT, node_outputs_json TEXT, error TEXT,
+                cell_cost_usd REAL, future_column TEXT,
+                PRIMARY KEY (run_id, variant_id, eval_id));
+            CREATE TABLE judge_results (run_id TEXT, variant_id TEXT, eval_id TEXT,
+                judge_kind TEXT, score_value REAL, passed INTEGER, rationale TEXT,
+                failure_reason TEXT,
+                PRIMARY KEY (run_id, variant_id, eval_id));
+        """)
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    with pytest.raises(RuntimeError, match="newer topofuzz"):
+        RunWriter(tmp_path, "run-x", topo)
+
+
+def test_cost_for_call_blended_rate():
+    from fuzzeval.costest import cost_for_call
+
+    # gemini-2.5-pro: 0.020 / 1K
+    assert abs(
+        cost_for_call("google/gemini-2.5-pro", 1000, 500) - (1500 * 0.020 / 1000.0)
+    ) < 1e-9
+
+
+def test_cost_for_call_unknown_model_returns_none():
+    from fuzzeval.costest import cost_for_call
+
+    assert cost_for_call("unknown/model-xyz", 100, 50) is None
+
+
+def test_cost_for_call_missing_tokens_returns_none():
+    from fuzzeval.costest import cost_for_call
+
+    assert cost_for_call("google/gemini-2.5-pro", None, 50) is None
+    assert cost_for_call("google/gemini-2.5-pro", 100, None) is None
+
+
+def test_cost_for_call_rejects_bool_and_negative():
+    from fuzzeval.costest import cost_for_call
+
+    assert cost_for_call("google/gemini-2.5-pro", True, 50) is None
+    assert cost_for_call("google/gemini-2.5-pro", 100, -1) is None
+    assert cost_for_call("google/gemini-2.5-pro", 100, 1.5) is None  # type: ignore[arg-type]

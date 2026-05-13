@@ -85,6 +85,7 @@ from typing import Any
 
 from fuzzeval.cache import JudgeCache, LLMCache
 from fuzzeval.canonical import canonical_hash
+from fuzzeval.costest import cost_for_call
 from fuzzeval.judge import BinaryScore, ContinuousScore, Judge, JudgeResult
 from topofuzz.ir import Node, Topology
 
@@ -103,6 +104,19 @@ class NodeOutput:
     ``model_served_version`` is the LiteLLM ``response.model`` value (or
     the resolver's prediction on a cache hit). ``cache_hit=True`` means
     the response came from ``LLMCache`` and was not billed.
+
+    **Token / cost fields are optional.** They are populated only when the
+    underlying ``llm_callable`` returned a ``usage`` payload (LiteLLM
+    ``ModelResponse.usage`` / dict ``"usage"``). They are ``None`` on:
+
+    * cache hits (the response was not billed — see :class:`fuzzeval.cache.LLMCache`),
+    * responses without ``usage`` (older mocks, providers that don't report it),
+    * models absent from :data:`fuzzeval.costest._RATE_USD_PER_1K`
+      (``cost_usd`` is ``None`` even when token counts are present).
+
+    Step 6's ``--max-cost-usd`` cap aggregates non-``None`` ``cost_usd`` values
+    across cells. A run that mixes priced + un-priced models will under-count;
+    surface this in the CLI's first-run warning.
     """
 
     node_id: str
@@ -111,6 +125,9 @@ class NodeOutput:
     model_served_version: str
     cache_hit: bool
     latency_ms: int
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cost_usd: float | None = None
 
 
 @dataclass(frozen=True)
@@ -355,6 +372,9 @@ async def run_variant(
         if llm_cache is not None:
             cached_bytes = llm_cache.get(identity)
 
+        input_tokens: int | None = None
+        output_tokens: int | None = None
+        cost_usd: float | None = None
         if cached_bytes is not None:
             response_text = cached_bytes.decode("utf-8")
             served_version = predicted_served
@@ -366,6 +386,10 @@ async def run_variant(
                 response = await _call_llm(node, prompt, llm_callable)
                 latency_ms = int((time.monotonic() - started) * 1000)
             response_text, actual_served = _extract_text_and_served(response)
+            input_tokens, output_tokens = _extract_usage(response)
+            cost_usd = cost_for_call(
+                node.llm_config.model, input_tokens, output_tokens
+            )
 
             # Cache under the resolver's prediction (also the lookup key) so
             # subsequent runs hit. The §7 spec text says "key on served
@@ -398,6 +422,9 @@ async def run_variant(
                 model_served_version=served_version,
                 cache_hit=cache_hit,
                 latency_ms=latency_ms,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost_usd=cost_usd,
             )
         )
 
@@ -491,6 +518,60 @@ def _extract_text_and_served(response: Any) -> tuple[str, str]:
     return text, str(served or "")
 
 
+def _extract_usage(response: Any) -> tuple[int | None, int | None]:
+    """Pull (input_tokens, output_tokens) from a LiteLLM-shaped response.
+
+    Returns ``(None, None)`` when ``usage`` is absent or malformed — the
+    runner treats missing usage as "not billable from telemetry" and
+    leaves :class:`NodeOutput.cost_usd` ``None``. This is intentional: a
+    cost-cap that silently substitutes zeros for missing token counts
+    would overrun the cap on un-instrumented runs.
+
+    Accepts the LiteLLM names (``prompt_tokens`` / ``completion_tokens``)
+    and the OpenAI-Python-SDK aliases (``input_tokens`` / ``output_tokens``).
+    Both dict envelopes and attribute-bearing objects are supported.
+    """
+    usage: Any = None
+    if isinstance(response, dict):
+        usage = response.get("usage")
+    else:
+        usage = getattr(response, "usage", None)
+    if usage is None:
+        return None, None
+
+    def _get(field_pair: tuple[str, str]) -> int | None:
+        for name in field_pair:
+            if isinstance(usage, dict):
+                if name in usage:
+                    val = usage[name]
+                    break
+            else:
+                if hasattr(usage, name):
+                    val = getattr(usage, name)
+                    break
+        else:
+            return None
+        if val is None or isinstance(val, bool):
+            return None
+        # Some older provider proxies wrap usage values as strings.
+        # Coerce; reject anything that fails int() — strings like "100"
+        # become 100, "1.5" or "abc" become None (audit m-8).
+        if isinstance(val, str):
+            try:
+                val = int(val)
+            except ValueError:
+                return None
+        if not isinstance(val, int):
+            return None
+        if val < 0:
+            return None
+        return val
+
+    return _get(("prompt_tokens", "input_tokens")), _get(
+        ("completion_tokens", "output_tokens")
+    )
+
+
 def _eval_row_hash(eval_row: dict) -> str:
     """Stable hash of the entire eval_row.
 
@@ -578,12 +659,21 @@ async def _run_judge(
 # ---------------------------------------------------------------------------
 
 
-# Schema version bumps require a migration path. v0.5.0 = 1. Any column
-# add or rename must increment and ship a migration in `topofuzz migrate`.
-_SCHEMA_VERSION = 1
+# Schema version bumps require a migration path. v0.5.0 step 5 = 1.
+# Step 6 = 2 (cost telemetry: cells.cell_cost_usd). Any column add or
+# rename must increment and either (a) ship a migration in `topofuzz
+# migrate`, or (b) inline a one-shot ALTER in :func:`_migrate` for a
+# small step bump pre-launch. The full migrate command is tracked as a
+# step-6 readiness gap; pre-launch we ALTER inline.
+#
+# Schema DDL deliberately omits ``PRAGMA user_version``. The PRAGMA is
+# written by :func:`_migrate` after CREATE/ALTER finishes, so the
+# pre-existing user_version (0 for fresh DBs, 1 for legacy step-5 DBs,
+# 99+ for a hypothetical future DB) is observable when migrate decides
+# whether to ALTER or refuse.
+_SCHEMA_VERSION = 2
 
-_SCHEMA = f"""
-PRAGMA user_version = {_SCHEMA_VERSION};
+_SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY,
     topology_canonical_hash TEXT NOT NULL,
@@ -598,6 +688,7 @@ CREATE TABLE IF NOT EXISTS cells (
     ir_canonical_hash TEXT NOT NULL,
     node_outputs_json TEXT NOT NULL,
     error TEXT,
+    cell_cost_usd REAL,
     PRIMARY KEY (run_id, variant_id, eval_id)
 );
 CREATE TABLE IF NOT EXISTS judge_results (
@@ -612,6 +703,48 @@ CREATE TABLE IF NOT EXISTS judge_results (
     PRIMARY KEY (run_id, variant_id, eval_id)
 );
 """
+
+
+def _check_supported_schema(db: sqlite3.Connection) -> None:
+    """Refuse to open a run.sqlite written by a newer topofuzz.
+
+    Run BEFORE :data:`_SCHEMA` so a forward-compat user_version isn't
+    overwritten before we look at it.
+    """
+    current = db.execute("PRAGMA user_version").fetchone()[0]
+    if current > _SCHEMA_VERSION:
+        raise RuntimeError(
+            f"run.sqlite was written by a newer topofuzz "
+            f"(schema {current} > supported {_SCHEMA_VERSION}). "
+            "Downgrade refused; upgrade topofuzz to read this run."
+        )
+
+
+def _migrate(db: sqlite3.Connection) -> None:
+    """Run any pre-launch in-place migrations.
+
+    Pre-launch (v0.5.0.dev*) we inline column adds rather than ship a
+    full ``topofuzz migrate`` command — there are no shipped DBs in the
+    wild. Each migration is idempotent so a fresh DB (where CREATE TABLE
+    already produced the v2 column set) is a no-op.
+
+    Called AFTER :data:`_SCHEMA` runs CREATE TABLE IF NOT EXISTS. For
+    fresh DBs the table already has the v2 column set; for legacy v1
+    DBs the table is the v1 shape and needs ALTER.
+    """
+    current = db.execute("PRAGMA user_version").fetchone()[0]
+    # _check_supported_schema already refused current > _SCHEMA_VERSION
+    # before CREATE TABLE ran; assert defends against caller drift.
+    assert current <= _SCHEMA_VERSION, "forward-version slipped past check"
+    if current < 2:
+        cols = {
+            row[1]
+            for row in db.execute("PRAGMA table_info(cells)").fetchall()
+        }
+        if "cell_cost_usd" not in cols:
+            db.execute("ALTER TABLE cells ADD COLUMN cell_cost_usd REAL")
+    db.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+    db.commit()
 
 
 def _judge_row(
@@ -633,6 +766,25 @@ def _judge_row(
         passed = 1 if cell.judge_result.passed else 0
         return "binary", None, passed, cell.judge_result.rationale, None
     return "absent", None, None, None, None
+
+
+def _cell_cost_usd(cell: Cell) -> float | None:
+    """Sum non-``None`` ``cost_usd`` across a cell's NodeOutputs.
+
+    Returns ``None`` only when **every** node lacks cost telemetry (all
+    cache hits, all un-priced models, or all without ``usage``). Returns
+    ``0.0`` for a degenerate empty-outputs cell (e.g. cancellation before
+    the first node) so downstream "sum cell costs" math stays in float
+    space without a None branch per cell. A cell with one priced node
+    and one un-priced node returns the priced node's cost — the un-priced
+    node contributes 0; surface this in the CLI's first-run warning.
+    """
+    if not cell.node_outputs:
+        return None
+    contributions = [o.cost_usd for o in cell.node_outputs if o.cost_usd is not None]
+    if not contributions:
+        return None
+    return float(sum(contributions))
 
 
 def _judge_to_jsonable(cell: Cell) -> dict | None:
@@ -720,7 +872,9 @@ class RunWriter:
         self._jsonl: Any = None
         try:
             self._db = sqlite3.connect(str(self._run_dir / "run.sqlite"))
+            _check_supported_schema(self._db)
             self._db.executescript(_SCHEMA)
+            _migrate(self._db)
             self._init_runs_row(run_id, topology)
             self._jsonl = (self._run_dir / "traces.jsonl").open(
                 "a", encoding="utf-8"
@@ -792,6 +946,8 @@ class RunWriter:
         node_dicts = [asdict(o) for o in cell.node_outputs]
         node_outputs_json = json.dumps(node_dicts, ensure_ascii=False)
 
+        cell_cost = _cell_cost_usd(cell)
+
         record = {
             "run_id": self._run_id,
             "variant_id": cell.variant_id,
@@ -802,12 +958,16 @@ class RunWriter:
             "judge_failure": cell.judge_failure,
             "judge_failure_reason": cell.judge_failure_reason,
             "error": cell.error,
+            "cell_cost_usd": cell_cost,
         }
         self._jsonl.write(json.dumps(record, ensure_ascii=False) + "\n")
         self._jsonl.flush()
 
         self._db.execute(
-            "INSERT OR REPLACE INTO cells VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO cells "
+            "(run_id, variant_id, eval_id, ir_canonical_hash, "
+            " node_outputs_json, error, cell_cost_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 self._run_id,
                 cell.variant_id,
@@ -815,6 +975,7 @@ class RunWriter:
                 cell.ir_canonical_hash,
                 node_outputs_json,
                 cell.error,
+                cell_cost,
             ),
         )
         kind, score_value, passed, rationale, failure_reason = _judge_row(cell)
