@@ -270,6 +270,383 @@ def test_round_robin_select_zero_total():
 
 
 # ---------------------------------------------------------------------------
+# Step 20a — edge-validity warning (RT audit option C)
+#
+# ``order_swap`` is edge-blind in v0.5: it permutes the node tuple without
+# consulting ``topology.edges``. ``_variant_violates_edges`` lets the CLI
+# count how many selected variants execute agents in an order that violates
+# the graph's data dependencies, so the limitation is surfaced rather than
+# buried. See packages/topofuzz/BACKLOG.md "Step 20a — order_swap is
+# edge-blind on linear-chain fixtures".
+# ---------------------------------------------------------------------------
+
+
+def _linear_chain_topology():
+    """A strict 4-node linear chain ``a -> b -> c -> d``.
+
+    Only one of the 24 node orderings is edge-valid — the worst case for
+    edge-blind ``order_swap``, mirroring the packaged ``lending_4role``
+    fixture.
+    """
+    from topofuzz.ir import Edge, Node, Topology
+
+    nodes = tuple(Node(id=i, role=i) for i in ("a", "b", "c", "d"))
+    edges = (
+        Edge(from_id="a", to_id="b"),
+        Edge(from_id="b", to_id="c"),
+        Edge(from_id="c", to_id="d"),
+    )
+    return Topology(
+        name="linear-chain",
+        nodes=nodes,
+        edges=edges,
+        entrypoint="a",
+        terminal=("d",),
+    )
+
+
+def test_variant_violates_edges_valid_ordering_not_flagged():
+    """The identity / declared ordering respects every edge → not flagged."""
+    from topofuzz.cli import _variant_violates_edges
+
+    topo = _linear_chain_topology()
+    assert _variant_violates_edges(topo, topo.edges) is False
+
+
+def test_variant_violates_edges_original_never_flagged():
+    """order_swap emits the original unchanged at index 0. For a fixture
+    DECLARED in dependency order (like this linear chain) the original is
+    edge-valid, so ``_variant_violates_edges`` returns False for it.
+
+    NOTE this holds because the nodes are declared in dependency order,
+    NOT by any adapter-enforced invariant (the adapter preserves
+    declaration order — B-1 audit finding). A fixture declared out of
+    dependency order makes its own original edge-invalid; that branch is
+    covered by ``test_run_warns_when_original_topology_is_edge_invalid``.
+    """
+    from topofuzz.cli import _variant_violates_edges
+    from topofuzz.variants.generators import order_swap
+
+    topo = _linear_chain_topology()
+    original = order_swap(topo, rng_seed=0)[0]
+    assert original is topo
+    assert _variant_violates_edges(original, topo.edges) is False
+
+
+def test_variant_violates_edges_backwards_ordering_flagged():
+    """An ordering where an edge's destination precedes its source
+    (here ``d`` before ``c``/``b``/``a``) violates the data deps."""
+    from topofuzz.cli import _variant_violates_edges
+    from topofuzz.ir import Topology
+
+    topo = _linear_chain_topology()
+    # Reverse the chain: d, c, b, a — every edge now runs backwards.
+    scrambled = Topology(
+        name=topo.name,
+        nodes=tuple(reversed(topo.nodes)),
+        edges=topo.edges,
+        entrypoint=topo.entrypoint,
+        terminal=topo.terminal,
+    )
+    assert _variant_violates_edges(scrambled, topo.edges) is True
+
+
+def test_variant_violates_edges_branchy_valid_orderings_not_flagged():
+    """A branchy topology legitimately has many valid orderings — only
+    genuinely edge-violating ones are flagged, not every permutation."""
+    from topofuzz.cli import _variant_violates_edges
+    from topofuzz.ir import Edge, Node, Topology
+
+    # Diamond: root -> {left, right} -> sink.
+    nodes_by_id = {i: Node(id=i, role=i) for i in ("root", "left", "right", "sink")}
+    edges = (
+        Edge(from_id="root", to_id="left"),
+        Edge(from_id="root", to_id="right"),
+        Edge(from_id="left", to_id="sink"),
+        Edge(from_id="right", to_id="sink"),
+    )
+
+    def _topo(order):
+        return Topology(
+            name="diamond",
+            nodes=tuple(nodes_by_id[i] for i in order),
+            edges=edges,
+            entrypoint="root",
+            terminal=("sink",),
+        )
+
+    # Both of these respect root-before-{left,right}-before-sink.
+    assert _variant_violates_edges(
+        _topo(("root", "left", "right", "sink")), edges
+    ) is False
+    assert _variant_violates_edges(
+        _topo(("root", "right", "left", "sink")), edges
+    ) is False
+    # But swapping a child ahead of root violates an edge.
+    assert _variant_violates_edges(
+        _topo(("left", "root", "right", "sink")), edges
+    ) is True
+
+
+def test_variant_violates_edges_self_loop_is_valid():
+    """A self-loop edge (from_id == to_id) has equal positions — equal
+    is not 'backwards', so it must not be flagged."""
+    from topofuzz.cli import _variant_violates_edges
+    from topofuzz.ir import Edge, Node, Topology
+
+    topo = Topology(
+        name="self-loop",
+        nodes=(Node(id="a", role="a"), Node(id="b", role="b")),
+        edges=(Edge(from_id="a", to_id="a"), Edge(from_id="a", to_id="b")),
+        entrypoint="a",
+        terminal=("b",),
+    )
+    assert _variant_violates_edges(topo, topo.edges) is False
+
+
+def test_run_warns_on_edge_invalid_variants_linear_chain(tmp_path, monkeypatch):
+    """End-to-end: a ``run`` against the linear-chain lending fixture
+    selects ``order_swap`` permutations that violate the data deps, and
+    the CLI emits the single-line edge-blindness warning to stderr.
+
+    The orchestrator is monkey-patched to avoid the network; the warning
+    fires at variant-selection time, well before kickoff.
+    """
+    pytest.importorskip("langgraph")
+
+    from importlib import resources
+
+    # Use the packaged linear-chain lending fixture — exactly the
+    # worst-case topology the RT audit flagged.
+    fixture_res = resources.files("topofuzz").joinpath(
+        "fixtures/lending_4role.py"
+    )
+    eval_path = tmp_path / "e.jsonl"
+    eval_path.write_text(
+        '{"id": "e1", "input": "x", "ground_truth_decision": "approve"}\n',
+        encoding="utf-8",
+    )
+
+    async def fake_llm(**kwargs):
+        return {
+            "choices": [{"message": {"content": "ok"}}],
+            "model": kwargs["model"],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5},
+        }
+
+    from topofuzz import orchestrator as orch_mod
+    real_execute_run = orch_mod.execute_run
+
+    async def execute_run_with_fake(plan, **kwargs):
+        kwargs.setdefault("llm_callable", fake_llm)
+        return await real_execute_run(plan, **kwargs)
+
+    monkeypatch.setattr(orch_mod, "execute_run", execute_run_with_fake)
+
+    with resources.as_file(fixture_res) as fixture_path:
+        result = CliRunner().invoke(
+            app,
+            [
+                "run",
+                f"{fixture_path}:build_graph",
+                "--eval", str(eval_path),
+                "--n", "1",
+                # 8 variants → enough order_swap perms get selected that
+                # at least one violates the strict a->b->c->d chain.
+                "--variants", "8",
+                "--out", str(tmp_path / "runs"),
+                "--no-cache",
+                "--dry-run",
+                "--rng-seed", "0",
+                "--yes",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    import re
+
+    # Single-line warning, topofuzz: prefix, names the BLUEPRINT section.
+    # The count is over the PERMUTED variants (the original is excluded
+    # and reported separately — B-1 audit fix).
+    assert re.search(
+        r"topofuzz:\s+\d+\s+of\s+\d+\s+permuted\s+variants\s+execute\s+"
+        r"agents\s+in\s+an\s+order\s+that\s+violates\s+the\s+graph's\s+"
+        r"data\s+dependencies",
+        result.output,
+    ), f"edge-blindness warning missing. Output:\n{result.output}"
+    assert "order_swap is edge-blind" in result.output
+    assert "scrambled-information-flow" in result.output
+
+
+def test_run_no_edge_warning_on_single_variant(tmp_path, monkeypatch):
+    """``--variants 1`` selects only the original. For the lending
+    fixture — declared in dependency order — the original is edge-valid,
+    so NEITHER edge-validity warning fires (no permuted variants, and
+    the original is clean). The two ``not in`` asserts below pin that
+    premise: if the lending fixture were ever re-declared out of
+    dependency order the 'original topology' warning would fire and this
+    test would catch it."""
+    pytest.importorskip("langgraph")
+
+    from importlib import resources
+
+    fixture_res = resources.files("topofuzz").joinpath(
+        "fixtures/lending_4role.py"
+    )
+    eval_path = tmp_path / "e.jsonl"
+    eval_path.write_text(
+        '{"id": "e1", "input": "x", "ground_truth_decision": "approve"}\n',
+        encoding="utf-8",
+    )
+
+    async def fake_llm(**kwargs):
+        return {
+            "choices": [{"message": {"content": "ok"}}],
+            "model": kwargs["model"],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5},
+        }
+
+    from topofuzz import orchestrator as orch_mod
+    real_execute_run = orch_mod.execute_run
+
+    async def execute_run_with_fake(plan, **kwargs):
+        kwargs.setdefault("llm_callable", fake_llm)
+        return await real_execute_run(plan, **kwargs)
+
+    monkeypatch.setattr(orch_mod, "execute_run", execute_run_with_fake)
+
+    with resources.as_file(fixture_res) as fixture_path:
+        result = CliRunner().invoke(
+            app,
+            [
+                "run",
+                f"{fixture_path}:build_graph",
+                "--eval", str(eval_path),
+                "--n", "1",
+                "--variants", "1",
+                "--out", str(tmp_path / "runs"),
+                "--no-cache",
+                "--dry-run",
+                "--yes",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    # No permuted variants → no order_swap edge-blindness warning.
+    assert "permuted variants execute agents" not in result.output
+    # And the lending fixture's original is edge-valid → no 'original
+    # topology' warning either. This second assert pins the premise.
+    assert (
+        "the original topology's own node order violates"
+        not in result.output
+    )
+
+
+def _out_of_order_topology():
+    """A 2-node topology DECLARED out of dependency order: ``nodes`` is
+    ``(b, a)`` but the only edge is ``a -> b``.
+
+    The adapter preserves ``add_node`` declaration order and does NOT
+    topologically sort, so a real fixture declared like this produces a
+    topology whose own original node order violates its edges. Used to
+    exercise the separate 'original topology' warning branch (B-1 audit
+    fix) — distinct from the order_swap edge-blindness warning.
+    """
+    from topofuzz.ir import Edge, LLMConfig, Node, Topology
+
+    cfg = LLMConfig(model="google/gemini-2.5-flash", temperature=0.0)
+    return Topology(
+        name="out-of-order",
+        nodes=(
+            Node(id="b", role="b", llm_config=cfg),
+            Node(id="a", role="a", llm_config=cfg),
+        ),
+        edges=(Edge(from_id="a", to_id="b"),),
+        entrypoint="a",
+        terminal=("b",),
+    )
+
+
+def test_run_warns_when_original_topology_is_edge_invalid(tmp_path, monkeypatch):
+    """End-to-end: when the loaded topology's OWN declared node order
+    violates its edges (nodes declared out of dependency order, or a
+    cycle), the CLI emits the separate 'original topology' warning — NOT
+    the order_swap edge-blindness warning, which would misdiagnose a
+    fixture/topology issue as an order_swap artifact (B-1 audit fix).
+
+    ``load_topology`` is monkey-patched to return a deliberately
+    out-of-order topology; the warning fires at variant-selection time.
+    """
+    pytest.importorskip("langgraph")
+
+    from importlib import resources
+
+    fixture_res = resources.files("topofuzz").joinpath(
+        "fixtures/lending_4role.py"
+    )
+    eval_path = tmp_path / "e.jsonl"
+    eval_path.write_text(
+        '{"id": "e1", "input": "x", "ground_truth_decision": "approve"}\n',
+        encoding="utf-8",
+    )
+
+    # load_topology is imported lazily inside `run` via
+    # `from topofuzz.loaders import load_topology` — patch the source
+    # module attribute so the lazy import resolves to the fake.
+    from topofuzz import loaders as loaders_mod
+
+    monkeypatch.setattr(
+        loaders_mod,
+        "load_topology",
+        lambda _fixture: _out_of_order_topology(),
+    )
+
+    async def fake_llm(**kwargs):
+        return {
+            "choices": [{"message": {"content": "ok"}}],
+            "model": kwargs["model"],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5},
+        }
+
+    from topofuzz import orchestrator as orch_mod
+
+    real_execute_run = orch_mod.execute_run
+
+    async def execute_run_with_fake(plan, **kwargs):
+        kwargs.setdefault("llm_callable", fake_llm)
+        return await real_execute_run(plan, **kwargs)
+
+    monkeypatch.setattr(orch_mod, "execute_run", execute_run_with_fake)
+
+    with resources.as_file(fixture_res) as fixture_path:
+        result = CliRunner().invoke(
+            app,
+            [
+                "run",
+                f"{fixture_path}:build_graph",
+                "--eval", str(eval_path),
+                "--n", "1",
+                "--variants", "1",
+                "--out", str(tmp_path / "runs"),
+                "--no-cache",
+                "--dry-run",
+                "--yes",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    # The separate 'original topology' warning fires...
+    assert (
+        "the original topology's own node order violates" in result.output
+    ), f"original-edge-invalid warning missing. Output:\n{result.output}"
+    # ...and it is correctly NOT attributed to order_swap.
+    assert "order_swap is edge-blind" not in result.output
+    # ...and the permuted-variant warning does not fire (permuted is
+    # empty at --variants 1).
+    assert "permuted variants execute agents" not in result.output
+
+
+# ---------------------------------------------------------------------------
 # True CLI end-to-end (audit M-2 second pass)
 # ---------------------------------------------------------------------------
 

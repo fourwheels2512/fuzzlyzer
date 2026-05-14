@@ -29,7 +29,7 @@ import signal
 from contextlib import ExitStack
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import typer
 
@@ -44,6 +44,12 @@ from fuzzeval.keys import (
 
 from topofuzz import __version__
 from topofuzz.attest import load_and_verify_attestation
+
+if TYPE_CHECKING:
+    # Annotation-only — `from __future__ import annotations` keeps these
+    # out of the runtime import graph, so the verify-only install stays
+    # langgraph-free (see the heavy-import note below).
+    from topofuzz.ir import Edge, Topology
 
 # Heavy imports (orchestrator, loaders, fuzzeval.judge, topofuzz.runids,
 # topofuzz.variants) are lazy — pulled inside :func:`run` and the kickoff
@@ -137,6 +143,58 @@ def _round_robin_select(
             if len(selected) >= total:
                 break
     return selected
+
+
+def _variant_violates_edges(
+    variant: "Topology", edges: "tuple[Edge, ...]"
+) -> bool:
+    """True if ``variant``'s node order violates the graph's data deps.
+
+    The §7 runner executes ``variant.nodes`` in tuple order, but
+    ``order_swap`` permutes that tuple WITHOUT consulting ``topology.edges``
+    (it is edge-blind in v0.5 — BLUEPRINT §6; the edge-aware fix is RT
+    option B, deferred to v0.5.1). So a permuted variant can execute an
+    edge's destination node *before* its source — the destination agent
+    runs on a scrambled / partial information flow.
+
+    The predicate: for every edge ``(from_id, to_id)``, the position of
+    ``from_id`` in the variant's node order must come strictly before the
+    position of ``to_id``. If any edge runs backwards, the variant is
+    edge-invalid.
+
+    Applies to ANY topology, including the original (index 0): the
+    adapter builds ``nodes`` from LangGraph's ``get_graph()`` emission
+    order — i.e. ``add_node`` *declaration* order — and does NOT
+    topologically sort (see ``adapter.py`` and the
+    ``test_nodes_in_declared_order`` adapter test). So the original is
+    edge-valid only by the *fixture-authoring convention* of declaring
+    nodes in dependency order, NOT by an adapter-enforced invariant. A
+    fixture declared out of dependency order — or a cyclic topology, for
+    which no linearisation is valid — makes the original itself
+    edge-invalid; callers must not assume index 0 is always clean.
+
+    A self-loop edge (``from_id == to_id``) is treated as valid — equal
+    positions are not "backwards". ``edges`` whose endpoints are all in
+    ``variant.nodes`` is the contract: the Topology ``@model_validator``
+    rejects *dangling* edges at construction, and all three v0.5 variant
+    generators preserve the node-id set, so every current caller honours
+    it. A future caller that adds/removes nodes would violate it — hence
+    the explicit ``ValueError`` rather than a bare ``KeyError``.
+    """
+    position = {node.id: idx for idx, node in enumerate(variant.nodes)}
+    for edge in edges:
+        try:
+            from_pos, to_pos = position[edge.from_id], position[edge.to_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"edge {edge.from_id!r}->{edge.to_id!r} references a node "
+                f"absent from variant.nodes {tuple(position)!r}"
+            ) from exc
+        if from_pos > to_pos:
+            return True
+    return False
+
+
 _RESERVED_FLAG_EXIT = 2
 _NOT_IMPLEMENTED_EXIT = 2
 _BAD_USAGE_EXIT = 2
@@ -568,6 +626,54 @@ def run(
         family_pools=(ord_perms, role_list, dec_list),
         total=variants,
     )
+
+    # Edge-validity warnings (RT audit option C). ``order_swap`` is
+    # edge-blind in v0.5 — it permutes the node tuple without consulting
+    # ``topology.edges`` (BLUEPRINT §6; edge-aware generation is deferred
+    # to v0.5.1). On a near-linear-chain topology most permuted variants
+    # execute agents in an order that violates the graph's own data
+    # dependencies. The runner does NOT crash on these (topofuzz bypasses
+    # LangGraph's edge-driven scheduler) — the destination agent simply
+    # runs on a scrambled / partial information flow, so the verdict-flip
+    # signal from those variants mixes a real topology effect with a
+    # scrambled-information-flow artifact. Surface the count so the
+    # limitation is visible, not buried. WARNING ONLY — we do not block,
+    # filter, or change the exit code.
+    #
+    # The original is checked SEPARATELY from the permuted variants. The
+    # adapter preserves ``add_node`` declaration order and does NOT
+    # topologically sort (see ``adapter.py`` + the
+    # ``test_nodes_in_declared_order`` test), so a fixture declared out
+    # of dependency order — or a cyclic topology — makes the original
+    # itself edge-invalid. That is a fixture/topology issue, NOT an
+    # order_swap artifact, so it gets its own message; folding it into
+    # the order_swap count would misdiagnose it. Both warnings fire in
+    # every run mode including ``--dry-run``: edge-invalidity is a
+    # structural property of the variant set, true regardless of whether
+    # the run bills LLM calls, so a user validating their setup with
+    # ``--dry-run`` should still see it.
+    if _variant_violates_edges(original, topology.edges):
+        typer.echo(
+            "topofuzz: the original topology's own node order violates its "
+            "data dependencies — the runner will execute the baseline on a "
+            "scrambled information flow. This is a fixture/topology issue "
+            "(nodes declared out of dependency order, or a cycle), not an "
+            "order_swap artifact.",
+            err=True,
+        )
+    permuted = variant_list[1:]
+    edge_invalid_count = sum(
+        1 for v in permuted if _variant_violates_edges(v, topology.edges)
+    )
+    if edge_invalid_count:
+        typer.echo(
+            f"topofuzz: {edge_invalid_count} of {len(permuted)} permuted "
+            "variants execute agents in an order that violates the graph's "
+            "data dependencies (order_swap is edge-blind in v0.5 — see "
+            "BLUEPRINT §6). The verdict-flip signal from those variants "
+            "includes a scrambled-information-flow component.",
+            err=True,
+        )
 
     run_id = new_run_id()
     # Resolve --out at parse time (audit O-3) so the manifest records an
