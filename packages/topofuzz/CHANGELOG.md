@@ -12,6 +12,50 @@ placeholder version and are not separately enumerated.
 
 ### Added
 
+- **Flip-composition donut + per-eval variance sparkline** (Weekend 7
+  step 18.5b, commit `9c722ec`). Two new hand-rolled SVG panels in
+  the HTML report per the Variant D editorial-condensed sketch
+  (`.planning/sketches/001-report-redesign/`). The §14 donut renders
+  the signed `verdict_flip_rate.point` from `report.json` (donut
+  centre) and decomposes it into approve→deny vs deny→approve
+  splits computed live from `run.sqlite` (legend), with
+  drift-detection that surfaces a stale-mirror warning when the
+  signed and live numbers disagree by more than 0.005. The §9
+  sparkline plots `np.nanvar` per eval sorted descending, accent-
+  coloured at-or-above the §10a worst-case-candidate gate (sourced
+  from `topofuzz.metrics.worstcase.DEFAULT_VARIANCE_GATE`, inclusive
+  `>=` to match the promoter exactly). Both sections wrapped in
+  test-extractable HTML sentinel comments; H2 suppressed entirely
+  on disabled state to avoid a question-shaped void on pre-attest
+  runs. Two-pass dual audit across six dimensions (code, RT, legal,
+  blueprint+flow, UX/UI, cross-step) with all MAJOR + MINOR
+  findings fixed; deferred polish items tracked in `BACKLOG.md`.
+- **Variant D editorial-condensed report re-skin + pre-launch
+  hardening** (Weekend 7 step 18.5a, commits `4ca51bd` + `53af646`
+  + `ac28ac7` + `a44c56a`). Warm cream + serif editorial voice with
+  2-col metadata grid, 4-stat verdict box, accessibility (aria-label
+  + tabindex + focus ring) on tooltip terms. Pre-launch hardening:
+  CSP meta + Referrer-Policy `no-referrer` on every report; LLM
+  call timeout 60s default + 3600s ceiling via
+  `TOPOFUZZ_LLM_TIMEOUT_SECS`; log-discipline tightening (no PII
+  in `%s` args); CLI banner on `topofuzz run`. Legal: copyright
+  credit to Kiran Nayudu (personal); NEW `NOTICE` files for DSSE +
+  Sigstore Rekor schema + Acklam attribution.
+- **`--rekor` opt-in for Sigstore Public Good Instance** (Weekend 6
+  step 18, commit `4d9139d`). Stdlib-urllib-only Rekor client (no
+  `sigstore` PyPI dep). Bounded synchronous retry (~30s ceiling, 3
+  attempts). `[REKOR-DEFERRED]` banner on race-window failures.
+  Live-validated against `rekor.sigstore.dev` (uuid `108e91…56f`,
+  logIndex `1527092975`).
+- **§17 natural-language summary panel** (Weekend 6 step 17, commit
+  `25f3d79`). Prose verdict ("Your topology is **stable** /
+  **unstable**: X% of answers flipped...") sourced from the signed
+  `report.json` headline. Verdict-tiered styling
+  (`nls-stable` / `nls-unstable` / `nls-unavailable`).
+- **§10a worst-case viewer** (Weekend 6 step 16). Side-by-side
+  variant cards showing the largest-score-gap flipping pair per
+  eval, with per-node trace excerpts. Top-3 ranked by binary-verdict
+  flip count, gated by per-eval variance ≥ 0.1.
 - **Per-agent influence score (§6a)** (Weekend 5 step 15). New
   `topofuzz.metrics.compute_influence` computes
   `P(answer flips | A moved) − P(answer flips | A in same slot)`

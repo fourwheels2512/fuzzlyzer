@@ -265,3 +265,7 @@ v1.0.0 reference vectors.
   — threat model + standalone verifier.
 - [`CHANGELOG.md`](https://github.com/kirannayudu/topofuzz/blob/main/packages/topofuzz/CHANGELOG.md)
   — release history.
+- [`BACKLOG.md`](https://github.com/kirannayudu/topofuzz/blob/main/packages/topofuzz/BACKLOG.md)
+  — polish + hardening items deferred from prior steps; the
+  v0.5.1 punch list. Contributors closing items reference this
+  file in commit messages (`closes BACKLOG: <description>`).
