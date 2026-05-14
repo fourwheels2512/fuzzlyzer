@@ -11,11 +11,16 @@ cost. Observed cost on the v0.5 reference run: ~$1.20 at
 ~20%; the cost estimator under-estimates real Gemini Flash output cost
 by ~3-5x).
 
-The eval set + rubric live in this directory (``eval.csv`` and
-``rubric.txt``, both byte-copies of the packaged
-``topofuzz.fixtures.lending_eval.csv`` and
-``topofuzz.prompts.lending_judge.txt`` respectively) so the gallery
-entry is self-contained.
+The eval set + rubric live in this directory so the gallery entry is
+self-contained. ``eval.csv`` is a byte-copy of the packaged
+``topofuzz.fixtures.lending_eval.csv``. ``rubric.txt`` is a
+**verdict-extraction** rubric (the judge reports the pipeline's
+APPROVE/DENY verdict, score 10/0) — it deliberately DIVERGES from the
+packaged reasoning-quality ``topofuzz.prompts.lending_judge.txt``,
+which scored reasoning quality 0-10 and so could not feed the
+blueprint's verdict-flip metric (§9/§10a/§22 expect the score to
+encode the verdict). See ``.planning/verdict-flip-rootcause/`` and the
+step-20a measurement-integrity discipline note.
 """
 
 from __future__ import annotations

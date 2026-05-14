@@ -49,15 +49,27 @@ from topofuzz.metrics.kappa import (
     cohens_kappa_original_vs_permuted,
     cohens_kappa_vs_truth,
 )
+from topofuzz.metrics.confirmed_verdict_flip import (
+    ConfirmedVerdictFlipResult,
+    compute_confirmed_verdict_flip_rate,
+)
 from topofuzz.metrics.score_matrix import ScoreMatrixResult, read_score_matrix
 from topofuzz.metrics.status import classify_run_status
 from topofuzz.metrics.verdict_flip import (
     VerdictFlipResult,
     compute_verdict_flip_rate,
 )
+from topofuzz.metrics.verdict_stability import (
+    VerdictStabilityResult,
+    compute_verdict_stability,
+)
 from topofuzz.metrics.voo import (
     variance_across_orderings,
     variance_across_orderings_ci,
+)
+from topofuzz.metrics.voo_noise_floor import (
+    compute_voo_noise_floor,
+    voo_gate_passes,
 )
 from topofuzz.metrics.worstcase import (
     NodeOutputView,
@@ -70,6 +82,7 @@ from topofuzz.metrics.worstcase import (
 __all__ = [
     "AgentInfluence",
     "BalancedAccuracyDropResult",
+    "ConfirmedVerdictFlipResult",
     "ECRResult",
     "InfluenceComputation",
     "KappaResult",
@@ -78,6 +91,7 @@ __all__ = [
     "ScoreMatrixResult",
     "VariantSideView",
     "VerdictFlipResult",
+    "VerdictStabilityResult",
     "WorstCaseEntry",
     "WorstCasePanel",
     "align_orderings_to_matrix",
@@ -87,11 +101,15 @@ __all__ = [
     "cohens_kappa",
     "cohens_kappa_original_vs_permuted",
     "cohens_kappa_vs_truth",
+    "compute_confirmed_verdict_flip_rate",
     "compute_influence",
     "compute_verdict_flip_rate",
+    "compute_verdict_stability",
+    "compute_voo_noise_floor",
     "compute_worstcase_panel",
     "error_correction_rate",
     "read_score_matrix",
     "variance_across_orderings",
     "variance_across_orderings_ci",
+    "voo_gate_passes",
 ]

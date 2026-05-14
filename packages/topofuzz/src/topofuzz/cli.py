@@ -1278,6 +1278,144 @@ def repro(
 
 @app.command(
     context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+def confirm(
+    ctx: typer.Context,
+    run_dir: str = typer.Argument(
+        ...,
+        help="Run directory (contains manifest.json + run.sqlite).",
+    ),
+    repeats: int = typer.Option(
+        3,
+        "--repeats",
+        min=1,
+        help=(
+            "K — re-runs per screened flip candidate AND per reference "
+            "cell. Majority-vote over K separates the topology effect "
+            "from LLM noise."
+        ),
+    ),
+    max_cost_usd: float | None = typer.Option(
+        None,
+        "--max-cost-usd",
+        min=0.0,
+        help=(
+            "Soft-warn at 80%%, hard-stop at 100%%. None = uncapped. "
+            "Must be positive — a cap of 0 is a usage error (it would "
+            "hard-stop before the first repeat)."
+        ),
+    ),
+    judge_model: str | None = typer.Option(
+        None,
+        "--judge",
+        help=(
+            "Judge model id. Default: read from the run's manifest "
+            "(cli_args.judge)."
+        ),
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the confirmation prompt (the confirm pass bills real LLM calls).",
+    ),
+) -> None:
+    """Re-run screened verdict flips K times to separate topology from noise.
+
+    The pipeline is non-deterministic — re-running the SAME ordering
+    flips the verdict some fraction of the time. ``topofuzz confirm``
+    re-runs every screened flip candidate K times AND re-runs the
+    original variant K times per relevant eval, persisting every repeat
+    into the ``flip_confirmations`` table. The noise-corrected metrics
+    (``verdict_stability``, ``confirmed_verdict_flip_rate``,
+    ``voo_noise_floor``) then majority-vote over the K repeats.
+
+    Exit codes:
+
+    * 0 — confirm pass completed (possibly with partial results if the
+      cost cap tripped — that is surfaced in the summary, not the code).
+    * 2 — usage error (run_dir not a directory, missing / malformed
+      manifest, fixture can't be loaded).
+    """
+    _reject_reserved_flags(list(ctx.args))
+    _reject_unknown_extras(list(ctx.args))
+
+    run_dir_path = Path(run_dir)
+    if not run_dir_path.is_dir():
+        typer.echo(
+            f"topofuzz confirm: run_dir is not a directory: {run_dir}",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT)
+
+    # N-RT-2: ``--max-cost-usd 0`` is a usage error, not "free run". The
+    # hard-stop predicate is ``total_cost >= max_cost_usd``, so a cap of
+    # 0 trips on ``0 >= 0`` BEFORE the first repeat — an instantly
+    # degenerate partial pass that re-runs nothing. Reject it with a
+    # clear message rather than letting the operator get an empty result.
+    if max_cost_usd is not None and max_cost_usd <= 0.0:
+        typer.echo(
+            "topofuzz confirm: --max-cost-usd must be a positive amount "
+            "(a cap of 0 would hard-stop before the first repeat runs). "
+            "Omit the flag for an uncapped pass.",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT)
+
+    typer.echo(
+        "topofuzz: research tool, no warranty. The confirm pass re-runs "
+        "the pipeline and bills real LLM calls. See LICENSE.",
+        err=True,
+    )
+
+    # Lazy import: the confirm pass pulls the runtime stack (loaders →
+    # langgraph, runner → litellm, the variant generators). Keeping it
+    # out of module scope preserves the §11a verify-path-safe contract.
+    from topofuzz.confirm import ConfirmError, run_confirm_pass
+
+    if not yes:
+        if not typer.confirm(
+            f"Re-run screened flip candidates {repeats}× each "
+            f"(bills real LLM calls)?",
+            default=False,
+        ):
+            typer.echo("Aborted.")
+            raise typer.Exit(code=0)
+
+    try:
+        summary = run_confirm_pass(
+            run_dir_path,
+            repeats=repeats,
+            max_cost_usd=max_cost_usd,
+            judge_model=judge_model,
+        )
+    except ConfirmError as e:
+        typer.echo(f"topofuzz confirm: {e}", err=True)
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+
+    typer.echo("")
+    typer.echo(
+        f"Candidates found: {summary.n_candidates} "
+        f"({summary.n_candidate_variants} distinct variant(s))"
+    )
+    typer.echo(
+        f"Repeats run: {summary.reference_repeats_run} reference + "
+        f"{summary.candidate_repeats_run} candidate "
+        f"(K={summary.repeats})"
+    )
+    typer.echo(f"Cost (priced cells only): ${summary.total_cost_usd:.4f}")
+    if summary.partial:
+        typer.echo(
+            "Cost cap tripped; results are PARTIAL — re-run "
+            "`topofuzz confirm` to complete the remaining repeats."
+        )
+
+
+@app.command(
+    context_settings={
         # Reserved-flag rejection (§16 #2) is a universal policy across
         # every subcommand — keygen opts in for the same reason scan /
         # report / run / verify do: a user typing `topofuzz keygen --kms`

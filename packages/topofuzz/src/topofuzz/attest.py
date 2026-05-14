@@ -86,6 +86,7 @@ __all__ = [
     "compute_headline",
     "compute_influence_for_attestation",
     "compute_kappa_orig_vs_perm_for_attestation",
+    "compute_noise_floor_for_attestation",
     "compute_verdict_flip_for_attestation",
     "compute_voo_for_attestation",
     "emit_attestation",
@@ -163,6 +164,10 @@ def compute_headline(
     balanced_accuracy_drop: dict[str, Any] | None = None,
     judge_failure_rate: float | None = None,
     judge_independence: dict[str, Any] | None = None,
+    verdict_stability: float | None = None,
+    confirmed_verdict_flip_rate: dict[str, Any] | None = None,
+    voo_noise_floor: float | None = None,
+    confirm_note: str | None = None,
 ) -> dict[str, Any]:
     """Assemble the headline dict.
 
@@ -183,6 +188,31 @@ def compute_headline(
     introduced by step 15a (d); it is intentionally distinct from the
     legacy ``kappa`` field, which references κ-vs-truth.
 
+    Noise-floor fields (the ``topofuzz confirm`` pass):
+
+    * ``verdict_stability`` — fraction of eval_ids whose K reference
+      repeats agree on the verdict (the AFL "stability %" negative
+      control). Scalar in [0, 1].
+    * ``confirmed_verdict_flip_rate`` — ``{point, ci_lower, ci_upper,
+      confirmed, flaky, unstable_baseline, missing_baseline,
+      judge_failure_pairs, n_screened_pairs, degenerate_flag}``: the
+      noise-corrected flip rate (majority-vote-vs-majority-vote).
+    * ``voo_noise_floor`` — VOO over the K reference repeats of the
+      original variant; the updated §22 gate input is ``voo_ci_lower >
+      voo_noise_floor`` instead of ``> 0`` (no in-tree caller applies
+      the gate yet — the §22 CEO-PDF site is not built).
+    * ``confirm_note`` — a short human-readable string set ONLY when the
+      noise-floor metrics were suppressed for a recoverable reason (a
+      partial confirm pass, reconstruction drift, etc.). The recipient
+      shows this instead of a number. ``None`` in the normal case
+      (metrics populated, or no confirm pass run at all).
+
+    The three metric fields default to ``None`` and are populated only
+    when the run has a complete ``confirm`` pass (``confirm.json`` sidecar
+    present, ``partial: false``, ``n_unmatched_candidates: 0``). An absent
+    sidecar leaves them ``null`` with ``confirm_note=null`` — not a crash.
+    A partial pass leaves them ``null`` with a non-null ``confirm_note``.
+
     All step-15a fields default to ``None`` so pre-step-15a callers
     (and the v0.5 in-tree callsites that haven't been migrated yet)
     continue producing well-shaped headlines without the new metrics.
@@ -197,6 +227,10 @@ def compute_headline(
         "balanced_accuracy_drop": balanced_accuracy_drop,
         "judge_failure_rate": judge_failure_rate,
         "judge_independence": judge_independence,
+        "verdict_stability": verdict_stability,
+        "confirmed_verdict_flip_rate": confirmed_verdict_flip_rate,
+        "voo_noise_floor": voo_noise_floor,
+        "confirm_note": confirm_note,
         "n_successful_cells": int(n_successful_cells),
         "n_total_cells": int(n_total_cells),
         "n_variants": int(n_variants),
@@ -1139,6 +1173,273 @@ def compute_ba_drop_for_attestation(
     }
 
 
+def compute_noise_floor_for_attestation(
+    run_dir: Path,
+    run_id: str,
+    *,
+    n_resamples: int = 5000,
+    conf: float = 0.95,
+    seed: int | None = 0,
+) -> tuple[float | None, dict[str, Any] | None, float | None, str | None]:
+    """Best-effort noise-floor metrics from the ``confirm`` pass.
+
+    Returns the 4-tuple ``(verdict_stability, confirmed_verdict_flip_rate,
+    voo_noise_floor, note)`` for the headline. The first three elements
+    are ``None`` (and the function never raises) in every case below; the
+    ``note`` is a short human-readable string when the metrics were
+    suppressed for a *recoverable* reason (so the attestation can show it
+    instead of a number), else ``None``.
+
+    Suppression cases (per the B-RT-1 / M-RT-2 spec-owner decisions —
+    ``emits the inputs for the updated §22 gate; no in-tree caller
+    applies the gate yet``):
+
+    * **no ``confirm.json`` sidecar** → ``(None, None, None, None)``: no
+      confirm pass has been run. Stable nulls, no note.
+    * **``confirm.json`` ``partial: true``** → ``(None, None, None,
+      <note>)``: a cost-cap hard-stop left a ragged repeat block; the
+      majority vote cannot be taken honestly. The note tells the operator
+      to re-run ``topofuzz confirm`` to complete it.
+    * **``confirm.json`` ``n_unmatched_candidates > 0``** → same shape:
+      fixture / rng_seed drift meant some candidates produced zero
+      repeats; the confirm data is incomplete (audit M-RT-2).
+    * **untrustworthy sidecar** → ``(None, None, None, <note>)``: a
+      sidecar missing the load-bearing ``partial`` or ``repeats`` key, or
+      with a non-int / negative ``repeats`` / ``n_unmatched_candidates``,
+      cannot be trusted to gate the headline — refuse rather than
+      silently degrade to a looser mode (audit RT-3 / CR-MINOR-2/3).
+    * **sidecar ``repeats`` disagrees with the table** → same shape: a
+      persisted ``repeat_idx`` is out of the sidecar's declared K range,
+      so the sidecar is stale or tampered (audit RT-3).
+    * **disposition buckets do not sum to ``n_screened_pairs``** → same
+      shape: the ``confirmed_verdict_flip`` accounting is internally
+      inconsistent (audit N-RT-3).
+    * numpy / ``topofuzz.metrics`` unavailable → ``(None, None, None,
+      None)``.
+
+    Only when the sidecar exists and is trustworthy, ``partial`` is
+    false, ``n_unmatched_candidates`` is 0, and the table is consistent
+    with it are the three metrics computed and returned.
+
+    * ``verdict_stability`` — scalar in [0, 1] or ``None``.
+    * ``confirmed_verdict_flip_rate`` — ``{point, ci_lower, ci_upper,
+      confirmed, flaky, unstable_baseline, missing_baseline,
+      judge_failure_pairs, n_screened_pairs, degenerate_flag}`` or
+      ``None``.
+    * ``voo_noise_floor`` — scalar or ``None``.
+
+    The reads go through :func:`topofuzz.confirm.read_flip_confirmations`
+    / :func:`topofuzz.confirm.read_confirm_sidecar`; the metrics are the
+    pure functions in :mod:`topofuzz.metrics`.
+    """
+    log = logging.getLogger(__name__)
+    try:
+        import numpy as np  # noqa: F401 — numpy presence gate
+    except ImportError:
+        return None, None, None, None
+    try:
+        from topofuzz.confirm import (
+            ConfirmError,
+            read_confirm_sidecar,
+            read_flip_confirmations,
+        )
+        from topofuzz.metrics import (
+            compute_confirmed_verdict_flip_rate,
+            compute_verdict_stability,
+            compute_voo_noise_floor,
+        )
+        from topofuzz.repro import ReproError, find_all_flip_candidates
+    except ImportError as e:
+        log.warning(
+            "topofuzz.metrics/confirm unavailable; noise-floor metrics "
+            "skipped in attestation: %s", e,
+        )
+        return None, None, None, None
+
+    # B-RT-1: the sidecar is the source of truth for "was a confirm pass
+    # run, and did it complete?". Missing sidecar → no confirm pass →
+    # stable nulls. The flip_confirmations table existing-but-empty (a
+    # RunWriter created the table) is NOT a confirm pass.
+    try:
+        sidecar = read_confirm_sidecar(run_dir)
+    except ConfirmError as e:
+        # A corrupt sidecar is a real signal — surface it as a note
+        # rather than silently treating the run as un-confirmed.
+        log.warning("confirm.json unreadable in %s: %s", run_dir, e)
+        return None, None, None, (
+            "confirm.json present but unreadable — re-run `topofuzz "
+            "confirm` to regenerate it"
+        )
+    if sidecar is None:
+        # No confirm pass run. Stable nulls in the headline, no note.
+        return None, None, None, None
+
+    # CR-MINOR-2 / RT-3: ``partial`` is load-bearing — a missing key in
+    # an otherwise-valid sidecar means we cannot trust it. A truncated
+    # sidecar must REFUSE (note + null headline), not silently fall into
+    # the looser "treat as complete" path.
+    if "partial" not in sidecar:
+        return None, None, None, (
+            "confirm.json is missing the `partial` field — cannot trust "
+            "this sidecar; re-run `topofuzz confirm` to regenerate it"
+        )
+    if sidecar.get("partial") is True:
+        # B-RT-1(c): a partial confirm pass must NOT ship a confident
+        # noise-corrected number. Surface a note instead.
+        return None, None, None, (
+            "partial confirm pass — re-run `topofuzz confirm` to complete"
+        )
+    # CR-MINOR-3: JSON ``true``/``false`` are int subclasses, so a bare
+    # ``isinstance(x, int)`` accepts ``n_unmatched_candidates: true`` and
+    # then prints a cosmetically wrong "True screened candidate variant(s)"
+    # note. Require a real (non-bool) int; a bad value is an untrustworthy
+    # sidecar — refuse (consistent with RT-3), don't guess.
+    n_unmatched = sidecar.get("n_unmatched_candidates", 0)
+    if isinstance(n_unmatched, bool) or not isinstance(n_unmatched, int):
+        return None, None, None, (
+            "confirm.json `n_unmatched_candidates` is not an integer — "
+            "cannot trust this sidecar; re-run `topofuzz confirm`"
+        )
+    if n_unmatched < 0:
+        return None, None, None, (
+            "confirm.json `n_unmatched_candidates` is negative — cannot "
+            "trust this sidecar; re-run `topofuzz confirm`"
+        )
+    if n_unmatched > 0:
+        # M-RT-2: variant-reconstruction drift left some screened
+        # candidates with zero repeats — the confirm data is incomplete.
+        return None, None, None, (
+            f"{n_unmatched} screened candidate variant(s) could not be "
+            "reconstructed (fixture/rng_seed drift) — confirm data "
+            "incomplete; re-run `topofuzz confirm`"
+        )
+
+    # ``repeats`` from the sidecar is threaded into every metric so a
+    # ragged repeat block (a unit whose scored-repeat count != K) is
+    # DROPPED rather than majority-voted — B-RT-1(b) / RT-2.
+    #
+    # RT-3 / CR-MINOR-2: ``repeats`` is load-bearing (it decides which
+    # units get dropped). A missing or non-positive-int ``repeats`` in an
+    # otherwise-valid sidecar means we cannot trust it — REFUSE rather
+    # than silently fall back to the looser ``repeats=None`` path (which
+    # would majority-vote ragged blocks). Earlier code degraded to
+    # ``repeats=None`` here; that was the CR-MINOR-2 silent-looser-mode
+    # bug.
+    repeats = sidecar.get("repeats")
+    if not isinstance(repeats, int) or isinstance(repeats, bool) or repeats <= 0:
+        return None, None, None, (
+            "confirm.json `repeats` is missing or not a positive integer "
+            "— cannot trust this sidecar; re-run `topofuzz confirm`"
+        )
+
+    try:
+        reference_rows = read_flip_confirmations(
+            run_dir, run_id=run_id, role="reference"
+        )
+        candidate_rows = read_flip_confirmations(
+            run_dir, run_id=run_id, role="candidate"
+        )
+    except ConfirmError:
+        # The sidecar said a confirm pass ran, but run.sqlite is now
+        # missing / schemaless. Treat as un-computable with a note.
+        return None, None, None, (
+            "confirm.json present but flip_confirmations table is "
+            "missing — re-run `topofuzz confirm`"
+        )
+
+    if not reference_rows and not candidate_rows:
+        # Sidecar present but the table is empty — a no-candidate run
+        # (a non-fragile run legitimately has zero candidates). Nulls,
+        # no note (this is not an error condition).
+        return None, None, None, None
+
+    # RT-3: ``confirm.json`` is an unsigned sidecar and ``repeats`` is
+    # load-bearing — it decides which units the metrics drop. Cross-check
+    # it against the actual ``repeat_idx`` values in the table: a
+    # hand-crafted sidecar whose ``repeats`` disagrees with the persisted
+    # rows would silently change the drop logic. We do not sign the
+    # sidecar (spec: minimal cross-check, NOT a signing scheme) — but a
+    # ``repeat_idx`` at or beyond ``repeats`` is structurally impossible
+    # for a pass that actually ran K=``repeats`` (the writer emits
+    # ``repeat_idx`` in ``range(repeats)``), so it is an unambiguous
+    # tamper / staleness signal. Refuse rather than trust it.
+    observed_idxs = [
+        r["repeat_idx"]
+        for r in (*reference_rows, *candidate_rows)
+        if isinstance(r.get("repeat_idx"), int)
+    ]
+    if observed_idxs and max(observed_idxs) >= repeats:
+        return None, None, None, (
+            "confirm.json `repeats` disagrees with the flip_confirmations "
+            "table (a persisted repeat_idx is out of range) — re-run "
+            "`topofuzz confirm`"
+        )
+
+    # The screened candidate-pair set — needed so the disposition
+    # buckets account for pairs whose every repeat was a judge failure
+    # (M-RT-1). Best-effort: if it can't be read, fall through to the
+    # observed-pairs fallback in the metric.
+    try:
+        screened_candidates: list[tuple[str, str]] | None = (
+            find_all_flip_candidates(run_dir)
+        )
+    except ReproError:
+        screened_candidates = None
+
+    stability_result = compute_verdict_stability(
+        reference_rows, repeats=repeats
+    )
+    verdict_stability = stability_result.point
+
+    confirmed_result = compute_confirmed_verdict_flip_rate(
+        reference_rows,
+        candidate_rows,
+        candidates=screened_candidates,
+        repeats=repeats,
+        n_resamples=n_resamples,
+        conf=conf,
+        seed=seed,
+    )
+    # N-RT-3: the honesty invariant — every screened pair lands in exactly
+    # one disposition bucket — only holds when ``candidates`` was supplied
+    # (see ConfirmedVerdictFlipResult). The attest path DOES supply it
+    # unless ``find_all_flip_candidates`` raised, so when it is non-None
+    # the buckets MUST sum to ``n_screened_pairs``. A mismatch means the
+    # metric's accounting is internally inconsistent — refuse to populate
+    # the headline + emit a note rather than ``assert`` (a hard crash in
+    # attest is worse than note-and-null, the house pattern).
+    if screened_candidates is not None:
+        bucket_sum = (
+            confirmed_result.confirmed
+            + confirmed_result.flaky
+            + confirmed_result.unstable_baseline
+            + confirmed_result.missing_baseline
+            + confirmed_result.judge_failure_pairs
+        )
+        if bucket_sum != confirmed_result.n_screened_pairs:
+            return None, None, None, (
+                "confirmed_verdict_flip disposition buckets do not sum to "
+                "the screened-pair count — confirm data is internally "
+                "inconsistent; re-run `topofuzz confirm`"
+            )
+    confirmed_dict: dict[str, Any] = {
+        "point": confirmed_result.point,
+        "ci_lower": confirmed_result.ci_lower,
+        "ci_upper": confirmed_result.ci_upper,
+        "confirmed": confirmed_result.confirmed,
+        "flaky": confirmed_result.flaky,
+        "unstable_baseline": confirmed_result.unstable_baseline,
+        "missing_baseline": confirmed_result.missing_baseline,
+        "judge_failure_pairs": confirmed_result.judge_failure_pairs,
+        "n_screened_pairs": confirmed_result.n_screened_pairs,
+        "degenerate_flag": confirmed_result.degenerate_flag,
+    }
+
+    voo_noise_floor = compute_voo_noise_floor(reference_rows, repeats=repeats)
+
+    return verdict_stability, confirmed_dict, voo_noise_floor, None
+
+
 def compute_findings(
     run_dir: Path,
     run_id: str,
@@ -1214,6 +1515,16 @@ def emit_run_attestation(
         run_dir, run_id, manifest
     )
     ba_drop = compute_ba_drop_for_attestation(run_dir, run_id, manifest)
+    # Noise-floor / verdict-confirmation metrics. All three are None
+    # unless a COMPLETE `topofuzz confirm` pass has run (confirm.json
+    # sidecar present, not partial, no reconstruction drift). A partial
+    # pass yields None metrics + a non-null ``confirm_note``.
+    (
+        verdict_stability,
+        confirmed_verdict_flip,
+        voo_noise_floor,
+        confirm_note,
+    ) = compute_noise_floor_for_attestation(run_dir, run_id, seed=0)
     headline = compute_headline(
         status=status,
         n_successful_cells=successful_cells,
@@ -1228,6 +1539,10 @@ def emit_run_attestation(
         balanced_accuracy_drop=ba_drop,
         judge_failure_rate=judge_failure_rate,
         judge_independence=judge_independence,
+        verdict_stability=verdict_stability,
+        confirmed_verdict_flip_rate=confirmed_verdict_flip,
+        voo_noise_floor=voo_noise_floor,
+        confirm_note=confirm_note,
     )
     findings = compute_findings(run_dir, run_id, manifest, seed=0)
     sqlite_path = run_dir / "run.sqlite"

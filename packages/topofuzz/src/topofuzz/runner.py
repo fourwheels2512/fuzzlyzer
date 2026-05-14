@@ -930,7 +930,7 @@ async def _run_judge(
 # pre-existing user_version (0 for fresh DBs, 1 for legacy step-5 DBs,
 # 99+ for a hypothetical future DB) is observable when migrate decides
 # whether to ALTER or refuse.
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -968,6 +968,21 @@ CREATE TABLE IF NOT EXISTS judge_results (
     rationale TEXT,
     failure_reason TEXT,
     PRIMARY KEY (run_id, variant_id, eval_id)
+);
+CREATE TABLE IF NOT EXISTS flip_confirmations (
+    run_id TEXT NOT NULL,
+    variant_id TEXT NOT NULL,
+    eval_id TEXT NOT NULL,
+    repeat_idx INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    node_outputs_json TEXT NOT NULL,
+    judge_kind TEXT,
+    score_value REAL,
+    rationale TEXT,
+    failure_reason TEXT,
+    error TEXT,
+    cell_cost_usd REAL,
+    PRIMARY KEY (run_id, variant_id, eval_id, repeat_idx)
 );
 """
 
@@ -1054,6 +1069,11 @@ def _migrate(db: sqlite3.Connection) -> None:
             db.execute(
                 "ALTER TABLE runs ADD COLUMN rubric_hash TEXT NOT NULL DEFAULT ''"
             )
+    # v5: flip_confirmations table (the noise-floor / `topofuzz confirm`
+    # store). It is a brand-NEW table, so `CREATE TABLE IF NOT EXISTS` in
+    # _SCHEMA already created it for both fresh and legacy DBs — no ALTER
+    # is needed here. The bump to _SCHEMA_VERSION=5 just records that a
+    # v4 DB opened by v5 code is fully migrated once _SCHEMA has run.
     db.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
     db.commit()
 
@@ -1380,6 +1400,101 @@ class RunWriter:
                 passed,
                 rationale,
                 failure_reason,
+            ),
+        )
+        self._db.commit()
+
+    def delete_flip_confirmations(self) -> int:
+        """Delete every ``flip_confirmations`` row for this run_id.
+
+        The ``confirm`` pass calls this once, before writing a new pass,
+        so a re-run is genuinely idempotent across changing ``K``:
+        ``write_flip_confirmation``'s ``INSERT OR REPLACE`` only overwrites
+        rows whose PK ``(run_id, variant_id, eval_id, repeat_idx)`` the
+        new pass also produces — so ``confirm --repeats 2`` after
+        ``--repeats 3`` would otherwise leave a STALE ``repeat_idx 2`` row
+        behind, contaminating the majority vote (audit M-RT-3).
+        Delete-then-write is the only actually-idempotent shape.
+
+        Caveat (N-RT-1): this REPLACES, it does not merge. The confirm
+        pass calls it before the re-run loop, so a crash mid-loop has
+        already destroyed the prior good pass's rows — there is no
+        rollback. :func:`topofuzz.confirm.run_confirm_pass` compensates
+        by writing a ``partial: true`` sidecar on any crash so the
+        half-rewritten table is at least *marked* incomplete; it does not
+        resurrect the prior data. Re-running ``topofuzz confirm`` is the
+        recovery path.
+
+        Returns the number of rows deleted (0 on a first pass).
+        """
+        if self._db is None:
+            raise RuntimeError("RunWriter is closed")
+        cur = self._db.execute(
+            "DELETE FROM flip_confirmations WHERE run_id = ?",
+            (self._run_id,),
+        )
+        self._db.commit()
+        return cur.rowcount
+
+    def write_flip_confirmation(
+        self,
+        cell: Cell,
+        *,
+        repeat_idx: int,
+        role: str,
+    ) -> None:
+        """Persist one ``topofuzz confirm`` repeat into ``flip_confirmations``.
+
+        Mirrors :meth:`write`'s serialisation of a :class:`Cell` — the
+        ``node_outputs_json`` blob and the judge fields are packed the
+        same way — but lands in the separate ``flip_confirmations`` table
+        whose PK includes ``repeat_idx`` (so K repeats of one variant do
+        not collide; see the schema comment). ``role`` is ``'reference'``
+        for re-runs of the original variant and ``'candidate'`` for re-runs
+        of a screened flip candidate.
+
+        Unlike :meth:`write` this does NOT append to ``traces.jsonl`` —
+        the confirm pass is a post-hoc analysis layer, not part of the
+        run's primary trace. ``INSERT OR REPLACE`` keeps a single pass's
+        own re-writes clean; the ``confirm`` pass calls
+        :meth:`delete_flip_confirmations` first so a re-run with a
+        different ``K`` cannot leave stale higher-index rows behind.
+        """
+        if self._db is None:
+            raise RuntimeError("RunWriter is closed")
+        if role not in ("reference", "candidate"):
+            raise ValueError(
+                f"role must be 'reference' or 'candidate'; got {role!r}"
+            )
+        node_dicts = [asdict(o) for o in cell.node_outputs]
+        node_outputs_json = json.dumps(node_dicts, ensure_ascii=False)
+        cell_cost = _cell_cost_usd(cell)
+        kind, score_value, passed, rationale, failure_reason = _judge_row(cell)
+        # judge_results packs binary verdicts into ``passed``; the
+        # flip_confirmations table has no ``passed`` column (the v0.5
+        # confirm pass scores continuously), so fold a binary verdict
+        # into score_value so the downstream metrics see one verdict slot.
+        if score_value is None and passed is not None:
+            score_value = float(passed)
+        self._db.execute(
+            "INSERT OR REPLACE INTO flip_confirmations "
+            "(run_id, variant_id, eval_id, repeat_idx, role, "
+            " node_outputs_json, judge_kind, score_value, rationale, "
+            " failure_reason, error, cell_cost_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                self._run_id,
+                cell.variant_id,
+                cell.eval_id,
+                repeat_idx,
+                role,
+                node_outputs_json,
+                kind,
+                score_value,
+                rationale,
+                failure_reason,
+                cell.error,
+                cell_cost,
             ),
         )
         self._db.commit()

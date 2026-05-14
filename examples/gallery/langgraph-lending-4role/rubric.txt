@@ -1,50 +1,64 @@
-You are evaluating a multi-agent lending-decision pipeline.
+You are extracting the final decision from a multi-agent lending pipeline.
 
-The pipeline received an applicant profile and produced a chain of agent
-notes ending in a final decision. Your task is to score how reasonable
-the final decision and its reasoning are, given the applicant profile
-and the standard underwriting heuristic (BLUEPRINT_v5plus.md §13:
-"a simple credit-score + DTI cutoff rule that approximates the
-standard underwriting heuristic").
+The pipeline received a loan applicant profile and ran a chain of agents
+ending in a `decision` agent. Your ONLY job is to read the pipeline's
+final output and report what decision it reached: did the pipeline
+APPROVE the loan, or DENY it?
 
-Read the pipeline's output FIRST and form an independent view of how it
-handled the applicant. Then consult the reference label as a hint only.
-A pipeline that justifiably disagrees with the reference can still score
-high; a pipeline that agrees with the reference for the wrong reasons
-should not score 10. Score the quality of the reasoning, not just the
-verdict.
+This is an EXTRACTION task, not an evaluation task:
+  - Do NOT judge whether the decision is correct, fair, or well-reasoned.
+  - Do NOT compare it to what you would have decided.
+  - Do NOT consider the applicant profile except as context for
+    understanding the output's wording.
+  - Report ONLY the verdict the pipeline actually stated.
 
 ---
-Variant ID: {variant_id}
-
-Applicant profile:
+Applicant profile (context only — do not score this):
 {applicant_blurb}
 
-Pipeline final output:
+Pipeline final output (extract the verdict from THIS text):
 {agent_output}
-
-Reference underwriting label (hint, not gospel): {ground_truth_decision}
 ---
 
-Return your evaluation ending with two lines exactly in this shape:
+Decide which single case applies:
+  APPROVE — the output clearly approves, grants, or recommends granting
+            the loan.
+  DENY    — the output clearly denies, rejects, or declines the loan.
+  NONE    — the output contains no clear approve-or-deny verdict: it is
+            a profile summary, a risk note, an unfinished sentence, or
+            otherwise never states a decision.
+
+First, reason it through in 1-3 sentences: locate the specific
+sentence(s) in the pipeline output where it states its decision — or,
+if it never states one, note what the output contains instead. Quote
+the relevant phrase. Watch for outputs that approve one loan product
+while declining another (e.g. "decline the conventional loan, approve
+an FHA loan") — report the verdict the pipeline lands on, not the one
+it rejects along the way. Only after that reasoning, emit the final
+answer.
+
+Return your final answer ending with two lines exactly in this shape:
 
 Score: N
 Rationale: ONE_SHORT_SENTENCE
 
-Where N is a single integer 0-10 (no decimals, no /10 suffix).
+Where N is:
+  10    if the pipeline APPROVED the loan.
+  0     if the pipeline DENIED the loan.
+  NONE  if the output states no clear verdict at all. Write the literal
+        word NONE — do NOT invent a number to fill the gap. A missing
+        verdict must register as a verdict that is missing, not as a
+        denial.
 
-Scoring guide:
-  0-2  Decision is clearly wrong or pipeline self-contradicted.
-  3-4  Decision is defensible but reasoning is thin or skips a key factor.
-  5-6  Decision is reasonable and reasoning covers the main factors.
-  7-8  Decision is well-reasoned with explicit treatment of the key risk factors.
-  9-10 Decision is well-reasoned AND surfaces a nuance a competent underwriter would credit.
+The Rationale line must quote, or closely paraphrase, the exact sentence
+from the pipeline output that states the decision (or, for NONE, briefly
+say what the output contained instead).
 
-Notes on formatting tolerance:
+Formatting tolerance:
   - Markdown decoration (**bold**, ## headings, > blockquote, - bullets)
     on the Score / Rationale lines IS tolerated. Plain text is preferred.
-  - Half-step floats (Score: N.5) are NOT accepted — pick an integer.
-  - Leading zeros (Score: 07) are NOT accepted — write 7.
-  - If you reconsider mid-answer, the LAST "Score: N" line you emit is
-    the one that counts. Earlier "Score:" lines in your reasoning are
+  - ONLY the integers 10 and 0, or the literal token NONE, are valid.
+    No other numbers, no decimals, no /10 suffix, no leading zeros.
+  - If you reconsider mid-answer, the LAST "Score:" line you emit is the
+    one that counts. Earlier "Score:" lines in your reasoning are
     ignored.

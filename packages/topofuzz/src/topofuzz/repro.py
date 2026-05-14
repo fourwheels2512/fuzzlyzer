@@ -147,6 +147,102 @@ def find_flip_candidate(
     )
 
 
+def find_all_flip_candidates(
+    run_dir: Path,
+    *,
+    threshold: float = DEFAULT_VERDICT_THRESHOLD,
+) -> list[tuple[str, str]]:
+    """Return every ``(eval_id, variant_id)`` whose verdict flips vs the original.
+
+    A *candidate* is a cell whose binarised verdict (``score >= threshold``,
+    or ``passed`` when present) differs from the **original variant's**
+    verdict on the same ``eval_id``. The original variant is
+    ``manifest.variant_canonical_hashes[0]`` — the §6 kickoff-insertion-
+    order contract, same as :func:`find_flip_candidate`.
+
+    Unlike :func:`find_flip_candidate` (which returns ONE flip for the
+    standalone reproducer), this returns the FULL candidate set — the
+    ``topofuzz confirm`` pass re-runs every one of them K times to
+    separate the topology effect from LLM noise.
+
+    Selection rules, all deterministic:
+
+    * Judge-failure cells (``passed IS NULL AND score_value IS NULL``)
+      are skipped — they contribute no verdict to compare.
+    * An eval_id whose original-variant cell is a judge failure (or
+      absent) is skipped entirely: with no reference verdict there is
+      nothing to flip against.
+    * The original variant is never its own candidate.
+    * Output is sorted lexicographically by ``(eval_id, variant_id)``
+      so the re-run order is stable across invocations.
+
+    Returns an empty list when no flip exists (this is NOT an error —
+    a non-fragile run legitimately has zero candidates; the caller
+    decides whether to treat that as a no-op).
+
+    Raises:
+        ReproError: ``manifest.json`` missing / malformed, or
+            ``run.sqlite`` is missing the ``judge_results`` schema.
+    """
+    run_dir = Path(run_dir)
+    manifest = _load_manifest(run_dir)
+    hashes = manifest["variant_canonical_hashes"]
+    if not hashes:
+        raise ReproError(
+            f"manifest.variant_canonical_hashes is empty in run "
+            f"{run_dir.name} — cannot identify the original variant."
+        )
+    original_hash = hashes[0]
+    known_hashes = set(hashes)
+
+    con = sqlite3.connect(str(run_dir / "run.sqlite"))
+    try:
+        try:
+            rows = list(
+                con.execute(
+                    "SELECT variant_id, eval_id, score_value, passed "
+                    "FROM judge_results "
+                    "ORDER BY eval_id, variant_id"
+                )
+            )
+        except sqlite3.DatabaseError as e:
+            raise ReproError(
+                f"run.sqlite in {run_dir.name} is missing the expected "
+                f"judge_results schema or is corrupt: {e}"
+            ) from e
+    finally:
+        con.close()
+
+    # Binarise once; only cells whose variant_id is a known manifest
+    # hash count (a stray cell under an unknown hash is forensic noise).
+    by_eval: dict[str, dict[str, bool]] = defaultdict(dict)
+    for vid, eid, score, passed in rows:
+        if vid not in known_hashes:
+            continue
+        if passed is not None:
+            verdict = bool(passed)
+        elif score is not None:
+            verdict = bool(score >= threshold)
+        else:
+            continue  # judge failure — no verdict
+        by_eval[eid][vid] = verdict
+
+    candidates: list[tuple[str, str]] = []
+    for eid in sorted(by_eval):
+        verdicts = by_eval[eid]
+        orig_verdict = verdicts.get(original_hash)
+        if orig_verdict is None:
+            # Original variant has no scored verdict for this eval — no
+            # reference frame, skip the whole eval.
+            continue
+        for vid in sorted(verdicts):
+            if vid == original_hash:
+                continue
+            if verdicts[vid] != orig_verdict:
+                candidates.append((eid, vid))
+    return candidates
+
+
 def resolve_graph_import(fixture_spec: str) -> tuple[str | None, str]:
     """Parse ``<path>:<factory>`` into ``(dotted_module, factory_name)``.
 

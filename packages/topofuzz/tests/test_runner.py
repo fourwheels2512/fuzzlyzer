@@ -1363,7 +1363,7 @@ def test_run_writer_persists_schema_version_pragma(tmp_path):
         ver = db.execute("PRAGMA user_version").fetchone()[0]
     finally:
         db.close()
-    assert ver == 4  # step 9: rubric_hash on runs (was 3 after step 8 polish)
+    assert ver == 5  # v5: flip_confirmations table (noise-floor / `topofuzz confirm`)
 
 
 def test_run_writer_resume_preserves_original_created_at(tmp_path):
@@ -2035,9 +2035,19 @@ def test_runwriter_migrates_v1_db_in_place(tmp_path):
 
     db = sqlite3.connect(str(db_path))
     try:
-        # Schema bumped v1 → v4 cascade: cost telemetry (v2) + §A runs
-        # cols (v3) + rubric_hash on runs (v4 / step 9).
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
+        # Schema bumped v1 → v5 cascade: cost telemetry (v2) + §A runs
+        # cols (v3) + rubric_hash on runs (v4 / step 9) + flip_confirmations
+        # table (v5 / noise-floor `topofuzz confirm`).
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 5
+        # v5: the flip_confirmations table exists post-migrate (created
+        # by CREATE TABLE IF NOT EXISTS — no ALTER needed for a new table).
+        legacy_tables = {
+            row[0]
+            for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "flip_confirmations" in legacy_tables
         # v3 + v4 runs columns landed. ``status`` defaults to
         # 'running', tenant_id to 'local', rubric_hash to ''.
         runs_cols = {
