@@ -69,11 +69,11 @@ _log = logging.getLogger(__name__)
 # can dial K down for tiny fixtures without rewriting the contract.
 DEFAULT_K: int = 3
 
-# Default binarisation cutoff — same 0.5 the §14 verdict_flip_rate uses
-# (handoff decision A of step 15a). Keep them in lockstep so the
-# headline metric and the rendered worst-case agree on what counts as
-# a flip.
-DEFAULT_THRESHOLD: float = 0.5
+# Default binarisation cutoff — re-exported alias of
+# ``topofuzz.metrics.verdict_flip.DEFAULT_FLIP_THRESHOLD`` so the
+# headline metric and the rendered worst-case use a single source of
+# truth (closes BACKLOG: lift _FLIP_THRESHOLD).
+from topofuzz.metrics.verdict_flip import DEFAULT_FLIP_THRESHOLD as DEFAULT_THRESHOLD
 
 # DoD #13 variance gate (BLUEPRINT line 533). The panel renders only
 # when at least one eval column has ``np.var(col) > 0.1`` over the

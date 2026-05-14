@@ -85,8 +85,6 @@ import asyncio
 import copy
 import json
 import logging
-import math
-import os
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable
@@ -108,35 +106,17 @@ _log = logging.getLogger(__name__)
 # the runner and the judge share one env var so operators set it once.
 # Env-overridable via TOPOFUZZ_LLM_TIMEOUT_SECS (default 60.0). Hard
 # ceiling at 3600s (1 hour) so the cap can't be neutered by a typo /
-# malicious env. See fuzzeval.judge for the math.isfinite + NaN
-# rationale. v0.5.1 audit-batch MAJOR fix (+pass-2 red-team fix for
-# inf/nan slipping the < 0 guard).
-_LLM_TIMEOUT_MAX_SECS = 3600.0
+# malicious env. Shared implementation lives in
+# :mod:`fuzzeval._timeout` (DRY'd 2026-05-14; closes BACKLOG: DRY
+# _resolve_llm_timeout_secs + truncate env-var value in warning log).
+from fuzzeval._timeout import (
+    LLM_TIMEOUT_MAX_SECS as _LLM_TIMEOUT_MAX_SECS,  # noqa: F401 (re-export for tests)
+    resolve_llm_timeout_secs as _shared_resolve,
+)
 
 
 def _resolve_llm_timeout_secs() -> float:
-    raw = os.environ.get("TOPOFUZZ_LLM_TIMEOUT_SECS", "60")
-    try:
-        value = float(raw)
-    except ValueError:
-        _log.warning(
-            "runner: TOPOFUZZ_LLM_TIMEOUT_SECS=%r is not a float; "
-            "falling back to 60.0", raw,
-        )
-        return 60.0
-    if not math.isfinite(value) or value <= 0:
-        _log.warning(
-            "runner: TOPOFUZZ_LLM_TIMEOUT_SECS=%r is not a positive "
-            "finite float; falling back to 60.0", raw,
-        )
-        return 60.0
-    if value > _LLM_TIMEOUT_MAX_SECS:
-        _log.warning(
-            "runner: TOPOFUZZ_LLM_TIMEOUT_SECS=%r exceeds %ds ceiling; "
-            "clamping to ceiling", raw, int(_LLM_TIMEOUT_MAX_SECS),
-        )
-        return _LLM_TIMEOUT_MAX_SECS
-    return value
+    return _shared_resolve(_log, prefix="runner")
 
 
 _LLM_TIMEOUT_SECS = _resolve_llm_timeout_secs()

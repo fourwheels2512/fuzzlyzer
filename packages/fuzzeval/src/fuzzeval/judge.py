@@ -40,8 +40,6 @@ contract belongs with the score type it operates on.
 from __future__ import annotations
 
 import logging
-import math
-import os
 import re
 import threading
 from dataclasses import dataclass
@@ -64,33 +62,18 @@ _log = logging.getLogger(__name__)
 # the cap was meant to close. The pass-2 red-team also caught that
 # `float("inf")` and `float("nan")` slip past a naive `<= 0` guard
 # (NaN comparisons return False), so the predicate is
-# `math.isfinite(value) AND value > 0` AND `value <= ceiling`.
-_LLM_TIMEOUT_MAX_SECS = 3600.0
+# `math.isfinite(value) AND value > 0` AND `value <= ceiling`. Shared
+# implementation lives in :mod:`fuzzeval._timeout` (DRY'd 2026-05-14;
+# closes BACKLOG: DRY _resolve_llm_timeout_secs + truncate env-var
+# value in warning log).
+from fuzzeval._timeout import (
+    LLM_TIMEOUT_MAX_SECS as _LLM_TIMEOUT_MAX_SECS,
+    resolve_llm_timeout_secs as _shared_resolve,
+)
 
 
 def _resolve_llm_timeout_secs() -> float:
-    raw = os.environ.get("TOPOFUZZ_LLM_TIMEOUT_SECS", "60")
-    try:
-        value = float(raw)
-    except ValueError:
-        _log.warning(
-            "judge: TOPOFUZZ_LLM_TIMEOUT_SECS=%r is not a float; "
-            "falling back to 60.0", raw,
-        )
-        return 60.0
-    if not math.isfinite(value) or value <= 0:
-        _log.warning(
-            "judge: TOPOFUZZ_LLM_TIMEOUT_SECS=%r is not a positive "
-            "finite float; falling back to 60.0", raw,
-        )
-        return 60.0
-    if value > _LLM_TIMEOUT_MAX_SECS:
-        _log.warning(
-            "judge: TOPOFUZZ_LLM_TIMEOUT_SECS=%r exceeds %ds ceiling; "
-            "clamping to ceiling", raw, int(_LLM_TIMEOUT_MAX_SECS),
-        )
-        return _LLM_TIMEOUT_MAX_SECS
-    return value
+    return _shared_resolve(_log, prefix="judge")
 
 
 _LLM_TIMEOUT_SECS = _resolve_llm_timeout_secs()

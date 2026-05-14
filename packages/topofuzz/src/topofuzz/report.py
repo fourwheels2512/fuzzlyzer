@@ -143,7 +143,7 @@ def render_report(run_dir: Path) -> Path:
             f"(expected at {sqlite_path})"
         )
 
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = _read_json_capped(manifest_path)
     status, run_id = _read_run_row(sqlite_path)
 
     # Score matrix (variant × eval). Empty matrix is a legitimate outcome
@@ -277,6 +277,32 @@ def render_report(run_dir: Path) -> Path:
     return out_path
 
 
+# 64 MiB ceiling on the JSON files topofuzz report parses. A
+# pathological multi-GB manifest or report.json crafted by a hostile
+# run_dir would otherwise pin RAM during ``topofuzz verify`` / ``report``
+# (audit step 18.5a v0.5.1 POLISH — closes BACKLOG: 64 MiB cap on
+# json.loads). Real artefacts are sub-megabyte; lift if a legitimate use
+# case demands more.
+_MAX_JSON_BYTES: int = 64 * 1024 * 1024
+
+
+def _read_json_capped(path: "Path", *, max_bytes: int = _MAX_JSON_BYTES) -> Any:
+    """Read+parse a JSON file, refusing files larger than ``max_bytes``.
+
+    Raises ``ValueError`` (the canonical caller-catchable type at every
+    existing call site that already handles ``json.JSONDecodeError``)
+    when the file is over the cap, so existing try/except blocks pick
+    up the new error without surface changes.
+    """
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(
+            f"{path.name} is {size} bytes (> {max_bytes} cap); refusing "
+            "to parse to bound RAM. Edit _MAX_JSON_BYTES if intentional."
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def _check_heavy_deps() -> None:
     """Probe numpy / matplotlib / jinja2 importability; raise on miss.
 
@@ -322,6 +348,11 @@ def _attestation_looks_signed(path: Path) -> bool:
     """
     try:
         raw = path.read_bytes()
+    except FileNotFoundError:
+        # Common case: unsigned run never wrote attestation.json. The
+        # call site already expected this — return quietly. Closes
+        # BACKLOG: misleading "present but unreadable" log.
+        return False
     except OSError as e:
         _log.warning(
             "report: attestation.json present but unreadable (%s) — "
@@ -961,8 +992,7 @@ def _render_summary_panel(
     per_agent_influence: list[dict[str, Any]] | None = None
     if report_json_path.is_file():
         try:
-            raw = report_json_path.read_text(encoding="utf-8")
-            doc = json.loads(raw)
+            doc = _read_json_capped(report_json_path)
         except (OSError, json.JSONDecodeError, ValueError) as e:
             _log.warning(
                 "report: report.json unreadable (%s) — summary degrades to "
@@ -1051,15 +1081,11 @@ def _render_summary_panel(
 # ---------------------------------------------------------------------------
 
 
-# Verdict-flip threshold matches :mod:`topofuzz.metrics.verdict_flip`'s
-# default — keeping a single value so the donut's directional split and
-# the signed headline number cannot disagree by accident. The constant
-# is duplicated here (rather than imported) so report.py stays
-# importable when ``topofuzz.metrics.verdict_flip`` isn't on the
-# verify-only path. Drift risk is low (the value is part of the v0.5
-# attestation contract) but a v0.5.1 polish item is to lift the
-# constant to a shared location and assert equality in tests.
-_FLIP_THRESHOLD: float = 0.5
+# Verdict-flip threshold sourced from :mod:`topofuzz.metrics.verdict_flip`.
+# Closes BACKLOG: lift _FLIP_THRESHOLD. The metrics submodule is stdlib-
+# only at import time (numpy stays behind TYPE_CHECKING + lazy func-level
+# imports), so this stays cheap for verify-only callers.
+from topofuzz.metrics.verdict_flip import DEFAULT_FLIP_THRESHOLD as _FLIP_THRESHOLD
 
 # §10a worst-case gate: per-eval variance ≥ this value promotes the
 # eval into the worst-case viewer's candidate set. Sourced from
@@ -1291,8 +1317,7 @@ def _read_flip_rate_from_report_json(run_dir: Path) -> float | None:
     if not report_json_path.is_file():
         return None
     try:
-        raw = report_json_path.read_text(encoding="utf-8")
-        doc = json.loads(raw)
+        doc = _read_json_capped(report_json_path)
     except (OSError, json.JSONDecodeError, ValueError) as e:
         _log.warning(
             "report: report.json unreadable for flip-composition (%s) — "

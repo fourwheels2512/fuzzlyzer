@@ -30,6 +30,14 @@ if TYPE_CHECKING:
     import numpy as np
 
 
+# Shared verdict-flip threshold for the binarisation
+# ``score >= DEFAULT_FLIP_THRESHOLD``. Pulled out of report.py (was
+# ``_FLIP_THRESHOLD``) and the per-call kwarg defaults below so the
+# threshold has a single source of truth. Closes BACKLOG: lift
+# _FLIP_THRESHOLD constant.
+DEFAULT_FLIP_THRESHOLD: float = 0.5
+
+
 @dataclass(frozen=True)
 class VerdictFlipResult:
     """Output of :func:`compute_verdict_flip_rate`.
@@ -56,7 +64,7 @@ def compute_verdict_flip_rate(
     score_matrix: "np.ndarray",
     original_index: int,
     *,
-    threshold: float = 0.5,
+    threshold: float = DEFAULT_FLIP_THRESHOLD,
     n_resamples: int = 5000,
     conf: float = 0.95,
     seed: int | None = None,

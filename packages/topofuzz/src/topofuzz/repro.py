@@ -39,7 +39,12 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 _log = logging.getLogger(__name__)
 
-DEFAULT_VERDICT_THRESHOLD = 0.5
+# Sourced from :mod:`topofuzz.metrics.verdict_flip` so the repro CLI's
+# binarisation matches the §14 headline metric (closes BACKLOG: lift
+# _FLIP_THRESHOLD).
+from topofuzz.metrics.verdict_flip import (
+    DEFAULT_FLIP_THRESHOLD as DEFAULT_VERDICT_THRESHOLD,
+)
 
 # eval_id is interpolated into the default output filename. Constrain
 # to characters that are filesystem-safe on POSIX *and* Windows so a
