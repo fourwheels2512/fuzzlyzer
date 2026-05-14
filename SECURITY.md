@@ -19,6 +19,8 @@ local-signed attestation for a production-grade one.
 | Multi-party signing | Single signer; envelope shape is plural-ready | Jury-of-3 co-signing |
 | Backing key store | Local filesystem | Cloud KMS adapters (`--kms` reserved) |
 | Verifier integrity | This document is the reference | Sigstore transparency log |
+| API key handling | Environment variable (`GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`); never written to disk | OS keyring shim via `keyring` (v0.6) |
+| Log redaction | `fuzzeval.log_redaction.SecretRedactionFilter` auto-installed on root logger at `import fuzzeval` time. Scrubs `sk-…`, `xai-…`, `AKIA…`, `AIza…`, and `Bearer …` patterns from `record.msg` + `record.args` before any handler sees them. Stdlib `logging.Filter`, idempotent. | `structlog` migration with the same redaction as a pipeline stage; required-fields contract becomes enforceable |
 
 Threats this signing scheme **does** mitigate:
 

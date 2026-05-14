@@ -5,7 +5,21 @@ implemented as of v0.1.0 (released alongside topofuzz v0.5.0rc1).
 Importing the package is intentionally cheap so the verify-only path
 stays under its dependency budget — no LangGraph and no LLM SDKs are
 pulled at import time.
+
+Side effect at import time: installs the secret-redaction filter on
+the root logger (BLUEPRINT_v5plus.md §A "Structured logging" v0.5
+commitment). Idempotent — calling install_default_filter() again is
+a no-op. See fuzzeval.log_redaction for the patterns scrubbed.
 """
+
+from fuzzeval.log_redaction import (
+    SecretRedactionFilter,
+    install_default_filter,
+    uninstall_default_filter,
+)
+
+# Install before any other fuzzeval submodule emits its first log line.
+install_default_filter()
 
 from fuzzeval.attestation import (
     DSSE_PAE_PREFIX,
@@ -67,6 +81,7 @@ __all__ = [
     "KeyAlreadyExistsError",
     "KeyNotFoundError",
     "LLMCache",
+    "SecretRedactionFilter",
     "Signer",
     "SingleJudge",
     "VerifiedPayload",
@@ -79,6 +94,7 @@ __all__ = [
     "dsse_verify",
     "estimate",
     "generate_dev_keys",
+    "install_default_filter",
     "load_private_key",
     "load_public_key",
     "pae",
