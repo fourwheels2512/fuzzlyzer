@@ -277,11 +277,17 @@ def _parse_score(response_text: str) -> tuple[int, str]:
 SyncLLMCallable = Callable[..., Any]
 
 
-# Default ``max_tokens`` for the judge response. The contract format is
-# ~2 lines of text; 256 is generous. Lower than the runner's default
-# because a verbose judge response is wasteful — we only parse the
-# Score and one rationale line.
-_DEFAULT_MAX_TOKENS = 256
+# Default ``max_tokens`` for the judge response. The rubric invites the
+# judge to reason about the pipeline output *before* emitting the
+# trailing ``Score:`` / ``Rationale:`` contract lines, so the budget
+# must cover that reasoning — not just the two contract lines. The
+# original 256 truncated Gemini Flash mid-response: the ``Score:`` line
+# sometimes never appeared (→ JudgeUnparseableError → judge_failure →
+# §8 degraded), and when it did the ``Rationale:`` was cut to 1-3 words
+# ("The", "The decision"). 1500 leaves headroom for the reasoning plus
+# both contract lines — empirically finish_reason='stop' with full
+# rationales on the gallery fixtures.
+_DEFAULT_MAX_TOKENS = 1500
 
 
 class SingleJudge:
@@ -310,7 +316,9 @@ class SingleJudge:
         llm_callable: Optional sync callable for tests. Default is
             ``litellm.completion`` (lazy-imported so verify-only installs
             still load this module).
-        max_tokens: Cap on judge-response length. Default 256.
+        max_tokens: Cap on judge-response length. Default 1500 (see
+            :data:`_DEFAULT_MAX_TOKENS` — must cover the judge's
+            pre-verdict reasoning, not just the two contract lines).
     """
 
     def __init__(
@@ -709,7 +717,8 @@ class JuryJudge:
             ``vendor_models``). Unsupplied vendors fall back to
             :mod:`litellm`.
         max_tokens: Cap passed through to each vendor's
-            :class:`SingleJudge`. Default 256.
+            :class:`SingleJudge`. Default 1500 (see
+            :data:`_DEFAULT_MAX_TOKENS`).
 
     Raises:
         ValueError: ``vendor_models`` has the wrong count

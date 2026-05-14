@@ -523,6 +523,22 @@ def test_single_judge_score_happy_path(tmp_path):
     assert len(stub.calls) == 1
 
 
+def test_single_judge_default_max_tokens_reaches_llm_call(tmp_path):
+    """The configured max_tokens is what gets sent to the LLM. Regression
+    guard for the 256-default truncation bug: the judge reasons before
+    emitting Score/Rationale, so the budget must cover that reasoning.
+    The floor assertion catches a regression to a too-small default
+    without pinning the exact value."""
+    from fuzzeval.judge import _DEFAULT_MAX_TOKENS
+
+    assert _DEFAULT_MAX_TOKENS >= 1000
+    rubric = _write_rubric(tmp_path / "r.txt")
+    stub = _StubLLM(["Score: 5\nRationale: ok\n"])
+    j = SingleJudge(model="m", rubric_path=rubric, llm_callable=stub)
+    j.score(_payload())
+    assert stub.calls[0]["max_tokens"] == _DEFAULT_MAX_TOKENS
+
+
 def test_single_judge_threads_parsed_rationale_into_score(tmp_path):
     """The Rationale: line the LLM emits is carried on the ContinuousScore,
     not just debug-logged — that is what makes judge_results.rationale
