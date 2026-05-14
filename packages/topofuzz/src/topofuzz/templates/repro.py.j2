@@ -1,0 +1,67 @@
+"""Standalone reproducer for topofuzz run {{ run_id }}, eval {{ eval_id }}.
+
+Topofuzz observed that two node-orderings produce disagreeing verdicts
+on this input. Re-run both orderings yourself to confirm the flip is
+real, not p-hacked.
+
+Usage:
+    pip install litellm
+    export GOOGLE_API_KEY=...   # or whichever provider your LLM_CONFIGS use
+    python repro_{{ eval_id }}.py
+
+Exits with AssertionError if the two orderings agree (could mean LLM
+noise, a missing API key, or a stale topology). Exits 0 silently when
+they disagree as observed. Fully standalone: no dependency on the
+fuzzer itself.
+"""
+{{ import_line }}
+import litellm
+
+EVAL_INPUT = {{ eval_input | tojson }}
+
+# Variant {{ hash_neg_short }} — verdict score < {{ threshold }} ("DENY" side of flip)
+ORDERING_NEG = {{ ordering_neg | tojson }}
+# Variant {{ hash_pos_short }} — verdict score >= {{ threshold }} ("APPROVE" side)
+ORDERING_POS = {{ ordering_pos | tojson }}
+
+
+def _cfg_field(cfg, name, default):
+    """LLM_CONFIGS values may be dataclasses (attr access) or plain dicts."""
+    if hasattr(cfg, name):
+        return getattr(cfg, name)
+    if isinstance(cfg, dict):
+        return cfg.get(name, default)
+    return default
+
+
+def run_chain(ordering, llm_configs):
+    """Run nodes sequentially in ``ordering``; each node sees prior outputs."""
+    history = []
+    for node_id in ordering:
+        cfg = llm_configs[node_id]
+        prior = "\n".join(f"- {nid}: {out}" for nid, out in history) or "(none)"
+        prompt = (
+            f"You are agent {node_id}. Previous outputs:\n{prior}\n\n"
+            f"User input: {EVAL_INPUT}"
+        )
+        resp = litellm.completion(
+            model=_cfg_field(cfg, "model", ""),
+            temperature=_cfg_field(cfg, "temperature", 0.0) or 0.0,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        history.append((node_id, resp.choices[0].message.content))
+    return history[-1][1]
+
+
+if __name__ == "__main__":
+    out_neg = run_chain(ORDERING_NEG, LLM_CONFIGS)
+    out_pos = run_chain(ORDERING_POS, LLM_CONFIGS)
+    print(f"Ordering NEG {ORDERING_NEG}\n  final: {out_neg!r}\n")
+    print(f"Ordering POS {ORDERING_POS}\n  final: {out_pos!r}\n")
+    if not out_neg or not out_pos:
+        import sys
+        sys.exit(
+            "Empty LLM response — check API key, quota, and content-filter "
+            "settings. Reproduction inconclusive."
+        )
+    assert out_neg != out_pos, "Reproduction failed: final outputs agreed."

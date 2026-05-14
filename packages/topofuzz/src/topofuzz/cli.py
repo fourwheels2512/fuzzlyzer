@@ -1210,6 +1210,74 @@ def verify(
 
 @app.command(
     context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+def repro(
+    ctx: typer.Context,
+    run_dir: str = typer.Argument(
+        ...,
+        help="Run directory (contains manifest.json + run.sqlite).",
+    ),
+    eval_id: str | None = typer.Option(
+        None,
+        "--eval",
+        help=(
+            "Specific eval id to reproduce. Default: lexically-first eval "
+            "id whose variants flip across the verdict threshold."
+        ),
+    ),
+    out: Path | None = typer.Option(
+        None,
+        "--out",
+        help=(
+            "Destination for the generated script. Defaults to "
+            "<run_dir>/repro_<eval_id>.py."
+        ),
+    ),
+) -> None:
+    """Emit a standalone reproducer script for a verdict flip.
+
+    BLUEPRINT_v5plus.md step 19b. Imports the user's graph module,
+    replays the two losing orderings against the failing input, prints
+    both verdicts side-by-side, and ``assert``s the mismatch.
+
+    Exit codes:
+
+    * 0 — script written; path printed to stdout.
+    * 1 — no verdict flip found in the run (or for ``--eval``).
+    * 2 — usage error (run_dir is not a directory, missing files).
+    """
+    _reject_reserved_flags(list(ctx.args))
+    _reject_unknown_extras(list(ctx.args))
+
+    run_dir_path = Path(run_dir)
+    if not run_dir_path.is_dir():
+        typer.echo(
+            f"topofuzz repro: run_dir is not a directory: {run_dir}",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT)
+
+    from topofuzz.repro import ReproError, write_repro_script
+
+    try:
+        target = write_repro_script(
+            run_dir_path, eval_id=eval_id, out_path=out
+        )
+    except ReproError as e:
+        typer.echo(f"topofuzz repro: {e}", err=True)
+        raise typer.Exit(code=_VERIFY_FAIL_EXIT) from e
+    except FileNotFoundError as e:
+        typer.echo(f"topofuzz repro: {e}", err=True)
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+
+    typer.echo(str(target))
+
+
+@app.command(
+    context_settings={
         # Reserved-flag rejection (§16 #2) is a universal policy across
         # every subcommand — keygen opts in for the same reason scan /
         # report / run / verify do: a user typing `topofuzz keygen --kms`
