@@ -42,6 +42,20 @@ v0.6. See `packages/topofuzz/BACKLOG.md` § "v0.6 — cross-vendor gallery
 | [`langgraph-lending-4role/`](langgraph-lending-4role/) | 4-agent linear chain | Loan underwriting | **0.300** [CI 0.100–0.500] | Shipped |
 | [`langgraph-content-moderation/`](langgraph-content-moderation/) | 4-agent linear chain | UGC moderation | 0.00 (degenerate) | Discarded — see entry README |
 
+### Published rendered reports
+
+Once the gallery is hosted on GitHub Pages (see `docs/gallery-build.md`
+for the republish ritual and `gh-pages` branch contents), the rendered
+Variant D `report.html` for each shipped entry is reachable at:
+
+* `https://fourwheels2512.github.io/topofuzz/gallery/langgraph-supervisor-research/report.html`
+* `https://fourwheels2512.github.io/topofuzz/gallery/langgraph-lending-4role/report.html`
+
+These URLs go live only after the repo is made public AND GitHub Pages
+is configured to serve the `gh-pages` branch — see `docs/gallery-build.md`
+§ "Activation". Until then, render the reports locally from the
+committed `runs/<run_id>/report.html` files.
+
 ## Reproducing a gallery run
 
 The committed `runs/<run_id>/` directory is **structurally**
