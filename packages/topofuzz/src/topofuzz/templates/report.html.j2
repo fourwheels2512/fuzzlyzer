@@ -142,6 +142,28 @@
     border-color: var(--border-soft);
     color: var(--muted-soft);
   }
+  /* Complementary stale-prose warning when the §14 donut detects
+     signed-vs-live drift. Same warn palette as the donut's own
+     drift-warning so a reader recognises the two annotations as
+     paired. Sits inside .natural-language-summary so the verdict-
+     word background still cascades. */
+  .natural-language-summary .nls-drift-warning {
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px solid var(--warn-border);
+    color: var(--warn);
+    font-family: var(--font-serif);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .natural-language-summary .nls-drift-warning code {
+    font-family: var(--font-mono);
+    background: var(--border-soft);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 11px;
+    color: var(--ink-strong);
+  }
 
   /* Banner row --------------------------------------------------- */
   .banners {
@@ -576,6 +598,11 @@
   {% if summary and summary.summary_html %}
   <div class="natural-language-summary nls-{{ summary.verdict_word }}">
   {{ summary.summary_html | safe }}
+  {% if summary.drift_flag and summary.drift_warning_html %}
+  <div class="nls-drift-warning" role="note">
+  {{ summary.drift_warning_html | safe }}
+  </div>
+  {% endif %}
   </div>
   {% endif %}
   <!-- SUMMARY-SECTION-END -->

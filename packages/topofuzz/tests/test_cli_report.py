@@ -2155,3 +2155,107 @@ def test_report_flip_composition_drift_warning_on_zero_pairs(tmp_path: Path) -> 
         "flip_rate exceeds the drift tolerance — otherwise the "
         "legend silently contradicts the donut center"
     )
+
+
+def test_render_summary_panel_drift_flag_adds_warning(tmp_path: Path) -> None:
+    """When ``drift_flag=True`` is passed, the §17 summary context
+    carries ``drift_flag=True`` plus a ``drift_warning_html`` snippet
+    that points the reader at ``topofuzz attest`` for refresh. The
+    snippet is omitted on clean (drift_flag=False) runs so the
+    happy-path template renders unchanged.
+
+    Unit-level (not CLI) because the propagation contract is between
+    ``_render_flip_composition_panel`` and ``_render_summary_panel``;
+    rendering the full CLI just to assert on a returned-dict field
+    would be heavyweight. The end-to-end propagation through the
+    Jinja template is covered separately by
+    :func:`test_report_summary_section_renders_drift_warning_on_flip_drift`.
+    """
+    from topofuzz.report import _render_summary_panel
+
+    run_dir = tmp_path / "drift-summary-run"
+    run_dir.mkdir()
+    # Real report.json so the summary doesn't degrade to "unavailable" —
+    # drift warning only attaches on the success path, never on the
+    # placeholder path (the placeholder has no prose to be stale).
+    _write_report_json(
+        run_dir,
+        verdict_flip_rate={
+            "point": 0.31, "ci_lower": 0.24, "ci_upper": 0.38,
+            "degenerate_flag": False,
+        },
+        per_agent_influence=[
+            {"node_id": "risk", "influence": 0.67,
+             "ci_lower": 0.55, "ci_upper": 0.78,
+             "degenerate": False, "degenerate_reason": None},
+        ],
+    )
+
+    ctx_clean = _render_summary_panel(run_dir)
+    assert ctx_clean["drift_flag"] is False
+    assert "drift_warning_html" not in ctx_clean, (
+        "drift_warning_html must not be present on clean runs — "
+        "rendering an empty drift-warning would visually clutter the "
+        "happy-path NLS card"
+    )
+
+    ctx_drift = _render_summary_panel(run_dir, drift_flag=True)
+    assert ctx_drift["drift_flag"] is True
+    warning_html = ctx_drift["drift_warning_html"]
+    # The warning must name the operator action (attest refresh) and
+    # the artefact that became stale (report.json). Without both, the
+    # reader can't act.
+    assert "topofuzz attest" in warning_html
+    assert "report.json" in warning_html
+
+
+
+def test_report_summary_section_renders_drift_warning_on_flip_drift(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: when the §14 donut detects signed-vs-live drift,
+    the §17 NLS panel renders a complementary stale-prose warning
+    inside the same ``.natural-language-summary`` div. Failure mode
+    this guards against: a reader who glances only at the NLS card
+    silently consumes stale prose (BACKLOG: drift propagation into
+    §17 NLS).
+
+    Drift is provoked by writing a ``report.json`` whose signed
+    ``verdict_flip_rate.point`` does NOT match the live recount from
+    ``run.sqlite``. ``_make_run_dir`` populates run.sqlite with a
+    clean score matrix; overwriting only report.json keeps the
+    contradiction localised, which is the same shape a stale-mirror
+    edit would produce in the field.
+    """
+    run_dir = _make_run_dir(tmp_path)
+    # A signed rate of 0.99 with a live recount near 0 (the
+    # _make_run_dir matrix is well-separated, no flips) is far above
+    # the 0.005 drift tolerance, so the donut fires the flag and the
+    # NLS panel inherits it.
+    _write_report_json(
+        run_dir,
+        verdict_flip_rate={
+            "point": 0.99, "ci_lower": 0.95, "ci_upper": 1.00,
+            "degenerate_flag": False,
+        },
+        per_agent_influence=[
+            {"node_id": "risk", "influence": 0.67,
+             "ci_lower": 0.55, "ci_upper": 0.78,
+             "degenerate": False, "degenerate_reason": None},
+        ],
+    )
+
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+
+    body = (run_dir / "report.html").read_text(encoding="utf-8")
+    section = _extract_summary_section(body)
+    # The warning must live INSIDE the §17 sentinels, not just
+    # somewhere in the body (the §14 donut also emits a drift warning
+    # under a different class).
+    assert "nls-drift-warning" in section, (
+        "§17 panel must render the .nls-drift-warning element when "
+        "the §14 donut's drift_flag is True — otherwise the prose "
+        "above silently reflects stale data"
+    )
+    assert "topofuzz attest" in section

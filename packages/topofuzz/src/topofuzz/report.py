@@ -163,9 +163,18 @@ def render_report(run_dir: Path) -> Path:
     worstcase_ctx = _render_worstcase_panel(
         matrix, variant_ids, eval_ids_from_db, run_dir, run_id, manifest
     )
-    summary_ctx = _render_summary_panel(run_dir)
+    # Render the §14 flip-composition donut BEFORE the §17 summary so
+    # the summary panel can consume the donut's signed-vs-live
+    # ``drift_flag`` and emit a complementary stale-prose warning.
+    # Without this ordering, a reader who only glances at the NLS card
+    # silently consumes stale prose when the donut detects drift.
+    # (closes BACKLOG: drift propagation into §17 NLS)
     flip_composition_ctx = _render_flip_composition_panel(
         matrix, variant_ids, run_dir, manifest
+    )
+    summary_ctx = _render_summary_panel(
+        run_dir,
+        drift_flag=bool(flip_composition_ctx.get("drift_flag", False)),
     )
     variance_distribution_ctx = _render_variance_distribution_panel(
         matrix, eval_ids_from_db
@@ -894,7 +903,9 @@ def _side_to_dict(side: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _render_summary_panel(run_dir: Path) -> dict[str, Any]:
+def _render_summary_panel(
+    run_dir: Path, *, drift_flag: bool = False,
+) -> dict[str, Any]:
     """Build the §17 natural-language summary Jinja context.
 
     Sources both ``headline.verdict_flip_rate`` and
@@ -909,6 +920,18 @@ def _render_summary_panel(run_dir: Path) -> dict[str, Any]:
     On any exception we degrade to a placeholder context with
     ``verdict_word="unavailable"`` so the rest of the report renders.
     The summary section is best-effort, not load-bearing.
+
+    ``drift_flag`` is the §14 donut's signed-vs-live drift signal
+    (``flip_composition.drift_flag`` — see
+    :func:`_render_flip_composition_panel`). When True, the donut
+    detected that ``report.json``'s signed ``verdict_flip_rate.point``
+    disagrees with the live ``n_flips / n_pairs`` recount by more
+    than :data:`_FLIP_DRIFT_TOLERANCE`. The §17 prose is derived from
+    the same signed value, so the prose is silently stale on drift —
+    we surface a complementary warning so a reader who only glances
+    at the NLS card doesn't consume stale data. The warning is added
+    ONLY on the success path; the ``unavailable`` placeholder paths
+    have no prose to be stale, so they suppress the flag.
     """
     try:
         from topofuzz.summary import render_summary
@@ -927,6 +950,10 @@ def _render_summary_panel(run_dir: Path) -> dict[str, Any]:
                 "Topology stability summary unavailable "
                 "(topofuzz.summary module not importable)."
             ),
+            # Shape stability for Python consumers using ``ctx["drift_flag"]``
+            # rather than ``.get(...)``; the placeholder has no prose to be
+            # stale, so the flag is explicitly suppressed (audit pass-1 MINOR).
+            "drift_flag": False,
         }
 
     report_json_path = run_dir / "report.json"
@@ -983,16 +1010,34 @@ def _render_summary_panel(run_dir: Path) -> dict[str, Any]:
                 "Topology stability summary unavailable "
                 "(internal render error)."
             ),
+            # Shape stability — see import-failure placeholder above.
+            "drift_flag": False,
         }
 
-    return {
+    out: dict[str, Any] = {
         "verdict_word": ctx.verdict_word,
         "verdict_flip_rate": ctx.verdict_flip_rate,
         "primary_driver": ctx.primary_driver,
         "primary_influence": ctx.primary_influence,
         "summary_text": ctx.summary_text,
         "summary_html": ctx.summary_html,
+        "drift_flag": bool(drift_flag),
     }
+    if drift_flag:
+        # Static HTML — no untrusted interpolation. The donut's drift
+        # warning already cites the numeric drift; this companion warning
+        # speaks to prose staleness specifically and points the reader
+        # at the §14 visual for the numeric details. Kept short on
+        # purpose so it doesn't visually compete with the verdict prose.
+        out["drift_warning_html"] = (
+            'Note: the verdict above was derived from the attested '
+            '<code>report.json</code>, but the live results database '
+            'disagrees with that attestation '
+            '(see the §14 donut below for the numeric drift). The '
+            'prose may be stale — re-run <code>topofuzz attest</code> '
+            'to refresh.'
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------
