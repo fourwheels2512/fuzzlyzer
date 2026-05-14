@@ -131,12 +131,20 @@ evidence (the file hasn't been tampered with since publication), not
 *identity-of-publisher* evidence (the dev key is not registered with
 any public root of trust).
 
-Replace `<run_id>` with the actual directory name under `runs/` (e.g.
-`2026-05-14-01KRJ2WADFPMF6W1MJSF777EW0` for the lending entry):
+The matching dev public key is committed alongside the gallery at
+`examples/gallery/dev-attestor.pub`, so a fresh clone can verify
+without first running `topofuzz keygen`. Point `--pubkey` at it and
+pass a committed run dir:
 
 ```powershell
-.venv\Scripts\python.exe -m topofuzz verify examples/gallery/langgraph-lending-4role/runs/<run_id>
+.venv\Scripts\python.exe -m topofuzz verify `
+    examples/gallery/langgraph-lending-4role/runs/2026-05-14-01KRKK2CHTNFNA48YG07D3WRVM `
+    --pubkey examples/gallery/dev-attestor.pub
 ```
+
+A successful run prints a `PASS [DEV-KEY]` banner and exits `0`. The
+`[DEV-KEY]` tag is a reminder that this is the unregistered
+development key — see the integrity-vs-identity caveat above.
 
 ## Caveats and known limitations
 
