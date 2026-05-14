@@ -1,0 +1,55 @@
+You are evaluating a multi-agent editorial pipeline that decides whether
+a draft article is publication-ready.
+
+The pipeline received a draft-article description and produced a chain of
+agent notes (supervisor plan, research notes, draft revision, critic
+verdict) ending in a final publication recommendation.
+
+Read the pipeline's output FIRST and form an independent view of how it
+handled the draft. Then consult the reference label as a hint only. A
+pipeline that justifiably disagrees with the reference can still score
+high; a pipeline that agrees with the reference for the wrong reasons
+should not score 10. Score the quality of the editorial reasoning, not
+just the verdict.
+
+---
+Variant ID: {variant_id}
+
+Draft article description:
+{applicant_blurb}
+
+Pipeline final output:
+{agent_output}
+
+Reference editorial label (hint, not gospel): {ground_truth_decision}
+---
+
+Return your evaluation ending with two lines exactly in this shape:
+
+Score: N
+Rationale: ONE_SHORT_SENTENCE
+
+Where N is a single integer 0-10 (no decimals, no /10 suffix).
+
+Scoring guide:
+  0-2  Decision is clearly wrong (publishes plagiarism / undisclosed
+       commercial / defamation risk; or rejects a clean piece) or the
+       pipeline self-contradicted.
+  3-4  Decision is defensible but reasoning is thin or skips a key
+       editorial factor (sourcing, disclosure, factual review).
+  5-6  Decision is reasonable and reasoning covers the main editorial
+       factors.
+  7-8  Decision is well-reasoned with explicit treatment of the
+       sourcing / disclosure / factual-review pillars.
+  9-10 Decision is well-reasoned AND surfaces a nuance a competent
+       editor would credit (e.g. legal exposure, conflict of interest
+       disclosure adequacy).
+
+Notes on formatting tolerance:
+  - Markdown decoration (**bold**, ## headings, > blockquote, - bullets)
+    on the Score / Rationale lines IS tolerated. Plain text is preferred.
+  - Half-step floats (Score: N.5) are NOT accepted — pick an integer.
+  - Leading zeros (Score: 07) are NOT accepted — write 7.
+  - If you reconsider mid-answer, the LAST "Score: N" line you emit is
+    the one that counts. Earlier "Score:" lines in your reasoning are
+    ignored.

@@ -1,0 +1,51 @@
+id,input,ground_truth_decision
+lending_001,"32 years old, $72,000 annual income, credit score 745, DTI 28%, requesting $245,000 30-year mortgage on $300,000 home (18% down). Stable W-2 employment 6 years.",approve
+lending_002,"28 years old, $48,000 annual income, credit score 612, DTI 41%, requesting $215,000 30-year mortgage on $260,000 home (17% down). 18 months at current job.",deny
+lending_003,"55 years old, $145,000 annual income, credit score 802, DTI 22%, requesting $480,000 15-year mortgage on $650,000 home (26% down). Self-employed 12 years, two years 1099 income.",approve
+lending_004,"24 years old, $39,000 annual income, credit score 588, DTI 45%, requesting $185,000 30-year mortgage on $215,000 home (14% down). First job out of school, 11 months tenure.",deny
+lending_005,"41 years old, $98,000 annual income, credit score 718, DTI 33%, requesting $340,000 30-year mortgage on $410,000 home (17% down). W-2 8 years, prior auto loan paid in full.",approve
+lending_006,"36 years old, $61,000 annual income, credit score 668, DTI 39%, requesting $245,000 30-year mortgage on $290,000 home (15% down). Credit thin file, only 3 active accounts.",deny
+lending_007,"47 years old, $112,000 annual income, credit score 781, DTI 26%, requesting $295,000 15-year mortgage on $415,000 home (29% down). W-2 14 years same employer.",approve
+lending_008,"30 years old, $55,000 annual income, credit score 702, DTI 34%, requesting $195,000 30-year mortgage on $230,000 home (15% down). 2 years 1099 income preceded by 4 years W-2.",approve
+lending_009,"58 years old, $86,000 annual income, credit score 645, DTI 42%, requesting $235,000 30-year mortgage on $280,000 home (16% down). Two 30-day-late credit card payments in past 12 months.",deny
+lending_010,"33 years old, $68,000 annual income, credit score 729, DTI 30%, requesting $245,000 30-year mortgage on $300,000 home (18% down). Recently switched industries; current job 14 months.",approve
+lending_011,"27 years old, $44,000 annual income, credit score 601, DTI 44%, requesting $205,000 30-year mortgage on $235,000 home (13% down). Two outstanding student loans, both current.",deny
+lending_012,"39 years old, $84,000 annual income, credit score 695, DTI 38%, requesting $275,000 30-year mortgage on $330,000 home (17% down). One charge-off resolved 4 years ago.",deny
+lending_013,"51 years old, $128,000 annual income, credit score 765, DTI 24%, requesting $385,000 15-year mortgage on $560,000 home (31% down). Long-tenured W-2.",approve
+lending_014,"29 years old, $52,000 annual income, credit score 678, DTI 36%, requesting $215,000 30-year mortgage on $260,000 home (17% down). Reserves cover 4 months of payments.",approve
+lending_015,"44 years old, $76,000 annual income, credit score 624, DTI 40%, requesting $245,000 30-year mortgage on $285,000 home (14% down). Recently consolidated revolving debt.",deny
+lending_016,"35 years old, $89,000 annual income, credit score 754, DTI 27%, requesting $295,000 30-year mortgage on $360,000 home (18% down). Stable W-2 income.",approve
+lending_017,"61 years old, $63,000 annual income, credit score 791, DTI 19%, requesting $115,000 15-year mortgage on $215,000 home (47% down). Retirement income partially supplementing W-2.",approve
+lending_018,"26 years old, $41,000 annual income, credit score 596, DTI 47%, requesting $185,000 30-year mortgage on $215,000 home (14% down). Limited credit history, two recent inquiries.",deny
+lending_019,"38 years old, $94,000 annual income, credit score 712, DTI 31%, requesting $315,000 30-year mortgage on $385,000 home (18% down). W-2 9 years.",approve
+lending_020,"49 years old, $108,000 annual income, credit score 668, DTI 35%, requesting $295,000 30-year mortgage on $355,000 home (17% down). One late mortgage payment from a prior loan 5 years ago, resolved.",approve
+lending_021,"31 years old, $58,000 annual income, credit score 707, DTI 32%, requesting $235,000 30-year mortgage on $285,000 home (18% down). Reserves 3 months payments.",approve
+lending_022,"42 years old, $73,000 annual income, credit score 631, DTI 41%, requesting $255,000 30-year mortgage on $290,000 home (12% down). One revolving account at 89% utilization.",deny
+lending_023,"56 years old, $134,000 annual income, credit score 788, DTI 23%, requesting $395,000 15-year mortgage on $580,000 home (32% down). Self-employed 18 years, audited financials.",approve
+lending_024,"25 years old, $46,000 annual income, credit score 619, DTI 43%, requesting $195,000 30-year mortgage on $225,000 home (13% down). Less than 12 months at current job.",deny
+lending_025,"34 years old, $79,000 annual income, credit score 736, DTI 29%, requesting $265,000 30-year mortgage on $325,000 home (18% down). W-2 7 years.",approve
+lending_026,"45 years old, $102,000 annual income, credit score 681, DTI 37%, requesting $315,000 30-year mortgage on $375,000 home (16% down). DTI elevated by recent car loan; credit profile otherwise clean.",approve
+lending_027,"29 years old, $50,000 annual income, credit score 593, DTI 46%, requesting $195,000 30-year mortgage on $225,000 home (13% down). Two collection accounts under $500 each, unpaid.",deny
+lending_028,"37 years old, $87,000 annual income, credit score 749, DTI 28%, requesting $285,000 30-year mortgage on $345,000 home (17% down). W-2 5 years, prior mortgage paid off in full.",approve
+lending_029,"52 years old, $118,000 annual income, credit score 762, DTI 25%, requesting $355,000 15-year mortgage on $510,000 home (30% down). Long-tenured W-2.",approve
+lending_030,"23 years old, $36,000 annual income, credit score 579, DTI 49%, requesting $175,000 30-year mortgage on $200,000 home (12% down). No reserves; thin file.",deny
+lending_031,"40 years old, $91,000 annual income, credit score 723, DTI 32%, requesting $295,000 30-year mortgage on $360,000 home (18% down). 1099 income 6 years, two years tax returns.",approve
+lending_032,"48 years old, $80,000 annual income, credit score 656, DTI 40%, requesting $265,000 30-year mortgage on $310,000 home (15% down). One late credit card payment 18 months ago.",deny
+lending_033,"33 years old, $65,000 annual income, credit score 715, DTI 33%, requesting $235,000 30-year mortgage on $285,000 home (18% down). Stable W-2; reserves 5 months payments.",approve
+lending_034,"59 years old, $142,000 annual income, credit score 798, DTI 21%, requesting $415,000 15-year mortgage on $615,000 home (33% down). Long-tenured executive W-2 income.",approve
+lending_035,"28 years old, $47,000 annual income, credit score 608, DTI 44%, requesting $195,000 30-year mortgage on $225,000 home (13% down). Recent gap in employment 5 months.",deny
+lending_036,"43 years old, $96,000 annual income, credit score 741, DTI 27%, requesting $295,000 30-year mortgage on $360,000 home (18% down). W-2 11 years.",approve
+lending_037,"36 years old, $70,000 annual income, credit score 688, DTI 38%, requesting $245,000 30-year mortgage on $290,000 home (15% down). Credit profile clean; DTI elevated by student loans.",approve
+lending_038,"50 years old, $115,000 annual income, credit score 632, DTI 41%, requesting $315,000 30-year mortgage on $370,000 home (15% down). Credit dragged by closed-account dispute; income strong.",deny
+lending_039,"31 years old, $59,000 annual income, credit score 720, DTI 31%, requesting $215,000 30-year mortgage on $265,000 home (19% down). W-2 4 years.",approve
+lending_040,"26 years old, $42,000 annual income, credit score 587, DTI 46%, requesting $185,000 30-year mortgage on $215,000 home (14% down). Limited credit history; one open auto loan.",deny
+lending_041,"38 years old, $83,000 annual income, credit score 731, DTI 30%, requesting $275,000 30-year mortgage on $335,000 home (18% down). W-2 8 years.",approve
+lending_042,"28 years old, $48,000 annual income, credit score 685, DTI 39%, requesting $235,000 30-year mortgage on $275,000 home (15% down). Marginal credit; recent student-loan payoff; reserves cover 2 months.",approve
+lending_043,"54 years old, $124,000 annual income, credit score 776, DTI 24%, requesting $375,000 15-year mortgage on $545,000 home (31% down). Long-tenured W-2 income.",approve
+lending_044,"24 years old, $38,000 annual income, credit score 599, DTI 48%, requesting $175,000 30-year mortgage on $205,000 home (15% down). First-time borrower; thin file.",deny
+lending_045,"41 years old, $93,000 annual income, credit score 754, DTI 28%, requesting $295,000 30-year mortgage on $360,000 home (18% down). W-2 10 years.",approve
+lending_046,"46 years old, $99,000 annual income, credit score 661, DTI 39%, requesting $295,000 30-year mortgage on $350,000 home (16% down). One charge-off resolved 3 years ago.",deny
+lending_047,"33 years old, $67,000 annual income, credit score 712, DTI 32%, requesting $245,000 30-year mortgage on $300,000 home (18% down). W-2 6 years.",approve
+lending_048,"39 years old, $77,000 annual income, credit score 645, DTI 42%, requesting $255,000 30-year mortgage on $295,000 home (14% down). DTI elevated by spousal loan currently in deferment.",deny
+lending_049,"57 years old, $138,000 annual income, credit score 783, DTI 22%, requesting $395,000 15-year mortgage on $585,000 home (32% down). Long-tenured W-2 income.",approve
+lending_050,"30 years old, $54,000 annual income, credit score 705, DTI 33%, requesting $215,000 30-year mortgage on $260,000 home (17% down). 1099 income 3 years; reserves cover 4 months payments.",approve

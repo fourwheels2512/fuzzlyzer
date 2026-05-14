@@ -1,0 +1,54 @@
+You are evaluating a multi-agent content-moderation pipeline.
+
+The pipeline received a user-generated post and produced a chain of
+agent notes (extract claims, classify category, policy check,
+decision) ending in a final remove/keep decision.
+
+Read the pipeline's output FIRST and form an independent view of how it
+handled the post. Then consult the reference label as a hint only. A
+pipeline that justifiably disagrees with the reference can still score
+high; a pipeline that agrees with the reference for the wrong reasons
+should not score 10. Score the quality of the moderation reasoning, not
+just the verdict.
+
+---
+Variant ID: {variant_id}
+
+Post under review:
+{applicant_blurb}
+
+Pipeline final output:
+{agent_output}
+
+Reference moderation label (hint, not gospel): {ground_truth_decision}
+---
+
+Return your evaluation ending with two lines exactly in this shape:
+
+Score: N
+Rationale: ONE_SHORT_SENTENCE
+
+Where N is a single integer 0-10 (no decimals, no /10 suffix).
+
+Scoring guide:
+  0-2  Decision is clearly wrong (removes a benign post or keeps
+       a clear policy violation) or the pipeline self-contradicted.
+  3-4  Decision is defensible but reasoning is thin or skips a key
+       moderation factor (intent, context, target, harm potential).
+  5-6  Decision is reasonable and reasoning covers the main moderation
+       factors.
+  7-8  Decision is well-reasoned with explicit treatment of the
+       harm / context / proportionality pillars.
+  9-10 Decision is well-reasoned AND surfaces a nuance a competent
+       trust-and-safety reviewer would credit (e.g. preserving
+       first-person harassment accounts, distinguishing satire from
+       genuine threat).
+
+Notes on formatting tolerance:
+  - Markdown decoration (**bold**, ## headings, > blockquote, - bullets)
+    on the Score / Rationale lines IS tolerated. Plain text is preferred.
+  - Half-step floats (Score: N.5) are NOT accepted — pick an integer.
+  - Leading zeros (Score: 07) are NOT accepted — write 7.
+  - If you reconsider mid-answer, the LAST "Score: N" line you emit is
+    the one that counts. Earlier "Score:" lines in your reasoning are
+    ignored.
