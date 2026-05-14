@@ -168,19 +168,31 @@ class JudgeUnparseableError(RuntimeError):
 _SCORE_RE = re.compile(
     r"(?im)^[\s*#>\-]*\**\s*Score:\**\s*\**\s*(10|[0-9])\**(?!\.\d)(?!\d)"
 )
-# Rationale capture. ``[\s*#>\-]*`` allows the same markdown leaders as
-# Score. ``\**`` at end strips a trailing ``**`` from bold-wrapped
-# rationales like ``**Rationale: ok**`` (second-pass MINOR-1).
-_RATIONALE_RE = re.compile(
-    r"(?im)^[\s*#>\-]*\**\s*Rationale:\**\s*(.+?)\**\s*$"
+# Rationale LABEL. ``[\s*#>\-]*`` allows the same markdown leaders as
+# Score; ``\**`` tolerates ``**Rationale:**`` bold-wrapping. This only
+# matches the *label* — _parse_score takes the body as everything from
+# the label to the first blank line. A single-line ``$``-anchored
+# capture was insufficient: real judge LLMs (Gemini Flash especially)
+# wrap the "one short sentence" the rubric asks for across physical
+# lines, and the old regex truncated those to the first fragment
+# (often 1-3 words like "The" / "The decision").
+_RATIONALE_LABEL_RE = re.compile(
+    r"(?im)^[\s*#>\-]*\**\s*Rationale:\**[ \t]*"
 )
 
-# Persisted-rationale length cap. The rubric contract is a single
-# rationale line; this bounds a pathological / adversarial LLM response
-# from inflating ``run.sqlite`` (which is SHA-256'd into the signed
-# attestation) without limit. Generous — a real one-line rationale is
-# well under this. ``_RATIONALE_RE`` already pins the capture to one
-# line, so no newline-sanitization is needed on top of the slice.
+# Paragraph break — a blank (whitespace-only) line. The rationale body
+# is captured only up to here so a judge's trailing sign-off / "Note:" /
+# "---" postscript after the rationale is not swallowed into it. ``\r``
+# is in the inner class so a CRLF response (``\r\n\r\n``) still counts
+# as a break.
+_PARAGRAPH_BREAK_RE = re.compile(r"\n[ \t\r]*\n")
+
+# Persisted-rationale length cap. The rubric contract is a single short
+# rationale sentence; this bounds a pathological / adversarial LLM
+# response from inflating ``run.sqlite`` (which is SHA-256'd into the
+# signed attestation) without limit. Generous — a real rationale is
+# well under this. _parse_score also collapses internal whitespace
+# (incl. newlines) so the persisted value is single-line.
 _RATIONALE_MAX_CHARS: Final[int] = 1000
 
 
@@ -202,18 +214,23 @@ def _parse_score(response_text: str) -> tuple[int, str]:
     match as the authoritative score (second-pass BLOCKER-1, BLOCKER-2).
 
     Rationale is optional — a missing rationale becomes an empty string.
+    When present, it is the text from the first ``Rationale:`` label
+    *after the authoritative score* through the next blank line,
+    whitespace-collapsed to a single line and length-capped (see
+    :data:`_RATIONALE_MAX_CHARS`).
     """
     if not isinstance(response_text, str):
         raise JudgeUnparseableError(
             f"Judge response must be str; got {type(response_text).__name__}"
         )
-    matches = _SCORE_RE.findall(response_text)
-    if not matches:
+    score_matches = list(_SCORE_RE.finditer(response_text))
+    if not score_matches:
         raise JudgeUnparseableError(
             "Judge response missing 'Score: <int>' line. Response was:\n"
             f"{response_text[:500]}"
         )
-    raw = int(matches[-1])
+    last_score = score_matches[-1]
+    raw = int(last_score.group(1))
     # Range check kept as defense in depth even though the regex
     # alternation pins N to 0-10 by construction. A future regex edit
     # that broadens the integer class would otherwise silently accept
@@ -223,8 +240,24 @@ def _parse_score(response_text: str) -> tuple[int, str]:
             f"Judge score {raw} out of range [0, 10]. Response was:\n"
             f"{response_text[:500]}"
         )
-    rm = _RATIONALE_RE.search(response_text)
-    rationale = rm.group(1).strip() if rm else ""
+    # Rationale belongs to the SAME answer block as the authoritative
+    # score. The rubric format is "Score:" then "Rationale:", so we take
+    # the FIRST "Rationale:" label at or after the LAST "Score:" match.
+    # Anchoring to the score (rather than "last Rationale: anywhere")
+    # keeps the two extractors agreeing on one block: a self-correction
+    # like a trailing "...Score: 8" with no following Rationale yields an
+    # empty rationale, not block-1's rationale mis-paired with block-2's
+    # score. The body runs from the label to the first blank line — so a
+    # trailing sign-off / "Note:" / "---" postscript isn't swallowed —
+    # with internal whitespace (incl. the newlines Gemini wraps the
+    # rationale across) collapsed to single spaces and a trailing
+    # markdown ``**`` stripped.
+    rationale = ""
+    label_match = _RATIONALE_LABEL_RE.search(response_text, last_score.end())
+    if label_match:
+        tail = response_text[label_match.end():]
+        tail = _PARAGRAPH_BREAK_RE.split(tail, maxsplit=1)[0]
+        rationale = " ".join(tail.split()).rstrip("*").strip()
     # Bound the persisted rationale (see _RATIONALE_MAX_CHARS): it lands
     # in run.sqlite, which is digested into the signed attestation.
     return raw, rationale[:_RATIONALE_MAX_CHARS]
