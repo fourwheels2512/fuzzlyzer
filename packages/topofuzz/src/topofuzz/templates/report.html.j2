@@ -417,6 +417,106 @@
     font-style: italic;
   }
 
+  /* Flip-composition donut --------------------------------------- */
+  .flip-composition {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 22px 26px;
+    margin: 8px 0 0 0;
+    display: flex;
+    gap: 28px;
+    align-items: center;
+  }
+  .flip-composition .donut { flex-shrink: 0; }
+  .flip-composition .donut svg { display: block; }
+  .flip-composition .legend {
+    flex: 1;
+    font-family: var(--font-serif);
+    font-size: 14px;
+    color: var(--ink);
+    line-height: 1.55;
+  }
+  .flip-composition .legend-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 6px;
+  }
+  .flip-composition .legend-swatch {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+    flex-shrink: 0;
+  }
+  .flip-composition .legend-swatch.flipped { background: var(--accent); }
+  .flip-composition .legend-swatch.stable {
+    background: var(--border-soft);
+    border: 1px solid var(--border);
+  }
+  .flip-composition .legend-row strong {
+    color: var(--ink-strong);
+    font-weight: 600;
+  }
+  .flip-composition .direction-row {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border-soft);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--muted-soft);
+  }
+  .flip-composition .direction-row .a2d { color: var(--accent); font-weight: 600; }
+  .flip-composition .direction-row .d2a { color: var(--success); font-weight: 600; }
+  .flip-composition.disabled {
+    color: var(--muted-soft);
+    font-family: var(--font-serif);
+    font-style: italic;
+    font-size: 14px;
+    display: block;
+  }
+  .flip-composition .drift-warning {
+    margin-top: 8px;
+    padding-top: 0;
+    border-top: none;
+    color: var(--warn);
+    font-family: var(--font-serif);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .flip-composition .drift-warning code {
+    font-family: var(--font-mono);
+    background: var(--border-soft);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 11px;
+  }
+
+  /* Variance-distribution sparkline ------------------------------ */
+  .variance-sparkline {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 22px 14px 22px;
+    margin: 8px 0 0 0;
+  }
+  .variance-sparkline svg { display: block; width: 100%; height: 100px; }
+  .variance-sparkline .sparkline-caption {
+    color: var(--muted-soft);
+    font-size: 12px;
+    margin-top: 8px;
+    font-family: var(--font-serif);
+    font-style: italic;
+    line-height: 1.5;
+  }
+  .variance-sparkline.disabled {
+    color: var(--muted-soft);
+    font-family: var(--font-serif);
+    font-style: italic;
+    font-size: 14px;
+  }
+
   /* Tooltip pattern --------------------------------------------- */
   .term {
     border-bottom: 1px dotted var(--muted);
@@ -459,6 +559,8 @@
     .wc-grid { grid-template-columns: 1fr; }
     .wc-side:first-child { border-right: none; border-bottom: 1px solid var(--border-soft); }
     ul.evals { columns: 2; }
+    .flip-composition { flex-direction: column; align-items: stretch; gap: 18px; }
+    .flip-composition .donut { align-self: center; }
   }
 </style>
 </head>
@@ -486,6 +588,36 @@
   </div>
 
   {% if matrix_warning %}<div class="warning">⚠ {{ matrix_warning }}</div>{% endif %}
+
+  <!-- FLIP-COMPOSITION-SECTION-BEGIN -->
+  {% if not flip_composition.disabled %}
+  <h2>Where did the flips happen? <span class="section-tag">Flip composition · §14</span></h2>
+  <p class="explainer">A picture of how often the verdict shifted when we re-ordered the agents. The orange ring is the share of (variant, eval) comparisons whose binary verdict disagreed with the original variant.<span class="engineer-note">verdict_flip_rate.point read from report.json (the signed mirror); approve→deny / deny→approve directional split computed live from run.sqlite at score threshold 0.5. The arrow → reads as "transitioned to".</span></p>
+  <div class="flip-composition">
+    <div class="donut">{{ flip_composition.donut_svg | safe }}</div>
+    <div class="legend">
+      <div class="legend-row">
+        <span class="legend-swatch flipped"></span>
+        <span><strong>{{ flip_composition.n_flips }} of {{ flip_composition.n_pairs }} (variant, eval) pairs flipped</strong>{% if not flip_composition.drift_flag %} ({{ flip_composition.flip_rate_pct_int }}%){% endif %}</span>
+      </div>
+      <div class="legend-row">
+        <span class="legend-swatch stable"></span>
+        <span><strong>{{ flip_composition.n_pairs - flip_composition.n_flips }} of {{ flip_composition.n_pairs }} pairs stable</strong>{% if not flip_composition.drift_flag %} ({{ 100 - flip_composition.flip_rate_pct_int }}%){% endif %}</span>
+      </div>
+      <div class="direction-row">
+        Of the {{ flip_composition.n_flips }} flips:
+        <span class="a2d">↓ {{ flip_composition.approve_to_deny }} went APPROVE → DENY</span> (more denials),
+        <span class="d2a">↑ {{ flip_composition.deny_to_approve }} went DENY → APPROVE</span> (more approvals).
+      </div>
+      {% if flip_composition.drift_flag %}
+      <div class="drift-warning">
+        Note: the donut percentage ({{ flip_composition.flip_rate_pct_int }}%) came from the attested record, but the legend counts ({{ flip_composition.live_pct_int }}%) came from the current results database. They disagree, so re-run <code>topofuzz attest</code> to refresh.
+      </div>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+  <!-- FLIP-COMPOSITION-SECTION-END -->
 
   <h2>What we tested <span class="section-tag">Run manifest</span></h2>
   <p class="explainer">The setup that produced these numbers. None of this changes the result — it records what code, what data, and what judge ran.</p>
@@ -581,8 +713,26 @@
   {% endif %}
   <!-- WORSTCASE-SECTION-END -->
 
-  <h2>Per-eval variance across orderings <span class="section-tag">§9</span></h2>
-  <p class="explainer">One bar per eval row. Tall bars mean the same input produced very different scores when we shuffled the agent order — the topology is more order-sensitive on those evals.<span class="engineer-note">Per-eval np.var across the variant axis (ddof=0). Higher = topology is more order-sensitive on that eval.</span></p>
+  <!-- VARIANCE-DISTRIBUTION-SECTION-BEGIN -->
+  <h2>Where is the instability concentrated? <span class="section-tag">Per-eval variance · §9 summary</span></h2>
+  <p class="explainer">Each bar is one eval, sorted by variance descending. Bars at-or-above the dashed line clear the §10a worst-case-candidate threshold — those are the evals whose verdict was most order-sensitive. This is a topology-fragility threshold, not a safety threshold. The instability is usually concentrated on a few evals, not spread evenly.<span class="engineer-note">np.var(matrix[:, j], ddof=0) per eval, sorted descending. Bars at variance ≥ DEFAULT_VARIANCE_GATE (sourced from topofuzz.metrics.worstcase) are accent-coloured.</span></p>
+  {% if variance_distribution.disabled %}
+  <div class="variance-sparkline disabled">
+    Variance distribution unavailable —
+    {% if variance_distribution.disabled_reason %}{{ variance_distribution.disabled_reason }}{% else %}no continuous-judge cells to plot{% endif %}.
+  </div>
+  {% else %}
+  <div class="variance-sparkline">
+    {{ variance_distribution.sparkline_svg | safe }}
+    <div class="sparkline-caption">
+      {{ variance_distribution.n_above_gate }} of {{ variance_distribution.n_evals }} evals cleared the threshold (variance ≥ {{ '%g' % variance_distribution.threshold }}){% if variance_distribution.n_truncated %} · showing top {{ variance_distribution.n_evals - variance_distribution.n_truncated }} of {{ variance_distribution.n_evals }} evals in the chart{% endif %}.
+    </div>
+  </div>
+  {% endif %}
+  <!-- VARIANCE-DISTRIBUTION-SECTION-END -->
+
+  <h2>Per-eval variance across orderings <span class="section-tag">§9 detail</span></h2>
+  <p class="explainer">The same evals as the sparkline above, plotted with axis labels for engineers who want to read the per-eval values directly. Failed eval columns render as gray hatched zero-bars here (the sparkline above shows them as zero-height too — same data, different presentation).<span class="engineer-note">Per-eval np.var across the variant axis (ddof=0). Higher = topology is more order-sensitive on that eval.</span></p>
   <div class="chart-card">
     <figure>
       {{ voo_svg | safe }}

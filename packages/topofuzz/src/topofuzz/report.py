@@ -4,7 +4,9 @@ Reads ``<run_dir>/manifest.json`` (required), ``<run_dir>/run.sqlite``
 (required), and ``<run_dir>/attestation.json`` (optional, presence
 implies the ``[DEV-KEY]`` banner). Produces ``<run_dir>/report.html``
 with two inline matplotlib SVGs — per-eval voo bar + score-matrix
-heatmap — and banner conditionals per BLUEPRINT_v5plus.md §11.
+heatmap — plus two hand-rolled SVGs from step 18.5b (flip-composition
+donut + per-eval variance sparkline) and banner conditionals per
+BLUEPRINT_v5plus.md §11.
 
 Verify-path safety: this module is **never** imported at module scope
 by :mod:`topofuzz.cli`, :mod:`topofuzz.attest`,
@@ -42,6 +44,7 @@ from __future__ import annotations
 import datetime as _datetime
 import json
 import logging
+import math
 import re
 import sqlite3
 from importlib import resources
@@ -161,6 +164,12 @@ def render_report(run_dir: Path) -> Path:
         matrix, variant_ids, eval_ids_from_db, run_dir, run_id, manifest
     )
     summary_ctx = _render_summary_panel(run_dir)
+    flip_composition_ctx = _render_flip_composition_panel(
+        matrix, variant_ids, run_dir, manifest
+    )
+    variance_distribution_ctx = _render_variance_distribution_panel(
+        matrix, eval_ids_from_db
+    )
 
     # Banner gates. attestation.json presence is the structural check,
     # but we additionally require the file to parse as JSON shaped like
@@ -250,6 +259,8 @@ def render_report(run_dir: Path) -> Path:
         matrix_warning=matrix_warning,
         worstcase=worstcase_ctx,
         summary=summary_ctx,
+        flip_composition=flip_composition_ctx,
+        variance_distribution=variance_distribution_ctx,
     )
 
     out_path = run_dir / "report.html"
@@ -982,6 +993,605 @@ def _render_summary_panel(run_dir: Path) -> dict[str, Any]:
         "summary_text": ctx.summary_text,
         "summary_html": ctx.summary_html,
     }
+
+
+# ---------------------------------------------------------------------------
+# Step 18.5b — flip-composition donut + per-eval variance sparkline
+#
+# Both helpers hand-roll their SVG (no matplotlib) per the Variant D sketch
+# contract — these are the at-a-glance "headline" visuals that complement
+# the existing matplotlib voo bar + heatmap. Hand-rolling keeps the SVG
+# byte-stable across matplotlib upgrades and avoids spinning a figure
+# canvas just to draw 50 rectangles.
+# ---------------------------------------------------------------------------
+
+
+# Verdict-flip threshold matches :mod:`topofuzz.metrics.verdict_flip`'s
+# default — keeping a single value so the donut's directional split and
+# the signed headline number cannot disagree by accident. The constant
+# is duplicated here (rather than imported) so report.py stays
+# importable when ``topofuzz.metrics.verdict_flip`` isn't on the
+# verify-only path. Drift risk is low (the value is part of the v0.5
+# attestation contract) but a v0.5.1 polish item is to lift the
+# constant to a shared location and assert equality in tests.
+_FLIP_THRESHOLD: float = 0.5
+
+# §10a worst-case gate: per-eval variance ≥ this value promotes the
+# eval into the worst-case viewer's candidate set. Sourced from
+# :mod:`topofuzz.metrics.worstcase` lazily (inside
+# :func:`_render_variance_distribution_panel`) so the sparkline's gate
+# matches the §10a promoter's gate exactly. Uses ``>=`` (audit RT-3:
+# the worstcase promoter at ``worstcase.py:356`` is inclusive; the
+# sparkline must agree on boundary values).
+_WORSTCASE_GATE_FALLBACK: float = 0.1
+
+# Hard cap on bars rendered in the sparkline. Above ~200 the bar widths
+# collapse below 1 SVG-unit and bars stop being visually distinguishable;
+# the headline counts (n_evals, n_above_gate) still cover the full set.
+_SPARKLINE_BAR_RENDER_CAP: int = 200
+
+# Tolerance for the donut's signed-vs-live drift check. A clean run
+# satisfies ``abs(live_rate - signed_rate) ≤ 0.005`` by construction
+# (both numerators come from the same masking, threshold, and orig_idx);
+# the only way they diverge is when ``run.sqlite`` was edited between
+# attestation and ``topofuzz report``. We surface the drift with a log
+# WARNING + a Jinja-side annotation; we do NOT disable the donut, since
+# the drift case still has informational content (the user just needs
+# to know which number is the signed truth).
+_FLIP_DRIFT_TOLERANCE: float = 0.005
+
+
+def _render_flip_composition_panel(
+    matrix: "np.ndarray",
+    variant_ids: tuple[str, ...],
+    run_dir: Path,
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the Jinja context for the §14 flip-composition donut.
+
+    Sources the headline number from
+    ``<run_dir>/report.json``'s ``headline.verdict_flip_rate.point`` (the
+    step-15a plain mirror of the signed attestation) so the rendered
+    percentage matches what was signed. Computes the approve→deny vs
+    deny→approve directional split from the in-memory score matrix
+    using the SAME threshold (``_FLIP_THRESHOLD``) and the SAME §6
+    "original variant = manifest insertion order" convention as
+    :func:`compute_verdict_flip_rate` — that's why we delegate the
+    original-index resolution to :func:`_resolve_original_variant_index`
+    in :mod:`topofuzz.attest`. Sharing a single resolver means the
+    donut and the signed payload cannot disagree on which variant was
+    the "original".
+
+    Returns one of:
+
+    * ``{"disabled": True, "disabled_reason": str}`` — donut hidden.
+      Reasons: ``"verdict-flip rate unavailable"`` (no report.json
+      or malformed), ``"score matrix empty"``, ``"single-variant
+      run (no permuted variants to compare)"``, ``"score matrix
+      has zero eval columns"``, ``"attest helper unavailable"``,
+      ``"original variant unresolvable"``, ``"direction split
+      computation error"``.
+    * ``{"disabled": False, "flip_rate": float,
+      "flip_rate_pct_int": int, "live_pct_int": int, "n_flips":
+      int, "n_pairs": int, "approve_to_deny": int,
+      "deny_to_approve": int, "drift_flag": bool, "donut_svg":
+      str}`` — donut rendered. ``flip_rate_pct_int`` is the signed
+      percent (donut center); ``live_pct_int`` is the live recount
+      percent (legend). They agree in clean runs; ``drift_flag``
+      is set when they diverge by more than
+      :data:`_FLIP_DRIFT_TOLERANCE`.
+
+    Degrades on any exception (same pattern as
+    :func:`_render_worstcase_panel`) — a crash here must not take
+    down the rest of the report.
+    """
+    flip_rate = _read_flip_rate_from_report_json(run_dir)
+    if flip_rate is None:
+        return {
+            "disabled": True,
+            "disabled_reason": "verdict-flip rate unavailable",
+        }
+
+    # Audit RT pass-1 MINOR-2: branch the disabled reason so the user
+    # sees a precise diagnostic. The three matrix-shape failure modes
+    # are distinct and the operator's next step differs for each.
+    if matrix.size == 0:
+        return {
+            "disabled": True,
+            "disabled_reason": "score matrix empty",
+        }
+    if matrix.shape[0] < 2:
+        return {
+            "disabled": True,
+            "disabled_reason": "single-variant run (no permuted variants to compare)",
+        }
+    if matrix.shape[1] < 1:
+        return {
+            "disabled": True,
+            "disabled_reason": "score matrix has zero eval columns",
+        }
+
+    # Lazy import — :mod:`topofuzz.attest` is heavy enough that we don't
+    # want it on the verify-only fast path. The lazy import mirrors
+    # :func:`_render_summary_panel`'s pattern.
+    try:
+        from topofuzz.attest import _resolve_original_variant_index
+    except ImportError as e:
+        # Audit pass-2 Cross-step MAJOR-2: log-discipline — exception
+        # type only, never the bare exception object. Locked from
+        # step 18a commit ac28ac7.
+        _log.warning(
+            "report: flip-composition disabled (attest helper "
+            "unavailable: %s)", type(e).__name__,
+        )
+        return {
+            "disabled": True,
+            "disabled_reason": "attest helper unavailable",
+        }
+
+    try:
+        orig_idx = _resolve_original_variant_index(manifest, variant_ids)
+    except (TypeError, ValueError, KeyError) as e:
+        _log.warning(
+            "report: flip-composition raised %s during original-variant "
+            "resolution — section disabled (run_dir=%s)",
+            type(e).__name__, run_dir,
+        )
+        return {
+            "disabled": True,
+            "disabled_reason": "original variant unresolvable",
+        }
+    if orig_idx is None:
+        return {
+            "disabled": True,
+            "disabled_reason": "original variant unresolvable",
+        }
+
+    try:
+        a2d, d2a, n_pairs = _count_flip_directions(matrix, orig_idx)
+    except (ValueError, ImportError, TypeError, IndexError) as e:
+        # Audit RT pass-1 MINOR-1: ``IndexError`` added for
+        # defense-in-depth against a future resolver refactor that
+        # could return an out-of-range int (today's
+        # ``_resolve_original_variant_index`` cannot, but the donut
+        # must not crash and take down the rest of the report).
+        _log.warning(
+            "report: flip-composition direction count raised %s — "
+            "section disabled (run_dir=%s)",
+            type(e).__name__, run_dir,
+        )
+        return {
+            "disabled": True,
+            "disabled_reason": "direction split computation error",
+        }
+
+    n_flips = a2d + d2a
+
+    # Audit consensus (Code-reviewer MAJOR + RT MAJOR + Blueprint
+    # MAJOR): detect signed-vs-live drift. The signed ``flip_rate``
+    # from ``report.json`` and the live ``n_flips/n_pairs`` produce
+    # an identical numerator and denominator on cells that
+    # ``compute_verdict_flip_rate`` includes in ``finite_cols``: on
+    # zero-finite-pair columns both sums add zero, so the rate
+    # matches. They diverge ONLY when ``run.sqlite`` was edited
+    # between attestation and ``topofuzz report``. Surface a small
+    # annotation so the legend doesn't quietly contradict the donut
+    # center; do NOT disable the section, since both numbers are
+    # still informational and the user needs to see them to diagnose.
+    #
+    # Audit pass-2 Code-reviewer MAJOR-2: the ``n_pairs > 0`` guard
+    # also covers the silent-contradiction edge case. When the live
+    # matrix has zero finite cell-pairs (every column has either a
+    # NaN original or a NaN permuted) AND the signed flip_rate is
+    # non-zero, the donut still has to surface drift — otherwise the
+    # legend reads "0 of 0 pairs flipped (44%)" which is the exact
+    # contradiction the detector exists for.
+    drift_flag = False
+    if n_pairs > 0:
+        live_rate = float(n_flips) / float(n_pairs)
+        if abs(live_rate - flip_rate) > _FLIP_DRIFT_TOLERANCE:
+            drift_flag = True
+            _log.warning(
+                "report: signed verdict_flip_rate.point=%.4f differs "
+                "from live n_flips/n_pairs=%.4f (run_dir=%s) — "
+                "report.json may be stale relative to run.sqlite",
+                flip_rate, live_rate, run_dir,
+            )
+    elif flip_rate > _FLIP_DRIFT_TOLERANCE:
+        # Zero pairs but a signed non-zero rate — definitionally a
+        # stale-mirror case. Set the flag so the template renders
+        # the warning instead of "0 of 0 pairs flipped (X%)".
+        drift_flag = True
+        _log.warning(
+            "report: signed verdict_flip_rate.point=%.4f but live "
+            "matrix has zero finite cell-pairs (run_dir=%s) — "
+            "report.json may be stale relative to run.sqlite",
+            flip_rate, run_dir,
+        )
+
+    return {
+        "disabled": False,
+        "flip_rate": flip_rate,
+        # Pre-rounded for the donut center text — Jinja-side
+        # ``'%d' % (flip_rate * 100)`` would be a banker's-rounding
+        # surprise for the 0.005 boundary. Pre-rounding once means the
+        # donut percentage and the legend percentage are guaranteed
+        # identical without the template having to re-derive.
+        "flip_rate_pct_int": int(round(flip_rate * 100)),
+        # Live percentage for the legend on drift — keeps the legend
+        # numerically self-consistent (audit pass-2 Code-reviewer
+        # MAJOR-3: previously the legend rendered "X of Y pairs
+        # flipped (Z%)" where Z was the SIGNED %, contradicting X/Y).
+        "live_pct_int": (
+            int(round(100.0 * n_flips / n_pairs)) if n_pairs > 0 else 0
+        ),
+        "n_flips": n_flips,
+        "n_pairs": n_pairs,
+        "approve_to_deny": a2d,
+        "deny_to_approve": d2a,
+        "drift_flag": drift_flag,
+        "donut_svg": _render_donut_svg(flip_rate),
+    }
+
+
+def _read_flip_rate_from_report_json(run_dir: Path) -> float | None:
+    """Read ``headline.verdict_flip_rate.point`` from ``report.json``.
+
+    Returns ``None`` if the file is missing, unreadable, malformed, or
+    the field is absent / out of ``[0, 1]``. Logs WARNING on read
+    failure — silent on missing-file (a pre-step-15a run dir is a
+    legitimate state and the report still renders for those).
+    """
+    report_json_path = run_dir / "report.json"
+    if not report_json_path.is_file():
+        return None
+    try:
+        raw = report_json_path.read_text(encoding="utf-8")
+        doc = json.loads(raw)
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        _log.warning(
+            "report: report.json unreadable for flip-composition (%s) — "
+            "donut disabled (run_dir=%s)",
+            type(e).__name__, run_dir,
+        )
+        return None
+    if not isinstance(doc, dict):
+        return None
+    headline = doc.get("headline")
+    if not isinstance(headline, dict):
+        return None
+    vf = headline.get("verdict_flip_rate")
+    if not isinstance(vf, dict):
+        return None
+    point = vf.get("point")
+    # ``isinstance(True, int)`` is True in Python — exclude bools so a
+    # serialiser that wrote ``true`` doesn't sneak in as ``1.0``.
+    if not isinstance(point, (int, float)) or isinstance(point, bool):
+        return None
+    point_f = float(point)
+    if not math.isfinite(point_f):
+        return None
+    if not (0.0 <= point_f <= 1.0):
+        return None
+    return point_f
+
+
+def _count_flip_directions(
+    matrix: "np.ndarray", orig_idx: int,
+) -> tuple[int, int, int]:
+    """Count approve→deny / deny→approve transitions vs the original.
+
+    Returns ``(a2d, d2a, n_pairs)``:
+
+    * ``a2d`` — count of (permuted_variant, eval) cells where the
+      original variant's binarised verdict was PASS but the permuted
+      variant's verdict was FAIL (and both cells are finite).
+    * ``d2a`` — symmetric count for (FAIL → PASS).
+    * ``n_pairs`` — total denominator (both cells finite).
+
+    ``a2d + d2a`` is the same numerator that
+    :func:`compute_verdict_flip_rate` uses for the headline rate, by
+    construction: the masking, the threshold, and the original-index
+    resolver are all shared. The donut's split therefore decomposes
+    the signed headline exactly in clean runs.
+    """
+    import numpy as np
+
+    valid = np.isfinite(matrix)
+    preds = matrix >= _FLIP_THRESHOLD
+
+    orig_preds = preds[orig_idx, :]
+    orig_valid = valid[orig_idx, :]
+
+    perm_mask = np.ones(matrix.shape[0], dtype=bool)
+    perm_mask[orig_idx] = False
+    perm_preds = preds[perm_mask, :]
+    perm_valid = valid[perm_mask, :]
+
+    denom_mask = perm_valid & orig_valid[None, :]
+    # ``np.where`` mirrors compute_verdict_flip_rate's audit-RT-M1
+    # pattern: NaN cells propagate as False through ``>= threshold``,
+    # so without the explicit denom gate, "False == False == agreement"
+    # would silently count failed cells as non-flips and skew the split.
+    a2d_mask = denom_mask & orig_preds[None, :] & ~perm_preds
+    d2a_mask = denom_mask & ~orig_preds[None, :] & perm_preds
+
+    return int(a2d_mask.sum()), int(d2a_mask.sum()), int(denom_mask.sum())
+
+
+def _render_donut_svg(flip_rate: float) -> str:
+    """Hand-rolled donut SVG matching the Variant D sketch (130×130).
+
+    Outer track is the Variant D border-soft cream; the orange arc is
+    the Variant D ``--accent`` (#c25024). Center text is the integer-
+    rounded percentage in serif (matches the report's editorial voice);
+    the caption "flipped" sits below in italic muted serif.
+
+    The arc is drawn as a stroked circle with ``stroke-dasharray``
+    = ``"<filled> <rest>"`` and a ``rotate(-90)`` so the arc starts at
+    12 o'clock. ``stroke-linecap`` is omitted (defaults to ``butt``) so
+    the arc edges line up with the track exactly.
+    """
+    # Geometry: r=46 + stroke-width=18 → outer radius 55, leaves 5px
+    # padding inside the 130×130 viewBox for the bevel.
+    radius = 46
+    circumference = 2.0 * math.pi * radius
+    # Clamp defensively: report.json carries the signed point in [0,1],
+    # but a future serialiser that emits, say, 1.0 + 1e-15 shouldn't
+    # produce an SVG with a negative ``rest`` (browsers tolerate it but
+    # the rendered arc gets a hairline overshoot).
+    fr = max(0.0, min(1.0, float(flip_rate)))
+    filled = fr * circumference
+    rest = circumference - filled
+    pct = int(round(fr * 100))
+    # Audit UX pass-2 MAJOR-1+2: a darkened track (#e7d8c2 ≈ 1.40:1
+    # vs #ffffff card surface) was strictly an improvement over the
+    # invisible #f0eae0 (~1.20:1) but ALSO weakened the orange arc's
+    # contrast vs the track on the common non-zero case (3.93:1 →
+    # 3.36:1). The right fix is to KEEP the lighter track (best
+    # arc-vs-track contrast) and add a 1px outer ring in
+    # ``--muted`` (#897764, ~4.0:1 vs surface) that defines the
+    # donut shape regardless of arc length — so a 0%-flip donut
+    # still reads as a deliberate "no flips" donut, not a rendering
+    # bug. The outer-ring radius is r=55 (track radius 46 + half
+    # stroke-width 9) so it sits exactly at the track's outer edge.
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 130 130" '
+        'width="130" height="130" role="img" '
+        f'aria-label="Verdict flip rate: {pct}%. {pct}% of '
+        'permuted-variant answers disagreed with the original variant '
+        'on the same eval.">'
+        '<circle cx="65" cy="65" r="55" fill="none" '
+        'stroke="#897764" stroke-width="1"/>'
+        '<circle cx="65" cy="65" r="46" fill="none" '
+        'stroke="#f0eae0" stroke-width="18"/>'
+        f'<circle cx="65" cy="65" r="46" fill="none" '
+        f'stroke="#c25024" stroke-width="18" '
+        f'stroke-dasharray="{filled:.3f} {rest:.3f}" '
+        f'stroke-dashoffset="0" transform="rotate(-90 65 65)"/>'
+        '<text x="65" y="68" text-anchor="middle" '
+        'font-family="Source Serif Pro, Georgia, serif" '
+        f'font-size="26" font-weight="500" fill="#1f1c19">{pct}%</text>'
+        '<text x="65" y="86" text-anchor="middle" '
+        'font-family="Source Serif Pro, Georgia, serif" '
+        'font-size="11" font-style="italic" fill="#6b5f54">flipped</text>'
+        '</svg>'
+    )
+
+
+def _render_variance_distribution_panel(
+    matrix: "np.ndarray",
+    eval_ids: tuple[str, ...],
+) -> dict[str, Any]:
+    """Build the Jinja context for the §9 variance-distribution sparkline.
+
+    Computes per-eval variance via ``np.var(matrix, axis=0, ddof=0)``
+    (same closure as :func:`_render_voo_bar_svg` and
+    :func:`compute_voo_for_attestation`). NaN columns (failed cells
+    in that column propagate to NaN variance) are zero-filled — same
+    policy as :func:`_render_voo_bar_svg`'s
+    ``np.where(np.isnan(per_eval), 0.0, per_eval)`` so the sparkline
+    and the §9 detail chart agree on ``n_evals``. The result is sorted
+    descending; bars at-or-above the §10a gate are accent-colored,
+    bars below are muted gray. A dashed threshold line at the gate
+    marks which evals cleared.
+
+    The §10a gate value is sourced from
+    :data:`topofuzz.metrics.worstcase.DEFAULT_VARIANCE_GATE` (lazy
+    import) rather than re-encoded locally, so a future blueprint
+    revision that bumps the gate updates one site, not two.
+
+    Returns a disabled context (mirroring :func:`_render_worstcase_panel`)
+    when the matrix is empty.
+    """
+    if matrix.size == 0 or matrix.shape[0] < 1 or matrix.shape[1] < 1:
+        return {
+            "disabled": True,
+            "disabled_reason": "no continuous-judge cells to score",
+        }
+
+    import numpy as np
+
+    try:
+        # Audit pass-2 Code-reviewer MAJOR-1: ``np.nanvar`` matches
+        # ``worstcase.py:300`` exactly. The earlier ``np.var`` →
+        # zero-fill landed the WRONG invariant (matched the voo bar,
+        # which is a secondary chart) and silently desynced the
+        # sparkline from the §10a candidate set on any run with a
+        # partial-failure cell. ``np.nanvar`` ignores NaN cells per
+        # column, returning NaN only for fully-NaN columns; we
+        # zero-fill those (matching the voo bar's display policy)
+        # so two charts on the same page still agree on ``n_evals``.
+        per_eval = np.nanvar(matrix, axis=0, ddof=0)
+    except (ValueError, TypeError) as e:
+        _log.warning(
+            "report: variance-distribution np.nanvar raised %s — "
+            "section disabled", type(e).__name__,
+        )
+        return {
+            "disabled": True,
+            "disabled_reason": "variance computation error",
+        }
+
+    # Audit RT pass-1 MAJOR-3: source the gate from the §10a
+    # promoter so the sparkline and the worstcase candidate set
+    # agree on boundary values. The fallback is the v0.5 contract
+    # value, used only if the import fails (verify-only install
+    # without metrics — should never happen here since we already
+    # need numpy to compute per_eval).
+    try:
+        from topofuzz.metrics.worstcase import DEFAULT_VARIANCE_GATE as _gate
+        gate = float(_gate)
+    except ImportError as e:
+        # Audit pass-2 Cross-step MAJOR-2: log-discipline — exception
+        # type only, never the bare exception object. Locked decision
+        # from step 18a commit ac28ac7.
+        _log.warning(
+            "report: variance-distribution falling back to local gate "
+            "constant (%s)", type(e).__name__,
+        )
+        gate = _WORSTCASE_GATE_FALLBACK
+
+    # Audit pass-2 Code-reviewer MAJOR-1 (cont.): zero-fill columns
+    # that ``np.nanvar`` left NaN (i.e., FULLY-NaN columns where
+    # nothing finite remains to compute variance from). Per-column
+    # partial-failure cells are already correctly handled by nanvar.
+    plot_values = np.where(np.isnan(per_eval), 0.0, per_eval)
+
+    # Sort descending; ties broken by original column index for
+    # cross-platform determinism. ``np.argsort(-x, kind="stable")``
+    # alone is unstable across BLAS/SIMD paths when many columns
+    # have nominally identical variance (audit Code-reviewer
+    # MINOR-1). ``lexsort`` with the primary key ``-plot_values``
+    # and secondary key ``arange`` enforces a single canonical
+    # ordering everywhere numpy runs.
+    primary = -plot_values.astype(np.float64)
+    secondary = np.arange(plot_values.size, dtype=np.int64)
+    sort_idx = np.lexsort((secondary, primary))
+    sorted_vals = plot_values[sort_idx].astype(np.float64)
+
+    n = int(sorted_vals.size)
+    # Audit RT pass-1 MAJOR-3 (cont.): use ``>=`` to match
+    # ``worstcase.py:356`` exactly. With strict ``>`` the sparkline
+    # would say "this eval did NOT clear the gate" while §10a
+    # surfaces it as a worst-case card — boundary-case desync.
+    n_above_gate = int((sorted_vals >= gate).sum())
+    max_var = float(sorted_vals.max())
+
+    # Cap the rendered bar count so a 500-eval run doesn't render
+    # invisible sub-pixel bars. Headline numbers (n, n_above_gate) still
+    # cover the FULL set — only the SVG bar list is capped.
+    rendered_vals = sorted_vals[:_SPARKLINE_BAR_RENDER_CAP]
+    n_truncated = max(0, n - _SPARKLINE_BAR_RENDER_CAP)
+
+    return {
+        "disabled": False,
+        "n_evals": n,
+        "n_above_gate": n_above_gate,
+        "max_variance": max_var,
+        "threshold": gate,
+        "n_truncated": n_truncated,
+        "sparkline_svg": _render_sparkline_svg(
+            rendered_vals,
+            max_variance=max_var,
+            threshold=gate,
+            n_above_gate_total=n_above_gate,
+            n_total=n,
+        ),
+    }
+
+
+def _render_sparkline_svg(
+    sorted_vals: "np.ndarray",
+    *,
+    max_variance: float,
+    threshold: float,
+    n_above_gate_total: int,
+    n_total: int,
+) -> str:
+    """Render the per-eval variance sparkline as inline SVG.
+
+    Layout: 500×100 viewBox, baseline at y=95 (5px bottom padding),
+    bars grow upward to y=5 (5px top padding) → 90px draw area capped
+    to 85px so the topmost bar stops just below the top edge. Bars
+    at-or-above ``threshold`` are accent (#c25024); bars below are
+    muted gray (#cccccc). A dashed gray line marks the threshold.
+
+    ``n_above_gate_total`` and ``n_total`` are the FULL-set counts
+    (before truncation), surfaced into the aria-label so screen-reader
+    users hear the same numbers the visible caption shows. Audit
+    Blueprint MAJOR-2: a previous in-function recount over the
+    truncated ``sorted_vals`` could undercount on capped renders.
+    """
+    n = int(sorted_vals.size)
+    if n == 0:
+        # Defensive only — _render_variance_distribution_panel
+        # short-circuits on empty matrix before reaching here.
+        return _placeholder_svg("no evals to sparkline")
+
+    # Y-axis: always show the threshold line inside the chart area.
+    # If max_variance is below threshold, expand y_max to threshold*1.2
+    # so the line sits at ~80% of the bar area instead of touching the
+    # top edge (where it'd visually disappear).
+    y_max = max(max_variance, threshold * 1.2, 1e-9)
+    chart_top = 5.0
+    chart_bottom = 95.0
+    bar_area = chart_bottom - chart_top  # = 90
+
+    # Bar width: divide 500 by n with a 1px gap on either side per bar
+    # boundary. Floor to keep bars integer-pixel-aligned in browsers
+    # that pixel-snap (Chromium does, Safari pixel-snaps differently;
+    # the .3f below gives sub-pixel placement either way).
+    canvas_w = 500.0
+    bar_w = max(1.0, canvas_w / n - 1.0)
+    # Stride = canvas_w / n centers the bar group across the full width
+    # regardless of n (small-n looks balanced; large-n tiles densely).
+    stride = canvas_w / n
+
+    bars: list[str] = []
+    for i, v in enumerate(sorted_vals):
+        h = (float(v) / y_max) * bar_area
+        # Defensive: a numerical ε can drive h slightly below 0 for a
+        # zero-variance column; clamp so we never emit a negative-
+        # height rect (browsers handle it but it lights up SVG linters).
+        h = max(0.0, min(bar_area, h))
+        x = i * stride
+        y = chart_bottom - h
+        # ``>=`` matches worstcase.py:356 exactly so boundary-case
+        # bars don't desync from the §10a candidate set.
+        color = "#c25024" if float(v) >= threshold else "#cccccc"
+        bars.append(
+            f'<rect x="{x:.3f}" y="{y:.3f}" '
+            f'width="{bar_w:.3f}" height="{h:.3f}" fill="{color}"/>'
+        )
+    bars_svg = "".join(bars)
+
+    # Threshold line: dashed, gray, with a text label at the right
+    # edge. Bumped from font-size 9 to 11 (audit UX MAJOR-4): 9pt at
+    # 100px chart height is below WCAG's user-readable threshold
+    # without zoom; 11pt matches the donut caption.
+    threshold_y = chart_bottom - (threshold / y_max) * bar_area
+    threshold_label = (
+        f"variance = {threshold:g} "
+        "(topology-fragility threshold, not a safety threshold)"
+    )
+
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" '
+        'viewBox="0 0 500 100" width="100%" height="100" '
+        'preserveAspectRatio="none" role="img" '
+        f'aria-label="Per-eval variance sparkline, sorted descending. '
+        f'{n_above_gate_total} of {n_total} evals cleared the '
+        f'topology-fragility threshold (variance ≥ {threshold:g}); '
+        f'remaining {n_total - n_above_gate_total} are stable.">'
+        f'{bars_svg}'
+        f'<line x1="0" y1="{threshold_y:.3f}" x2="500" y2="{threshold_y:.3f}" '
+        'stroke="#897764" stroke-dasharray="3 3" stroke-width="1"/>'
+        f'<text x="498" y="{threshold_y - 3:.3f}" text-anchor="end" '
+        'font-family="ui-monospace, Menlo, Consolas, monospace" '
+        f'font-size="11" fill="#6b5f54">{threshold_label}</text>'
+        '</svg>'
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1427,3 +1427,731 @@ def test_report_summary_idempotent_render(tmp_path: Path) -> None:
         (run_dir / "report.html").read_text(encoding="utf-8")
     )
     assert first == second
+
+
+# ---------------------------------------------------------------------------
+# Step 18.5b — flip-composition donut + per-eval variance sparkline
+# ---------------------------------------------------------------------------
+
+
+_FLIP_SECTION_BEGIN = "<!-- FLIP-COMPOSITION-SECTION-BEGIN -->"
+_FLIP_SECTION_END = "<!-- FLIP-COMPOSITION-SECTION-END -->"
+_VARIANCE_SECTION_BEGIN = "<!-- VARIANCE-DISTRIBUTION-SECTION-BEGIN -->"
+_VARIANCE_SECTION_END = "<!-- VARIANCE-DISTRIBUTION-SECTION-END -->"
+
+
+def _extract_flip_composition_section(body: str) -> str:
+    """Slice the §14 flip-composition section between sentinel comments.
+
+    Same scoping pattern as :func:`_extract_summary_section` /
+    :func:`_extract_worstcase_section` — assertions on the whole body
+    risk matching disclaimer copy or future-section content elsewhere.
+    """
+    start = body.index(_FLIP_SECTION_BEGIN)
+    end = body.index(_FLIP_SECTION_END, start + len(_FLIP_SECTION_BEGIN))
+    return body[start : end + len(_FLIP_SECTION_END)]
+
+
+def _extract_variance_distribution_section(body: str) -> str:
+    """Slice the §9 variance-distribution sparkline section."""
+    start = body.index(_VARIANCE_SECTION_BEGIN)
+    end = body.index(_VARIANCE_SECTION_END, start + len(_VARIANCE_SECTION_BEGIN))
+    return body[start : end + len(_VARIANCE_SECTION_END)]
+
+
+def _make_flipping_run_dir(tmp_path: Path) -> Path:
+    """Build a 4-variant × 3-eval fixture with a known flip pattern.
+
+    var00 is the §6 original (insertion-order-first); the three permuted
+    variants flip on a controlled subset of cells so the directional
+    split is mechanically computable and easy to grep in tests.
+
+    Score layout (threshold = 0.5):
+
+    *   var00 (original): all PASS (0.9, 0.9, 0.9)
+    *   var01: all FAIL (0.1, 0.1, 0.1) → 3 approve→deny vs original
+    *   var02: PASS, FAIL, PASS (0.9, 0.1, 0.9) → 1 approve→deny
+    *   var03: all PASS (0.9, 0.9, 0.9) → 0 flips
+
+    Total flips = 4 (all approve→deny). n_pairs = 9 (3 perm variants
+    × 3 evals). Verdict-flip rate = 4/9 ≈ 0.444.
+    """
+    orderings = [["A", "B"]] * 4
+    run_dir = _make_run_dir(
+        tmp_path, n_variants=4, n_evals=3, variant_orderings=orderings,
+    )
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    try:
+        db.execute("DELETE FROM judge_results")
+        cells = {
+            "var00": [0.9, 0.9, 0.9],
+            "var01": [0.1, 0.1, 0.1],
+            "var02": [0.9, 0.1, 0.9],
+            "var03": [0.9, 0.9, 0.9],
+        }
+        eval_ids = [f"eval-{i}" for i in range(3)]
+        for vid, scores in cells.items():
+            for eid, sc in zip(eval_ids, scores, strict=True):
+                db.execute(
+                    "INSERT INTO judge_results "
+                    "(run_id, variant_id, eval_id, judge_kind, "
+                    " score_value, passed, rationale, failure_reason) "
+                    "VALUES (?, ?, ?, 'continuous', ?, NULL, NULL, NULL)",
+                    ("run-test", vid, eid, sc),
+                )
+        db.commit()
+    finally:
+        db.close()
+    return run_dir
+
+
+# --- flip-composition section -----------------------------------------------
+
+
+def test_report_flip_composition_section_sentinels_present(tmp_path: Path) -> None:
+    """Sentinel HTML comments wrap the §14 section in every render — the
+    test extractor depends on them, and any future template refactor
+    that drops them must surface immediately."""
+    run_dir = _make_run_dir(tmp_path)
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    body = (run_dir / "report.html").read_text(encoding="utf-8")
+    assert _FLIP_SECTION_BEGIN in body
+    assert _FLIP_SECTION_END in body
+    assert body.index(_FLIP_SECTION_BEGIN) < body.index(_FLIP_SECTION_END)
+    # And the donut sentinels precede the worst-case sentinels (donut
+    # sits above the meta-grid, well above §10a worst-case).
+    assert body.index(_FLIP_SECTION_BEGIN) < body.index(_WC_SECTION_BEGIN)
+
+
+def test_report_flip_composition_disabled_without_report_json(
+    tmp_path: Path,
+) -> None:
+    """A pre-step-15a run dir (no report.json) suppresses the §14
+    section entirely (audit UX pass-2 MAJOR-3: a question-shaped
+    void above the meta-grid is worse UX than no section). Sentinels
+    still wrap the (empty) section so test extractors keep working.
+    """
+    run_dir = _make_run_dir(tmp_path)
+    assert not (run_dir / "report.json").exists()
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    body = (run_dir / "report.html").read_text(encoding="utf-8")
+    section = _extract_flip_composition_section(body)
+    # H2 + explainer + body MUST all be suppressed when disabled.
+    assert "Where did the flips happen?" not in section
+    assert "Flip composition unavailable" not in section
+    assert "verdict-flip rate" not in section
+    # Sentinels still present + bracket only whitespace.
+    assert _FLIP_SECTION_BEGIN in body
+    assert _FLIP_SECTION_END in body
+
+
+def test_report_flip_composition_disabled_with_malformed_report_json(
+    tmp_path: Path,
+) -> None:
+    """Garbage JSON in report.json suppresses the section, not crash."""
+    run_dir = _make_run_dir(tmp_path)
+    (run_dir / "report.json").write_text("{not valid", encoding="utf-8")
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_flip_composition_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    assert "Where did the flips happen?" not in section
+
+
+def test_report_flip_composition_disabled_with_missing_headline_field(
+    tmp_path: Path,
+) -> None:
+    """report.json present but ``headline.verdict_flip_rate.point`` is
+    missing → section suppressed."""
+    run_dir = _make_run_dir(tmp_path)
+    _write_report_json(run_dir, verdict_flip_rate=None)
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_flip_composition_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    assert "Where did the flips happen?" not in section
+
+
+def test_report_flip_composition_disabled_with_out_of_range_point(
+    tmp_path: Path,
+) -> None:
+    """A nonsense point value (> 1 or < 0) is rejected — defence in
+    depth against a serialiser bug that wrote a percentage as 31.0
+    instead of 0.31. Section suppressed."""
+    run_dir = _make_run_dir(tmp_path)
+    _write_report_json(
+        run_dir,
+        verdict_flip_rate={
+            "point": 1.5, "ci_lower": 0.0, "ci_upper": 1.0,
+            "degenerate_flag": False,
+        },
+    )
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_flip_composition_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    assert "Where did the flips happen?" not in section
+
+
+def test_report_flip_composition_disabled_for_single_variant(
+    tmp_path: Path,
+) -> None:
+    """A 1-variant fixture has no permuted variants → score matrix
+    has 1 row → directional split is structurally undefined → section
+    is suppressed (audit UX pass-2 MAJOR-3). The internal disabled
+    reason "single-variant run (no permuted variants to compare)"
+    is logged but not user-facing."""
+    run_dir = _make_run_dir(tmp_path, n_variants=1, n_evals=3)
+    _write_report_json(
+        run_dir,
+        verdict_flip_rate={
+            "point": 0.0, "ci_lower": None, "ci_upper": None,
+            "degenerate_flag": True,
+        },
+    )
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_flip_composition_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    assert "Where did the flips happen?" not in section
+
+
+def test_report_flip_composition_renders_with_real_data(tmp_path: Path) -> None:
+    """Happy-path render: donut SVG present, integer percent in centre,
+    legend names the flip count, directional split decomposes the total."""
+    run_dir = _make_flipping_run_dir(tmp_path)
+    # 4/9 ≈ 0.444 — matches what the fixture's matrix produces. Pre-write
+    # the headline so the section renders even without an attestation pass.
+    _write_report_json(
+        run_dir,
+        verdict_flip_rate={
+            "point": 4.0 / 9.0, "ci_lower": 0.20, "ci_upper": 0.70,
+            "degenerate_flag": False,
+        },
+    )
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_flip_composition_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    # Donut SVG present + center text rounds to 44%.
+    assert "<svg" in section
+    assert ">44%<" in section
+    # Legend mentions 4 of 9 (variant, eval) pairs (audit Legal MINOR:
+    # "pair" was undefined; legend now spells the unit out).
+    assert "4 of 9 (variant, eval) pairs flipped" in section
+    assert "5 of 9 pairs stable" in section
+    # Directional split: all 4 flips are approve→deny by construction.
+    # The non-color cue (↓ glyph + descriptive "(more denials)"
+    # annotation; audit Legal pass-2 MINOR-1 reworded "got stricter"
+    # → "(more denials)" to stay descriptive instead of evaluative).
+    assert "↓ 4 went APPROVE → DENY" in section
+    assert "more denials" in section
+    assert "↑ 0 went DENY → APPROVE" in section
+    assert "more approvals" in section
+
+
+def test_report_flip_composition_split_decomposes_count(tmp_path: Path) -> None:
+    """For any fixture, approve→deny + deny→approve == n_flips —
+    pinning the donut's invariant so a future refactor of either
+    counter can't silently desynchronise the legend total."""
+    run_dir = _make_flipping_run_dir(tmp_path)
+    _write_report_json(
+        run_dir,
+        verdict_flip_rate={
+            "point": 4.0 / 9.0, "ci_lower": 0.0, "ci_upper": 1.0,
+            "degenerate_flag": False,
+        },
+    )
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_flip_composition_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    # Pull the three numbers out of the section via simple substring
+    # parsing. Legend after pass-1 + pass-2 fixes:
+    # "X of Y (variant, eval) pairs flipped" / "↓ X went APPROVE → DENY (more denials)"
+    # / "↑ X went DENY → APPROVE (more approvals)". A regex would buy
+    # nothing — the fixture is deterministic.
+    assert "4 of 9 (variant, eval) pairs flipped" in section
+    assert "↓ 4 went APPROVE → DENY" in section
+    assert "↑ 0 went DENY → APPROVE" in section
+    # 4 = 4 + 0 by inspection — the invariant.
+
+
+def test_report_flip_composition_idempotent_render(tmp_path: Path) -> None:
+    """Two renders of the same run dir produce a byte-identical §14
+    section — pinning determinism so a future contributor doesn't
+    sneak a wall-clock or hash into the donut."""
+    run_dir = _make_flipping_run_dir(tmp_path)
+    _write_report_json(
+        run_dir,
+        verdict_flip_rate={
+            "point": 4.0 / 9.0, "ci_lower": 0.0, "ci_upper": 1.0,
+            "degenerate_flag": False,
+        },
+    )
+    runner = CliRunner()
+    runner.invoke(app, ["report", str(run_dir)])
+    first = _extract_flip_composition_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    runner.invoke(app, ["report", str(run_dir)])
+    second = _extract_flip_composition_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    assert first == second
+
+
+# --- variance-distribution sparkline ----------------------------------------
+
+
+def test_report_variance_distribution_section_sentinels_present(
+    tmp_path: Path,
+) -> None:
+    """Sentinel HTML comments wrap the §9 sparkline section in every
+    render."""
+    run_dir = _make_run_dir(tmp_path)
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    body = (run_dir / "report.html").read_text(encoding="utf-8")
+    assert _VARIANCE_SECTION_BEGIN in body
+    assert _VARIANCE_SECTION_END in body
+    assert body.index(_VARIANCE_SECTION_BEGIN) < body.index(_VARIANCE_SECTION_END)
+    # The sparkline sits ABOVE the existing matplotlib voo-bar §9 detail
+    # chart per the Variant D sketch (sparkline = at-a-glance teaser,
+    # matplotlib = engineer detail).
+    assert "§9 detail" in body
+    assert body.index(_VARIANCE_SECTION_END) < body.index("§9 detail")
+
+
+def test_report_variance_distribution_renders_with_real_data(
+    tmp_path: Path,
+) -> None:
+    """Happy-path sparkline render: SVG present, threshold line drawn,
+    caption announces n_above_gate / n_evals."""
+    run_dir = _make_flipping_run_dir(tmp_path)
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_variance_distribution_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    assert "<svg" in section
+    # Threshold line label sits in the SVG as an inline text element.
+    assert "variance = 0.1" in section
+    assert "topology-fragility threshold" in section
+    # 3 evals in the flipping fixture; per-eval variance computed by
+    # np.nanvar(matrix, axis=0, ddof=0) across var00=[0.9,0.9,0.9],
+    # var01=[0.1,0.1,0.1], var02=[0.9,0.1,0.9], var03=[0.9,0.9,0.9]
+    # is [0.12, 0.16, 0.12] — all three clear the 0.1 gate. Audit
+    # pass-2 Code-reviewer MINOR-5: pin "3 of 3" exactly so a future
+    # regression that flipped the count to "0 of 3" or "1 of 3"
+    # wouldn't pass the looser "of 3 evals cleared" substring.
+    assert "3 of 3 evals cleared the threshold" in section
+
+
+def test_report_variance_distribution_disabled_when_matrix_empty(
+    tmp_path: Path,
+) -> None:
+    """An empty score matrix → sparkline disabled with placeholder copy.
+    Same fallback pattern as the existing voo-bar matplotlib SVG."""
+    run_dir = _make_run_dir(tmp_path)
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    try:
+        db.execute("DELETE FROM judge_results")
+        db.commit()
+    finally:
+        db.close()
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_variance_distribution_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    assert "Variance distribution unavailable" in section
+    assert "no continuous-judge cells to score" in section
+
+
+def test_report_variance_distribution_truncation_label_present(
+    tmp_path: Path,
+) -> None:
+    """When the matrix has more evals than the sparkline render cap, the
+    caption announces the truncation count so the user knows the
+    headline numbers cover more than the chart shows."""
+    from topofuzz.report import _SPARKLINE_BAR_RENDER_CAP
+
+    n_evals = _SPARKLINE_BAR_RENDER_CAP + 5
+    run_dir = _make_run_dir(tmp_path, n_variants=2, n_evals=n_evals)
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_variance_distribution_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    # Caption shows "showing top 200 of 205 evals in the chart" when
+    # the bar render cap kicks in (audit UX MINOR: cap exposed as a
+    # clean truncation message instead of "rank N omitted").
+    assert (
+        f"showing top {_SPARKLINE_BAR_RENDER_CAP} of {n_evals} evals in the chart"
+        in section
+    )
+
+
+def test_report_variance_distribution_idempotent_render(tmp_path: Path) -> None:
+    """Two renders → byte-identical sparkline section, pinning
+    determinism on the hand-rolled SVG."""
+    run_dir = _make_flipping_run_dir(tmp_path)
+    runner = CliRunner()
+    runner.invoke(app, ["report", str(run_dir)])
+    first = _extract_variance_distribution_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    runner.invoke(app, ["report", str(run_dir)])
+    second = _extract_variance_distribution_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    assert first == second
+
+
+# --- audit pass-1 fix coverage ----------------------------------------------
+
+
+def test_report_flip_composition_directional_split_survives_non_lex_hashes(
+    tmp_path: Path,
+) -> None:
+    """Audit RT pass-1 MAJOR-4: the donut's directional split MUST
+    pick the §6 original variant via the manifest hash list, NOT by
+    score-matrix row index. Mirrors the existing influence-panel
+    non-lex test (`test_attestation_influence_alignment_survives_non_lex_hashes`).
+    The score-matrix axis is canonical_hash lex-sorted; the §6
+    original is `manifest.variant_canonical_hashes[0]`. If the donut
+    silently drifted to "row 0 of the matrix" the lex-coincident
+    happy-path tests would still pass, but a non-lex hash list would
+    attribute the wrong variant's verdict to the original.
+    """
+    # Hash list in NON-lex order so var_a (the polarised "all PASS"
+    # row that should be the original by manifest-insertion order)
+    # does NOT happen to sit at matrix row 0.
+    hashes = ["zvar_a", "avar_b", "mvar_c", "qvar_d"]
+    # Lex-sorted: avar_b, mvar_c, qvar_d, zvar_a → matrix axis order
+    # places zvar_a at index 3, NOT 0.
+    orderings = [["X"]] * 4
+    run_dir = tmp_path / "non-lex-flip"
+    run_dir.mkdir()
+
+    manifest = {
+        "run_id": "non-lex-flip",
+        "topology_canonical_hash": "topo-hash",
+        "topology_name": "lending_4role",
+        "tds_version": "0.5.0",
+        "tenant_id": "local",
+        "n_variants": 4,
+        "n_eval_rows": 3,
+        "variant_canonical_hashes": hashes,
+        "variant_orderings": orderings,
+        "eval_ids": ["eval-0", "eval-1", "eval-2"],
+        "max_cost_usd": None,
+        "judge_model": "google/gemini-2.5-pro",
+        "rubric_hash": "rh",
+        "semaphore_size": 8,
+        "cli_args": {},
+        "kickoff_ts": 1700000000.0,
+    }
+    (run_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
+
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    try:
+        db.executescript("""
+            CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY,
+                topology_canonical_hash TEXT NOT NULL,
+                topology_name TEXT NOT NULL,
+                tds_version TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                finished_at REAL,
+                n_variants INTEGER,
+                n_evals INTEGER,
+                judge_protocol TEXT,
+                cost_actual_usd REAL,
+                tenant_id TEXT NOT NULL DEFAULT 'local',
+                rubric_hash TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE cells (
+                run_id TEXT NOT NULL,
+                variant_id TEXT NOT NULL,
+                eval_id TEXT NOT NULL,
+                ir_canonical_hash TEXT NOT NULL,
+                node_outputs_json TEXT NOT NULL,
+                error TEXT,
+                cell_cost_usd REAL,
+                PRIMARY KEY (run_id, variant_id, eval_id)
+            );
+            CREATE TABLE judge_results (
+                run_id TEXT NOT NULL,
+                variant_id TEXT NOT NULL,
+                eval_id TEXT NOT NULL,
+                judge_kind TEXT NOT NULL,
+                score_value REAL,
+                passed INTEGER,
+                rationale TEXT,
+                failure_reason TEXT,
+                PRIMARY KEY (run_id, variant_id, eval_id)
+            );
+        """)
+        db.execute(
+            "INSERT INTO runs (run_id, topology_canonical_hash, "
+            "topology_name, tds_version, created_at, status, rubric_hash) "
+            "VALUES ('non-lex-flip', 'h', 'name', '0.5', 0.0, 'succeeded', 'rh')"
+        )
+        # Score layout — keyed by HASH not by row index. zvar_a is
+        # the §6 original (manifest insertion-order index 0); only
+        # avar_b flips against it. Expected counts under correct
+        # alignment: 3 a2d (avar_b's three FAIL cells vs zvar_a's
+        # three PASS), 0 d2a, 9 n_pairs.
+        cells_per_variant = {
+            "zvar_a": [0.9, 0.9, 0.9],   # original (§6 insertion-order index 0)
+            "avar_b": [0.1, 0.1, 0.1],   # flips on every eval
+            "mvar_c": [0.9, 0.9, 0.9],   # no flips
+            "qvar_d": [0.9, 0.9, 0.9],   # no flips
+        }
+        eval_ids = ["eval-0", "eval-1", "eval-2"]
+        for vid, scores in cells_per_variant.items():
+            for eid, sc in zip(eval_ids, scores, strict=True):
+                db.execute(
+                    "INSERT INTO judge_results "
+                    "(run_id, variant_id, eval_id, judge_kind, "
+                    " score_value, passed, rationale, failure_reason) "
+                    "VALUES ('non-lex-flip', ?, ?, 'continuous', ?, "
+                    " NULL, NULL, NULL)",
+                    (vid, eid, sc),
+                )
+        db.commit()
+    finally:
+        db.close()
+    # 3/9 = 0.333... — what compute_verdict_flip_rate would give too.
+    _write_report_json(
+        run_dir,
+        verdict_flip_rate={
+            "point": 3.0 / 9.0, "ci_lower": 0.0, "ci_upper": 1.0,
+            "degenerate_flag": False,
+        },
+    )
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_flip_composition_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    # If the donut had silently picked matrix-row-0 (= avar_b) as
+    # "original", we'd see 3 d2a (FAIL→PASS, since zvar_a/mvar_c/
+    # qvar_d all PASS against avar_b's FAIL) and 0 a2d. The correct
+    # alignment yields 3 a2d / 0 d2a.
+    assert "↓ 3 went APPROVE → DENY" in section
+    assert "↑ 0 went DENY → APPROVE" in section
+
+
+def test_report_flip_composition_drift_warning_renders(tmp_path: Path) -> None:
+    """Audit consensus MAJOR (Code-reviewer + RT + Blueprint pass-1):
+    when the signed flip_rate from report.json disagrees with the live
+    n_flips/n_pairs from run.sqlite by more than the drift tolerance,
+    the legend renders a stale-mirror warning. Audit pass-2
+    Code-reviewer MAJOR-3: the legend's `(X%)` parenthetical is dropped
+    on drift to avoid the contradiction "4 of 9 pairs flipped (10%)";
+    the drift band names BOTH the signed and live percentages explicitly."""
+    run_dir = _make_flipping_run_dir(tmp_path)
+    # Live matrix produces 4 of 9 flips (≈ 44%); write a stale
+    # report.json claiming 10% to force the drift detector.
+    _write_report_json(
+        run_dir,
+        verdict_flip_rate={
+            "point": 0.10, "ci_lower": 0.0, "ci_upper": 0.5,
+            "degenerate_flag": False,
+        },
+    )
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_flip_composition_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    # Drift annotation is visible + spells out both percentages.
+    assert "donut percentage (10%)" in section
+    assert "legend counts (44%)" in section
+    assert "topofuzz attest" in section
+    # Donut center renders signed 10%; legend renders the live count.
+    assert ">10%<" in section
+    assert "4 of 9 (variant, eval) pairs flipped" in section
+    # Critical: the legend MUST NOT render "(10%)" or "(90%)" after
+    # the count when drift is active — that would be the
+    # internally-inconsistent "4 of 9 (variant, eval) pairs flipped (10%)"
+    # that audit pass-2 MAJOR-3 was about.
+    assert "pairs flipped (10%)" not in section
+    assert "pairs stable (90%)" not in section
+
+
+def test_report_flip_composition_no_drift_warning_on_clean_run(
+    tmp_path: Path,
+) -> None:
+    """Inverse of the drift test: when signed and live agree within
+    tolerance, the warning does NOT appear (no false positives)."""
+    run_dir = _make_flipping_run_dir(tmp_path)
+    _write_report_json(
+        run_dir,
+        verdict_flip_rate={
+            "point": 4.0 / 9.0, "ci_lower": 0.0, "ci_upper": 1.0,
+            "degenerate_flag": False,
+        },
+    )
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    section = _extract_flip_composition_section(
+        (run_dir / "report.html").read_text(encoding="utf-8")
+    )
+    assert "report.json is stale" not in section
+
+
+def test_report_variance_sparkline_gate_uses_inclusive_comparator(
+    tmp_path: Path,
+) -> None:
+    """Audit RT pass-1 MAJOR-3 + pass-2 MAJOR-1: the sparkline gate
+    is `>= DEFAULT_VARIANCE_GATE` (matches `worstcase.py:356`), not
+    `>`. Test directly at the function level with FP-free synthetic
+    bars: the previous fixture-based approach used `sqrt(0.1)` whose
+    `np.var` returns `0.10000000000000002` — passes both `>` AND
+    `>=`, so a regression to strict `>` would slip through.
+
+    Direct call to `_render_sparkline_svg` with three explicit bars:
+    one at exactly the gate (must be accent-coloured under `>=`,
+    muted under `>`), one above, one below. The bar-fill color is
+    the comparator-discriminating signal.
+    """
+    from topofuzz.report import _render_sparkline_svg
+    import numpy as np
+
+    # Exactly at the gate, exactly above, exactly below — all
+    # bit-identical 0.1-multiples so the comparison is FP-exact.
+    sorted_vals = np.array([0.2, 0.1, 0.05], dtype=np.float64)
+    svg = _render_sparkline_svg(
+        sorted_vals,
+        max_variance=0.2,
+        threshold=0.1,
+        n_above_gate_total=2,
+        n_total=3,
+    )
+    # First bar (0.2) is above the gate → accent.
+    # Second bar (0.1) is AT the gate → accent under `>=`, muted under `>`.
+    # Third bar (0.05) is below the gate → muted.
+    accent_rects = svg.count('fill="#c25024"')
+    muted_rects = svg.count('fill="#cccccc"')
+    assert accent_rects == 2, (
+        f"Expected 2 accent bars (0.2 + 0.1 boundary) under `>=` "
+        f"semantics; got {accent_rects}. A regression to strict `>` "
+        f"would yield 1 accent bar."
+    )
+    assert muted_rects == 1, (
+        f"Expected 1 muted bar (0.05 below gate); got {muted_rects}."
+    )
+
+
+def test_report_full_section_chain_ordering(tmp_path: Path) -> None:
+    """Audit pass-2 Cross-step MAJOR-3: pin the full top-down section
+    order so a future template refactor cannot legally rearrange any
+    pair of sections without a test failing. The previously-pinned
+    pairwise checks (summary < worstcase, flip < worstcase, variance <
+    §9 detail) left several legal-but-undesired reorderings unguarded.
+    """
+    run_dir = _make_flipping_run_dir(tmp_path)
+    _write_report_json(
+        run_dir,
+        verdict_flip_rate={
+            "point": 4.0 / 9.0, "ci_lower": 0.0, "ci_upper": 1.0,
+            "degenerate_flag": False,
+        },
+    )
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    body = (run_dir / "report.html").read_text(encoding="utf-8")
+
+    # The end-to-end chain: SUMMARY (§17 prose) → FLIP-COMPOSITION
+    # (§14 donut) → "What we tested" (manifest H2) → "Per-agent
+    # influence" (§6a H2) → WORSTCASE (§10a) → VARIANCE-DISTRIBUTION
+    # (§9 sparkline) → "§9 detail" (matplotlib voo bar) → score
+    # matrix → eval IDs → footer disclaimer.
+    #
+    # Each marker is anchored to the HTML body (H2 tag prefix or
+    # sentinel comment) so a CSS-block substring match can't satisfy
+    # the assertion accidentally.
+    chain = [
+        _SUMMARY_SECTION_BEGIN,
+        _FLIP_SECTION_BEGIN,
+        "<h2>What we tested",
+        "<h2>Per-agent influence",
+        _WC_SECTION_BEGIN,
+        _VARIANCE_SECTION_BEGIN,
+        ">§9 detail</span>",
+        "<h2>Score matrix",
+        "<h2>Eval IDs",
+        "Informational only",  # footer disclaimer fragment
+    ]
+    positions = [body.index(marker) for marker in chain]
+    assert positions == sorted(positions), (
+        "Section chain is out of order. Got positions:\n"
+        + "\n".join(f"  {pos:>6} — {marker!r}" for pos, marker in zip(positions, chain))
+    )
+
+
+def test_report_flip_composition_drift_warning_on_zero_pairs(tmp_path: Path) -> None:
+    """Audit pass-2 Code-reviewer MAJOR-2: when the live matrix has
+    zero finite cell-pairs (every column has either a NaN original
+    or a NaN permuted) AND the signed flip_rate is non-zero, the
+    drift detector MUST fire. Otherwise the legend reads
+    "0 of 0 pairs flipped (44%)" — the exact silent contradiction
+    the detector exists for.
+
+    Tested at the function level (not via the CLI) because the
+    all-NaN-cells fixture path would route through
+    ``_read_matrix_or_empty``'s degraded-empty branch (which sets
+    the matrix shape to (0, 0)) before reaching the drift logic.
+    The drift-on-zero-pairs invariant lives inside
+    ``_render_flip_composition_panel`` itself.
+    """
+    import numpy as np
+
+    from topofuzz.report import _render_flip_composition_panel
+
+    # Build a 2×2 NaN-everywhere matrix paired with a manifest that
+    # carries var_a as the §6 original. ``denom_mask = perm_valid &
+    # orig_valid`` will be all-False → n_pairs = 0.
+    matrix = np.full((2, 2), np.nan, dtype=np.float64)
+    variant_ids = ("var_a", "var_b")
+    # Write a real report.json so _read_flip_rate_from_report_json
+    # picks up a non-zero signed point.
+    rd = tmp_path / "zero-pairs-run"
+    rd.mkdir()
+    (rd / "report.json").write_text(
+        json.dumps({"headline": {"verdict_flip_rate": {"point": 4.0 / 9.0}}}),
+        encoding="utf-8",
+    )
+    manifest = {
+        "variant_canonical_hashes": ["var_a", "var_b"],
+        "variant_orderings": [["A"], ["A"]],
+    }
+
+    ctx = _render_flip_composition_panel(matrix, variant_ids, rd, manifest)
+    assert ctx["disabled"] is False
+    assert ctx["n_pairs"] == 0
+    assert ctx["n_flips"] == 0
+    # The drift flag MUST be set when n_pairs == 0 and signed rate
+    # is non-zero, otherwise the rendered legend silently reads
+    # "0 of 0 pairs flipped (44%)" — the bug audit pass-2
+    # Code-reviewer MAJOR-2 caught.
+    assert ctx["drift_flag"] is True, (
+        "drift_flag must be True when n_pairs == 0 and signed "
+        "flip_rate exceeds the drift tolerance — otherwise the "
+        "legend silently contradicts the donut center"
+    )
