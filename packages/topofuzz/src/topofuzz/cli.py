@@ -983,7 +983,14 @@ def _run_with_signal_handling(plan: RunPlan, *, judge: Any = None) -> Any:
     """
     # Lazy import of the orchestrator (mirrors the lazy-import policy
     # in :func:`run` — see comment there about §11a verify-path safety).
+    # ``default_resolver`` is the vendor-dispatched canonical→served
+    # mapper (gemini/openai/anthropic prefix-strip + Anthropic snapshot
+    # map). Without it the §7 cache keys on canonical IDs while the
+    # provider responds with bare/served IDs, mismatch-warning per call
+    # and 5-10× cache miss amplification on warm runs.
+    # (closes BACKLOG: model_served_version_resolver)
     from topofuzz.orchestrator import execute_run
+    from topofuzz.runner import default_resolver
 
     loop_cancel = asyncio.Event()
 
@@ -1011,6 +1018,7 @@ def _run_with_signal_handling(plan: RunPlan, *, judge: Any = None) -> Any:
                 cancel=loop_cancel,
                 judge=judge,
                 judge_prompt_renderer=judge.render_prompt if judge is not None else None,
+                resolver=default_resolver,
             )
         )
     finally:

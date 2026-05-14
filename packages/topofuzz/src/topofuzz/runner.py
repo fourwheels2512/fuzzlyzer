@@ -38,10 +38,18 @@ use), making the cache effective across runs. The actual ``response.model``
 is recorded in :class:`NodeOutput` for forensics and a warning fires on
 mismatch. Net effect:
 
-* Providers that don't alias-route (Gemini direct, OpenAI direct):
-  identity resolver is correct → §7-compliant.
-* Providers that alias-route (Anthropic, multi-region OpenAI): caller
-  MUST inject a resolver that returns the served id. Without one, cache
+* All three hosted vendors (Google, OpenAI, Anthropic) mismatch under
+  the bare :func:`_identity_resolver` because LiteLLM routes with
+  canonical ``<vendor>/<model>`` prefixes that the providers strip in
+  ``response.model``. :func:`default_resolver` is the vendor-dispatched
+  baseline the CLI wires to eliminate the per-call mismatch warning
+  and the §7 cache miss on warm runs. Identity remains the
+  orchestrator-level default kwarg so test fakes that round-trip the
+  model id continue to work unchanged.
+* Providers that ship date-stamped snapshots (Anthropic ``*-latest``,
+  some OpenAI aliases): :func:`default_resolver` covers Anthropic via
+  :data:`_ANTHROPIC_SERVED_MAP`; OpenAI snapshot mapping is deferred
+  to v0.6 (tracked in BACKLOG). Without one, cache
   is consistent and effective across runs but is technically keyed on
   the request id (deviation from §7 spec text — accepted for v0.5,
   surface in step 6 CLI's first-run warning).
@@ -253,6 +261,109 @@ def _default_prompt(
 
 
 def _identity_resolver(model: str) -> str:
+    return model
+
+
+# Vendor-served snapshot table for Anthropic ``*-latest`` aliases. The
+# Anthropic API resolves these to date-stamped served IDs at response
+# time; without a mapping the runner sees mismatched served vs request
+# IDs on every call and burns the cache. Update when Anthropic ships a
+# new snapshot (the resolver-mismatch dedup filter will surface a stale
+# entry as a one-line WARNING per process — that's the canary).
+# Hard-coding a snapshot table is the v0.5 deviation; v0.6 may replace
+# this with a probe call. Empirically confirmed canonical→served per
+# https://docs.anthropic.com/en/docs/about-claude/models as of
+# 2026-05-13.
+_ANTHROPIC_SERVED_MAP: dict[str, str] = {
+    "claude-3-5-sonnet-latest": "claude-3-5-sonnet-20241022",
+    "claude-3-5-haiku-latest": "claude-3-5-haiku-20241022",
+    "claude-3-7-sonnet-latest": "claude-3-7-sonnet-20250219",
+    "claude-3-opus-latest": "claude-3-opus-20240229",
+}
+
+
+def gemini_resolver(model: str) -> str:
+    """Map Gemini canonical IDs to Google AI Studio's served IDs.
+
+    LiteLLM routes Gemini via ``google/gemini-*`` canonical IDs, but the
+    underlying Google AI Studio / Gemini API serves the bare model name
+    without the ``google/`` prefix. With :func:`_identity_resolver` the
+    §7 cache keys on the canonical ID while ``response.model`` carries
+    the bare ID — every call mismatches and the cache misses, causing
+    a 5-10× cost amplification on warm runs. This resolver strips the
+    prefix so the cache key matches the served version.
+
+    Non-``google/``-prefixed inputs pass through unchanged so a future
+    multi-vendor wrapper can chain this resolver safely.
+    """
+    if model.startswith("google/"):
+        return model[len("google/"):]
+    return model
+
+
+def openai_resolver(model: str) -> str:
+    """Map OpenAI canonical IDs to served IDs.
+
+    Strips the LiteLLM ``openai/`` canonical prefix. Non-``openai/``-
+    prefixed inputs pass through unchanged.
+
+    **Known limitation (v0.5):** OpenAI's chat-completions API echoes a
+    date-stamped snapshot in ``response.model`` for un-versioned aliases
+    (e.g. ``gpt-4o`` → ``gpt-4o-2024-11-20``). Prefix-strip alone leaves
+    a snapshot-shape mismatch for those aliases, which still surfaces
+    the dedup-filtered resolver-mismatch warning once per process.
+    Pinning the request to the dated snapshot in the fixture
+    (``openai/gpt-4o-2024-11-20``) eliminates the mismatch entirely;
+    a vendored OpenAI snapshot map is deferred to v0.6 (tracked in
+    BACKLOG).
+    """
+    if model.startswith("openai/"):
+        return model[len("openai/"):]
+    return model
+
+
+def anthropic_resolver(model: str) -> str:
+    """Map Anthropic canonical IDs to served snapshot IDs.
+
+    Anthropic's API resolves ``*-latest`` aliases to date-stamped
+    snapshots in ``response.model`` (e.g. ``claude-3-5-sonnet-latest``
+    → ``claude-3-5-sonnet-20241022``). With :func:`_identity_resolver`
+    the cache key carries the alias while the response carries the
+    snapshot — every call mismatches.
+
+    First strips the ``anthropic/`` prefix; then maps known aliases via
+    :data:`_ANTHROPIC_SERVED_MAP`. Unknown aliases fall through as
+    prefix-stripped (which is the best we can do without an API probe);
+    the resolver-mismatch dedup filter surfaces a one-line WARNING so
+    the operator can update the snapshot table.
+    """
+    bare = model[len("anthropic/"):] if model.startswith("anthropic/") else model
+    return _ANTHROPIC_SERVED_MAP.get(bare, bare)
+
+
+def default_resolver(model: str) -> str:
+    """Vendor-dispatched served-version resolver.
+
+    Dispatches by canonical-id prefix to the per-vendor resolver. This
+    is the resolver the CLI wires by default (see
+    :func:`topofuzz.cli._run_with_signal_handling`), replacing the
+    historical :func:`_identity_resolver` default which produced a
+    canonical/served mismatch warning on every call for the three
+    major hosted vendors. Unknown vendors fall through to identity so
+    the cache key matches the request id (preserving the historical
+    no-resolver-supplied behavior).
+
+    **Case-sensitive on purpose.** LiteLLM's canonical prefixes are
+    spec-fixed lowercase; tolerating ``Google/`` / ``OpenAI/`` /
+    ``Anthropic/`` here would silently mask user typos that should
+    fail loud at the LiteLLM call site rather than at the cache layer.
+    """
+    if model.startswith("google/"):
+        return gemini_resolver(model)
+    if model.startswith("openai/"):
+        return openai_resolver(model)
+    if model.startswith("anthropic/"):
+        return anthropic_resolver(model)
     return model
 
 

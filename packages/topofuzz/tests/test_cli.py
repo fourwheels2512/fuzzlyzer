@@ -404,6 +404,93 @@ def test_cli_run_end_to_end_with_mocked_orchestrator(tmp_path, monkeypatch):
         assert cost is not None and cost > 0.0
 
 
+def test_cli_run_wires_default_resolver_into_execute_run(tmp_path, monkeypatch):
+    """The CLI MUST pass ``default_resolver`` (the vendor-dispatched
+    canonical→served mapper) to ``execute_run``. Without this wiring
+    the §7 cache keys on canonical IDs while the provider responds
+    with bare/snapshot IDs — every call mismatch-warns and the cache
+    misses on warm runs.
+
+    Asserts the kwarg by capturing the call from a fake ``execute_run``.
+    (closes BACKLOG: model_served_version_resolver)
+    """
+    pytest.importorskip("langgraph")
+
+    fixture = tmp_path / "fx.py"
+    fixture.write_text(
+        "from langgraph.graph import END, START, StateGraph\n"
+        "from typing import TypedDict\n"
+        "from topofuzz.ir import LLMConfig\n"
+        "\n"
+        "class _S(TypedDict, total=False):\n"
+        "    x: str\n"
+        "\n"
+        "def _a(s): return s\n"
+        "\n"
+        "def build_graph():\n"
+        "    g = StateGraph(_S)\n"
+        "    g.add_node('a', _a)\n"
+        "    g.add_edge(START, 'a')\n"
+        "    g.add_edge('a', END)\n"
+        "    return g.compile()\n"
+        "\n"
+        "LLM_CONFIGS = {\n"
+        "    'a': LLMConfig(model='google/gemini-2.5-flash'),\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    eval_path = tmp_path / "e.jsonl"
+    eval_path.write_text(
+        '{"id": "e1", "input": "x", "ground_truth_decision": "approve"}\n',
+        encoding="utf-8",
+    )
+
+    async def fake_llm(**kwargs):
+        return {
+            "choices": [{"message": {"content": "ok"}}],
+            "model": "gemini-2.5-flash",  # bare served id
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+
+    from topofuzz import orchestrator as orch_mod
+    from topofuzz.runner import default_resolver
+
+    captured: dict = {}
+    real_execute_run = orch_mod.execute_run
+
+    async def execute_run_capturing(plan, **kwargs):
+        captured["kwargs"] = kwargs
+        kwargs.setdefault("llm_callable", fake_llm)
+        return await real_execute_run(plan, **kwargs)
+
+    monkeypatch.setattr(orch_mod, "execute_run", execute_run_capturing)
+
+    out_dir = tmp_path / "runs"
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            f"{fixture}:build_graph",
+            "--eval", str(eval_path),
+            "--n", "1",
+            "--variants", "1",
+            "--out", str(out_dir),
+            "--no-cache",
+            "--dry-run",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    # Object identity — not "a callable that happens to map the same".
+    # If a future refactor decomposes the resolver into a partial / lambda
+    # we'd want this assertion to fail and prompt updating the contract.
+    assert captured["kwargs"].get("resolver") is default_resolver, (
+        "CLI must wire default_resolver into execute_run; got "
+        f"{captured['kwargs'].get('resolver')!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Step 7 — packaged rubric + --rubric + --dry-run
 # ---------------------------------------------------------------------------

@@ -96,6 +96,33 @@ placeholder version and are not separately enumerated.
 ### Fixed
 
 - N/A — scan was previously a stub raising a "not yet implemented" message.
+- **`model_served_version_resolver` canonical/served mismatch.** The
+  CLI previously left the runner's served-version slot keyed under the
+  bare-identity default, which mismatched LiteLLM's canonical
+  `<vendor>/<model>` request id against the bare/snapshot id every
+  provider returns in `response.model`. Net effect: per-call mismatch
+  warning **and** 5-10× §7 cache miss on warm runs (empirically
+  observed across the gallery in step 19a). New
+  `topofuzz.runner.default_resolver` dispatches by canonical prefix:
+  `gemini_resolver` strips `google/`, `openai_resolver` strips
+  `openai/`, `anthropic_resolver` strips `anthropic/` and maps
+  `*-latest` aliases via a vendored `_ANTHROPIC_SERVED_MAP` snapshot
+  table (3.5 sonnet/haiku, 3.7 sonnet, 3 opus). The CLI now wires
+  `default_resolver` into `execute_run` so the warning is gone and
+  the cache works as designed. **One-time cache invalidation:**
+  existing warm `~/.topofuzz/llm-cache/` entries written under
+  canonical prefixes will not be reused; one cold run then back to
+  normal. OpenAI snapshot mapping is prefix-strip-only in v0.5
+  (deferred to v0.6 — tracked in `BACKLOG.md`).
+- **Cross-step drift propagation into §17 NLS.** The §14 donut
+  detected when `report.json`'s signed `verdict_flip_rate.point`
+  disagreed with the live `n_flips/n_pairs` recount, but the §17
+  natural-language summary — derived from the same signed value —
+  silently rendered stale prose. `_render_summary_panel` now
+  accepts a keyword-only `drift_flag` parameter and renders a
+  complementary stale-prose warning inside the
+  `.natural-language-summary` div with the same warn palette as the
+  donut's drift-warning so a reader recognises the two as paired.
 
 ## [0.5.0rc1] — 2026-05-13
 

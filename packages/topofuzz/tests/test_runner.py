@@ -20,9 +20,14 @@ from fuzzeval.judge import BinaryScore, ContinuousScore  # noqa: E402
 
 from topofuzz.ir import Edge, LLMConfig, Node, Topology  # noqa: E402
 from topofuzz.runner import (  # noqa: E402
+    _ANTHROPIC_SERVED_MAP,
     Cell,
     NodeOutput,
     RunWriter,
+    anthropic_resolver,
+    default_resolver,
+    gemini_resolver,
+    openai_resolver,
     run_variant,
 )
 
@@ -368,6 +373,233 @@ def test_runner_resolver_returning_garbage_falls_back(caplog):
             )
         )
     assert cell.node_outputs[0].model_served_version == "google/gemini-2.5-pro"
+
+
+# ---------------------------------------------------------------------------
+# Vendor canonical → served resolvers (gemini/openai/anthropic/default).
+# Closes BACKLOG: model_served_version_resolver canonical/served
+# mismatch. Without these resolvers the §7 cache keyed on canonical
+# `google/...` / `openai/...` / `anthropic/...` IDs while providers
+# echoed bare/snapshot IDs in response.model, mismatch-warning every
+# call and burning the cache.
+# ---------------------------------------------------------------------------
+
+
+def test_gemini_resolver_strips_canonical_prefix():
+    """``google/gemini-X`` → ``gemini-X`` (the actual Google AI Studio
+    served ID). Non-google inputs pass through unchanged so downstream
+    composition is safe."""
+    assert gemini_resolver("google/gemini-2.5-flash") == "gemini-2.5-flash"
+    assert gemini_resolver("google/gemini-2.5-pro") == "gemini-2.5-pro"
+    assert gemini_resolver("google/gemini-1.5-flash") == "gemini-1.5-flash"
+    # Non-prefixed pass-through (the served form itself round-trips).
+    assert gemini_resolver("gemini-2.5-flash") == "gemini-2.5-flash"
+    # Other-vendor inputs pass through (composability).
+    assert gemini_resolver("openai/gpt-4o") == "openai/gpt-4o"
+
+
+def test_openai_resolver_strips_canonical_prefix():
+    assert openai_resolver("openai/gpt-4o") == "gpt-4o"
+    assert openai_resolver("openai/gpt-4o-mini") == "gpt-4o-mini"
+    assert openai_resolver("gpt-4o") == "gpt-4o"
+    assert openai_resolver("google/gemini-2.5-pro") == "google/gemini-2.5-pro"
+
+
+def test_anthropic_resolver_maps_latest_aliases_to_dated_snapshots():
+    """The Anthropic API resolves ``*-latest`` aliases to date-stamped
+    snapshots; the resolver mirrors that mapping so cache keys match
+    what ``response.model`` will carry."""
+    # Every known mapping round-trips.
+    for alias, snapshot in _ANTHROPIC_SERVED_MAP.items():
+        assert anthropic_resolver(f"anthropic/{alias}") == snapshot
+        # Bare alias (caller already stripped) also resolves.
+        assert anthropic_resolver(alias) == snapshot
+
+    # Unknown alias: prefix-stripped, no snapshot lookup (best effort).
+    # The runner's resolver-mismatch dedup filter will surface the
+    # mismatch as a single WARNING per process, signalling that the
+    # snapshot table needs updating.
+    assert anthropic_resolver(
+        "anthropic/claude-9-future-latest"
+    ) == "claude-9-future-latest"
+
+
+def test_default_resolver_dispatches_by_vendor_prefix():
+    """``default_resolver`` is what the CLI wires by default. It must
+    dispatch by canonical prefix to the per-vendor resolver — Gemini,
+    OpenAI, Anthropic — and fall back to identity for unknown vendors
+    so the historical no-resolver default is preserved."""
+    # Each known vendor routes to its own resolver.
+    assert default_resolver("google/gemini-2.5-flash") == "gemini-2.5-flash"
+    assert default_resolver("openai/gpt-4o") == "gpt-4o"
+    assert default_resolver(
+        "anthropic/claude-3-5-sonnet-latest"
+    ) == "claude-3-5-sonnet-20241022"
+    # Unknown vendors fall through to identity.
+    assert default_resolver("xai/grok-2") == "xai/grok-2"
+    assert default_resolver("mistral/mistral-large") == "mistral/mistral-large"
+    # Already-bare ids round-trip.
+    assert default_resolver("gemini-2.5-flash") == "gemini-2.5-flash"
+
+
+def test_runner_with_default_resolver_emits_no_mismatch_warning_on_gemini(
+    tmp_path, caplog,
+):
+    """Integration test: with ``default_resolver`` wired up, a 1-cell
+    run against a Gemini-canonical model that the provider serves as
+    its bare ID emits NO ``model_served_version_resolver returned ...
+    but provider served ...`` warning. This is the regression test
+    for the canonical/served mismatch BACKLOG item.
+
+    Empirically reproduces the observed v0.5 gallery behavior (every
+    cell printed the warning once with ``_identity_resolver``);
+    asserts the warning disappears when ``default_resolver`` is used.
+    A second call is then verified to hit the §7 cache — the whole
+    point of getting the served-version slot right is cache effectiveness
+    (RT audit MINOR 5b).
+    """
+    topo = _toy_topology(n=1, model="google/gemini-2.5-flash")
+    # Simulate Google AI Studio's actual served behavior: response.model
+    # is the bare ID without the canonical ``google/`` prefix.
+    fake = FakeLLM(served_override="gemini-2.5-flash")
+    llm_cache = LLMCache(tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="topofuzz.runner"):
+        cell = _run(
+            run_variant(
+                topo,
+                {"id": "e1", "input": "x"},
+                llm_callable=fake,
+                llm_cache=llm_cache,
+                model_served_version_resolver=default_resolver,
+            )
+        )
+
+    # Sanity: cell completed cleanly.
+    assert cell.node_outputs[0].model_served_version == "gemini-2.5-flash"
+
+    # The exact warning text from runner.py line ~454. Asserting on the
+    # full template fragment guards against partial-match false negatives
+    # if a future log message reuses the word "resolver".
+    mismatch_warnings = [
+        rec for rec in caplog.records
+        if (
+            "but provider served" in rec.getMessage()
+            and "resolver" in rec.getMessage().lower()
+        )
+    ]
+    assert mismatch_warnings == [], (
+        "default_resolver must produce zero canonical/served mismatch "
+        "warnings on the Gemini happy path — saw:\n"
+        + "\n".join(rec.getMessage() for rec in mismatch_warnings)
+    )
+
+    # Cache-effectiveness regression. Without the resolver fix the §7
+    # cache key carried the canonical prefix while the response served
+    # the bare id, so warm runs cache-missed every time. A correctly
+    # resolved key MUST round-trip on the next lookup — the entire
+    # business case for closing this MAJOR.
+    cell2 = _run(
+        run_variant(
+            topo,
+            {"id": "e1", "input": "x"},
+            llm_callable=fake,
+            llm_cache=llm_cache,
+            model_served_version_resolver=default_resolver,
+        )
+    )
+    assert cell2.node_outputs[0].cache_hit is True
+    assert len(fake.calls) == 1, (
+        "Second run with default_resolver must hit cache — saw "
+        f"{len(fake.calls)} LLM calls (expected 1)"
+    )
+
+    llm_cache.close()
+
+
+def test_anthropic_stale_snapshot_map_surfaces_resolver_mismatch_warning(
+    tmp_path, caplog,
+):
+    """When ``_ANTHROPIC_SERVED_MAP`` becomes stale (Anthropic ships a
+    new snapshot but the in-repo table hasn't been refreshed), the
+    canonical/served mismatch warning MUST fire so operators can see
+    the table needs updating. This pins the staleness-canary contract
+    that audit-pass-1 RT MAJOR called out as untested.
+
+    We simulate staleness by passing a `*-latest` alias the map DOES
+    know but pretending the provider serves a newer date stamp. The
+    resolver's prediction is the old snapshot; the provider's served
+    id is the (hypothetical) new one. The warning must fire.
+    """
+    new_anthropic_snapshot = "claude-3-5-sonnet-99999999"  # future date
+    topo = _toy_topology(n=1, model="anthropic/claude-3-5-sonnet-latest")
+    fake = FakeLLM(served_override=new_anthropic_snapshot)
+    llm_cache = LLMCache(tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="topofuzz.runner"):
+        _run(
+            run_variant(
+                topo,
+                {"id": "e1", "input": "x"},
+                llm_callable=fake,
+                llm_cache=llm_cache,
+                model_served_version_resolver=default_resolver,
+            )
+        )
+
+    mismatch_warnings = [
+        rec for rec in caplog.records
+        if (
+            "but provider served" in rec.getMessage()
+            and new_anthropic_snapshot in rec.getMessage()
+        )
+    ]
+    assert mismatch_warnings, (
+        "Stale _ANTHROPIC_SERVED_MAP MUST surface the resolver-mismatch "
+        "warning — without this canary, the snapshot table can drift "
+        "silently for months and operators only notice via cost reports"
+    )
+
+    llm_cache.close()
+
+
+def test_runner_with_identity_resolver_still_warns_on_gemini(tmp_path, caplog):
+    """Positive control: the original ``_identity_resolver`` default
+    DOES produce the mismatch warning that ``default_resolver``
+    eliminates. Pins both sides of the contract — if a future change
+    silently disables the warning at the runner layer, this test will
+    fail rather than letting :func:`test_runner_with_default_resolver_emits_no_mismatch_warning_on_gemini`
+    succeed for the wrong reason.
+    """
+    topo = _toy_topology(n=1, model="google/gemini-2.5-flash")
+    fake = FakeLLM(served_override="gemini-2.5-flash")
+    llm_cache = LLMCache(tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="topofuzz.runner"):
+        _run(
+            run_variant(
+                topo,
+                {"id": "e1", "input": "x"},
+                llm_callable=fake,
+                llm_cache=llm_cache,
+                # No resolver kwarg → default `_identity_resolver`.
+            )
+        )
+
+    mismatch_warnings = [
+        rec for rec in caplog.records
+        if (
+            "but provider served" in rec.getMessage()
+            and "resolver" in rec.getMessage().lower()
+        )
+    ]
+    assert len(mismatch_warnings) >= 1, (
+        "identity-resolver MUST emit the canonical/served mismatch "
+        "warning so the default_resolver regression test is a real "
+        "test of behavior change, not a passthrough"
+    )
+
+    llm_cache.close()
 
 
 def test_runner_uses_resolver_for_cache_lookup(tmp_path):
