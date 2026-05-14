@@ -1016,7 +1016,17 @@ def _judge_row(
     if cell.judge_failure:
         return "failure", None, None, None, cell.judge_failure_reason
     if isinstance(cell.judge_result, ContinuousScore):
-        return "continuous", cell.judge_result.value, None, None, None
+        # Write rationale verbatim — including "" — matching the
+        # BinaryScore branch below. Both judge kinds then use "" as the
+        # single "no rationale" sentinel; collapsing to NULL here would
+        # split the sentinel by judge_kind.
+        return (
+            "continuous",
+            cell.judge_result.value,
+            None,
+            cell.judge_result.rationale,
+            None,
+        )
     if isinstance(cell.judge_result, BinaryScore):
         passed = 1 if cell.judge_result.passed else 0
         return "binary", None, passed, cell.judge_result.rationale, None
@@ -1046,7 +1056,11 @@ def _judge_to_jsonable(cell: Cell) -> dict | None:
     if cell.judge_failure:
         return {"kind": "failure", "reason": cell.judge_failure_reason}
     if isinstance(cell.judge_result, ContinuousScore):
-        return {"kind": "continuous", "value": cell.judge_result.value}
+        return {
+            "kind": "continuous",
+            "value": cell.judge_result.value,
+            "rationale": cell.judge_result.rationale,
+        }
     if isinstance(cell.judge_result, BinaryScore):
         return {
             "kind": "binary",

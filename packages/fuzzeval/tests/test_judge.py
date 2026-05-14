@@ -24,6 +24,40 @@ def test_continuous_score_holds_value():
     assert s.value == 0.7
 
 
+def test_continuous_score_rationale_defaults_empty():
+    """rationale is optional — pre-rationale callers still construct cleanly."""
+    assert ContinuousScore(value=0.7).rationale == ""
+
+
+def test_continuous_score_holds_rationale():
+    s = ContinuousScore(value=0.7, rationale="meets rubric")
+    assert s.value == 0.7
+    assert s.rationale == "meets rubric"
+
+
+def test_continuous_score_old_pickle_missing_rationale_falls_back():
+    """A ContinuousScore pickled before the rationale field existed has no
+    'rationale' key in its stored __dict__. The dataclass default is a real
+    class attribute, so such an instance resolves ``.rationale`` to "" via the
+    class-attribute fallback instead of raising AttributeError — this is what
+    keeps pre-existing JudgeCache (pickle-backed) entries round-tripping after
+    the field was added."""
+    import pickle
+
+    # A current instance must survive a real pickle round-trip cleanly.
+    fresh = pickle.loads(pickle.dumps(ContinuousScore(value=0.4, rationale="x")))
+    assert fresh == ContinuousScore(value=0.4, rationale="x")
+
+    # Simulate the on-disk shape of a pre-field pickle: a __dict__ carrying
+    # only 'value'. object.__setattr__ is required because the dataclass is
+    # frozen; this mirrors what pickle.loads would reconstruct from old bytes.
+    old = ContinuousScore(value=0.4)
+    object.__setattr__(old, "__dict__", {"value": 0.4})
+    assert "rationale" not in old.__dict__
+    assert old.rationale == ""  # class-attribute fallback, no AttributeError
+    assert old == ContinuousScore(value=0.4)  # __eq__ still resolves cleanly
+
+
 def test_continuous_score_is_frozen():
     s = ContinuousScore(value=0.7)
     with pytest.raises(FrozenInstanceError):
@@ -403,6 +437,41 @@ def test_single_judge_score_happy_path(tmp_path):
     assert len(stub.calls) == 1
 
 
+def test_single_judge_threads_parsed_rationale_into_score(tmp_path):
+    """The Rationale: line the LLM emits is carried on the ContinuousScore,
+    not just debug-logged — that is what makes judge_results.rationale
+    non-NULL for continuous cells."""
+    rubric = _write_rubric(tmp_path / "r.txt")
+    stub = _StubLLM(["Score: 7\nRationale: applicant meets all criteria\n"])
+    j = SingleJudge(model="m", rubric_path=rubric, llm_callable=stub)
+    result = j.score(_payload())
+    assert result.rationale == "applicant meets all criteria"
+
+
+def test_single_judge_missing_rationale_line_yields_empty_string(tmp_path):
+    """A judge response with no Rationale: line still scores; rationale is ""."""
+    rubric = _write_rubric(tmp_path / "r.txt")
+    stub = _StubLLM(["Score: 5\n"])
+    j = SingleJudge(model="m", rubric_path=rubric, llm_callable=stub)
+    result = j.score(_payload())
+    assert result.value == pytest.approx(0.5)
+    assert result.rationale == ""
+
+
+def test_single_judge_rationale_is_length_capped(tmp_path):
+    """A pathologically long Rationale: line is capped before it reaches the
+    ContinuousScore — bounding what lands in run.sqlite / the signed
+    attestation."""
+    from fuzzeval.judge import _RATIONALE_MAX_CHARS
+
+    rubric = _write_rubric(tmp_path / "r.txt")
+    long_rationale = "x" * (_RATIONALE_MAX_CHARS + 500)
+    stub = _StubLLM([f"Score: 6\nRationale: {long_rationale}\n"])
+    j = SingleJudge(model="m", rubric_path=rubric, llm_callable=stub)
+    result = j.score(_payload())
+    assert len(result.rationale) == _RATIONALE_MAX_CHARS
+
+
 def test_single_judge_dry_run_skips_llm(tmp_path):
     rubric = _write_rubric(tmp_path / "r.txt")
 
@@ -413,6 +482,7 @@ def test_single_judge_dry_run_skips_llm(tmp_path):
     result = j.score(_payload())
     assert isinstance(result, ContinuousScore)
     assert result.value == 0.5
+    assert result.rationale == "[DRY-RUN]"
 
 
 def test_single_judge_dry_run_still_renders_for_validation(tmp_path):
@@ -643,6 +713,79 @@ def test_jury_judge_means_three_parseable_votes(tmp_path):
     assert j.judge_independence == {
         "vendor_overlap": ["anthropic", "gemini", "openai"],
     }
+
+
+def test_jury_judge_aggregates_vendor_rationales(tmp_path):
+    """The persisted rationale reflects the whole jury — each parseable
+    vendor's Rationale: line, vendor-prefixed and joined."""
+    stubs = _jury_stubs(
+        {
+            "anthropic": _score_response(4, rationale="weak evidence"),
+            "openai": _score_response(6, rationale="adequate"),
+            "gemini": _score_response(8, rationale="strong case"),
+        }
+    )
+    j = _make_jury(tmp_path, callables=stubs)
+    result = j.score(_payload())
+    # Vendors iterate in dict order; assert each vendor's line is present
+    # rather than pinning the exact join order.
+    assert "anthropic: weak evidence" in result.rationale
+    assert "openai: adequate" in result.rationale
+    assert "gemini: strong case" in result.rationale
+    # ...joined with the " | " delimiter (3 fragments → 2 delimiters).
+    assert result.rationale.count(" | ") == 2
+
+
+def test_jury_judge_joined_rationale_is_length_capped(tmp_path):
+    """Each vendor fragment is capped by _parse_score, but the JOINED result
+    must also be capped — 3 max-length fragments would otherwise blow past
+    _RATIONALE_MAX_CHARS into the signed run.sqlite."""
+    from fuzzeval.judge import _RATIONALE_MAX_CHARS
+
+    big = "x" * (_RATIONALE_MAX_CHARS + 500)
+    stubs = _jury_stubs(
+        {
+            "anthropic": _score_response(4, rationale=big),
+            "openai": _score_response(6, rationale=big),
+            "gemini": _score_response(8, rationale=big),
+        }
+    )
+    j = _make_jury(tmp_path, callables=stubs)
+    result = j.score(_payload())
+    assert len(result.rationale) == _RATIONALE_MAX_CHARS
+
+
+def test_jury_judge_rationale_excludes_failed_vendor(tmp_path):
+    """A dropped (unparseable) vendor contributes no rationale fragment."""
+    stubs = _jury_stubs(
+        {
+            "anthropic": "no score line here",
+            "openai": _score_response(6, rationale="adequate"),
+            "gemini": _score_response(8, rationale="strong case"),
+        }
+    )
+    j = _make_jury(tmp_path, callables=stubs)
+    result = j.score(_payload())
+    assert "anthropic" not in result.rationale
+    assert "openai: adequate" in result.rationale
+    assert "gemini: strong case" in result.rationale
+
+
+def test_jury_judge_all_empty_rationales_yield_empty_string(tmp_path):
+    """When no parseable vendor emitted a Rationale: line, the aggregate is
+    "" — not a string of bare "vendor: " delimiters that would persist as a
+    non-NULL noise value."""
+    stubs = _jury_stubs(
+        {
+            "anthropic": "Score: 4\n",
+            "openai": "Score: 6\n",
+            "gemini": "Score: 8\n",
+        }
+    )
+    j = _make_jury(tmp_path, callables=stubs)
+    result = j.score(_payload())
+    assert result.value == pytest.approx(0.6)
+    assert result.rationale == ""
 
 
 def test_jury_judge_drops_unparseable_vote_and_means_survivors(tmp_path):

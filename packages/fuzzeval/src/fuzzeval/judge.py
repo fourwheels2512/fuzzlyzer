@@ -44,7 +44,7 @@ import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Final, Protocol
 
 from fuzzeval.canonical import canonical_hash
 
@@ -86,9 +86,16 @@ _LLM_TIMEOUT_SECS = _resolve_llm_timeout_secs()
 
 @dataclass(frozen=True)
 class ContinuousScore:
-    """A real-valued judge score in [0, 1]."""
+    """A real-valued judge score in [0, 1] with the judge's rationale.
+
+    ``rationale`` carries the ``Rationale:`` line the judge LLM emitted
+    (empty string when the judge gave none, or for the dry-run / pre-
+    rationale-field cache entries). Defaulted so old pickled cache
+    entries round-trip via the class-attribute fallback.
+    """
 
     value: float
+    rationale: str = ""
 
 
 @dataclass(frozen=True)
@@ -168,6 +175,14 @@ _RATIONALE_RE = re.compile(
     r"(?im)^[\s*#>\-]*\**\s*Rationale:\**\s*(.+?)\**\s*$"
 )
 
+# Persisted-rationale length cap. The rubric contract is a single
+# rationale line; this bounds a pathological / adversarial LLM response
+# from inflating ``run.sqlite`` (which is SHA-256'd into the signed
+# attestation) without limit. Generous — a real one-line rationale is
+# well under this. ``_RATIONALE_RE`` already pins the capture to one
+# line, so no newline-sanitization is needed on top of the slice.
+_RATIONALE_MAX_CHARS: Final[int] = 1000
+
 
 def _parse_score(response_text: str) -> tuple[int, str]:
     """Return (raw_score in [0, 10], rationale) parsed from a judge response.
@@ -210,7 +225,9 @@ def _parse_score(response_text: str) -> tuple[int, str]:
         )
     rm = _RATIONALE_RE.search(response_text)
     rationale = rm.group(1).strip() if rm else ""
-    return raw, rationale
+    # Bound the persisted rationale (see _RATIONALE_MAX_CHARS): it lands
+    # in run.sqlite, which is digested into the signed attestation.
+    return raw, rationale[:_RATIONALE_MAX_CHARS]
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +452,7 @@ class SingleJudge:
             # dry-run rather than waiting for the first real call. Cheap
             # ($0) and catches the most common rubric-author mistake.
             self.render_prompt(payload)
-            return ContinuousScore(value=0.5)
+            return ContinuousScore(value=0.5, rationale="[DRY-RUN]")
 
         prompt = self.render_prompt(payload)
         messages = [{"role": "user", "content": prompt}]
@@ -475,17 +492,12 @@ class SingleJudge:
         # 0-10 → [0, 1]. Integer division would zero everything but the
         # 10 case; explicit float division.
         value = raw / 10.0
-        # Rationale is currently logged but not threaded into the
-        # ContinuousScore (the §17a type only carries `value`). The
-        # rationale is in the LLM response body and would surface via
-        # debug logging if needed; we deliberately don't widen the §17a
-        # type to keep Pramana's BinaryScore the only rationale carrier.
         if rationale:
             _log.debug(
                 "SingleJudge rationale (raw=%d): %s",
                 raw, rationale[:200],
             )
-        return ContinuousScore(value=value)
+        return ContinuousScore(value=value, rationale=rationale)
 
     # ------------------------------------------------------------------
     # Internal: one LLM call returning the response text
@@ -870,6 +882,7 @@ class JuryJudge:
         # ``failed_vendor_calls > total_vendor_calls`` if a reader
         # snapshots between the two ``+=`` statements.
         votes: list[float] = []
+        vote_rationales: list[tuple[str, str]] = []
         parseable_this_call: list[str] = []
         per_call_errors: list[tuple[str, str]] = []
         local_total = 0
@@ -929,6 +942,7 @@ class JuryJudge:
                 )
                 continue
             votes.append(result.value)
+            vote_rationales.append((vendor, result.rationale))
             parseable_this_call.append(vendor)
 
         # Apply the per-call accumulator updates atomically.
@@ -944,7 +958,18 @@ class JuryJudge:
             )
         mean = sum(votes) / len(votes)
         # Mean of values in [0, 1] is itself in [0, 1] — no clamp needed.
-        return ContinuousScore(value=mean)
+        # Rationale aggregates only the parseable vendors that actually
+        # emitted a Rationale: line, vendor-prefixed and joined. Vendors
+        # with an empty rationale contribute nothing — so an all-empty
+        # jury yields "" (NULL once persisted), not a string of bare
+        # "vendor: " delimiters. Each fragment is already single-line and
+        # per-vendor capped by _parse_score; the JOINED result is capped
+        # again here — N fragments × the per-vendor cap would otherwise
+        # exceed _RATIONALE_MAX_CHARS and inflate the signed run.sqlite.
+        jury_rationale = " | ".join(
+            f"{vendor}: {text}" for vendor, text in vote_rationales if text
+        )[:_RATIONALE_MAX_CHARS]
+        return ContinuousScore(value=mean, rationale=jury_rationale)
 
     # ------------------------------------------------------------------
     # Run-level accounting — DoD #14 falsifiability surface.

@@ -888,50 +888,73 @@ def _extract_ground_truth_binary(
     """Return a numpy 0/1 array aligned with ``eval_ids``, or None.
 
     Reads ``manifest.eval_ground_truth`` (parallel to
-    ``manifest.eval_ids``). Each entry must be 0 / 1 / None. Any null
-    entry, missing field, or length mismatch → returns ``None`` (the
-    BA-drop metric is then degenerate; the legacy κ-vs-truth path
-    already null-handles).
+    ``manifest.eval_ids``) and re-indexes it onto the score-matrix eval
+    axis (``eval_ids``) BY eval_id.
 
-    The aligned-by-eval-ids guarantee: the orchestrator writes
-    ``eval_ground_truth`` in the SAME ORDER as ``eval_ids``; the score
-    matrix's eval axis is in insertion order; so positional alignment
-    holds without re-indexing. We still cross-check the manifest's
-    ``eval_ids`` against the score matrix's ``eval_ids`` to catch a
-    refactor that broke the convention.
+    The two axes are NOT positionally aligned: the manifest lists evals
+    in plan order, but :func:`topofuzz.metrics.read_score_matrix`
+    discovers its eval axis in judge-row insertion order — and the
+    concurrent runner does not persist judge rows in plan order. An
+    earlier version of this function asserted positional alignment and
+    bailed on every real run; alignment must be by eval_id.
+
+    Returns ``None`` (BA-drop then degenerate) when: the manifest
+    fields are missing/malformed, the manifest's own ``eval_ids`` /
+    ``eval_ground_truth`` arrays disagree in length, the manifest has
+    duplicate eval_ids, a score-matrix eval_id is absent from the
+    manifest, any ground-truth entry needed for ``eval_ids`` is null,
+    or any value is not 0/1.
     """
+    log = logging.getLogger(__name__)
     if not isinstance(manifest, dict):
         return None
     gt_raw = manifest.get("eval_ground_truth")
     eids_manifest = manifest.get("eval_ids")
     if not isinstance(gt_raw, list) or not isinstance(eids_manifest, list):
         return None
-    if len(gt_raw) != len(eval_ids):
-        return None
-    if tuple(eids_manifest) != tuple(eval_ids):
-        # Audit RT-M6: this mismatch is a structural refactor-bug
-        # signal — log it at ERROR so a regression that breaks the
-        # eval-axis ordering invariant doesn't silently degrade
-        # BA-drop to "ground truth unavailable" on EVERY signed
-        # attestation thereafter. Step 22 PDFs that quote
-        # ``balanced_accuracy_drop=None`` would otherwise look like
-        # "this run has no ground-truth signal" when in fact the
-        # producer's wiring is broken.
-        logging.getLogger(__name__).error(
-            "eval-axis ordering mismatch in attestation path: "
-            "manifest.eval_ids=%r score_matrix.eval_ids=%r — "
-            "BA-drop skipped (structural bug, not a per-run condition)",
-            eids_manifest, eval_ids,
+    if len(gt_raw) != len(eids_manifest):
+        # The manifest's two parallel arrays must agree in length — a
+        # producer bug if they don't. ERROR so a regression surfaces in
+        # operator logs rather than silently degrading BA-drop.
+        log.error(
+            "manifest.eval_ids (len %d) and manifest.eval_ground_truth "
+            "(len %d) disagree — BA-drop skipped (producer bug)",
+            len(eids_manifest), len(gt_raw),
         )
+        return None
+    if len(set(eids_manifest)) != len(eids_manifest):
+        # Duplicate eval_ids make the eval_id→ground_truth map ambiguous.
+        # Like the length-mismatch and missing-eval cases, this is a
+        # producer bug — ERROR so it surfaces in operator logs.
+        log.error(
+            "manifest.eval_ids has duplicate entries; BA-drop skipped "
+            "(cannot unambiguously align ground truth by eval_id)"
+        )
+        return None
+    gt_by_eid = dict(zip(eids_manifest, gt_raw))
+    missing = [eid for eid in eval_ids if eid not in gt_by_eid]
+    if missing:
+        # A score-matrix eval with no manifest ground-truth entry. This
+        # is the structural-refactor signal RT-M6 cared about — ERROR so
+        # it doesn't silently degrade BA-drop to "no ground-truth
+        # signal" on every signed attestation thereafter.
+        log.error(
+            "score-matrix eval_ids %r absent from manifest.eval_ids — "
+            "BA-drop skipped (structural bug, not a per-run condition)",
+            missing,
+        )
+        return None
+    aligned = [gt_by_eid[eid] for eid in eval_ids]
+    if any(v is None for v in aligned):
+        # At least one eval on the score-matrix axis has no ground-truth
+        # label. Genuine "this run has no ground-truth signal" condition.
         return None
     try:
         import numpy as np
     except ImportError:
         return None
-    if any(v is None for v in gt_raw):
-        return None
     try:
-        arr = np.asarray(gt_raw, dtype=int)
+        arr = np.asarray(aligned, dtype=int)
     except (TypeError, ValueError):
         return None
     if not bool(np.all((arr == 0) | (arr == 1))):

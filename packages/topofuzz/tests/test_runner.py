@@ -1428,7 +1428,11 @@ def test_run_writer_persists_judge_kinds(tmp_path):
         run_variant(
             topo, {"id": "e1", "input": "x"},
             llm_callable=FakeLLM(),
-            judge=FakeJudge(score_to_return=ContinuousScore(value=0.4)),
+            judge=FakeJudge(
+                score_to_return=ContinuousScore(
+                    value=0.4, rationale="continuous judge said so"
+                )
+            ),
         )
     )
     bin_cell = _run(
@@ -1468,12 +1472,39 @@ def test_run_writer_persists_judge_kinds(tmp_path):
     by_eval = {r[0]: r for r in rows}
     assert by_eval["e1"][1] == "continuous"
     assert by_eval["e1"][2] == 0.4
+    # Continuous cells now persist the judge's rationale (was always NULL).
+    assert by_eval["e1"][4] == "continuous judge said so"
     assert by_eval["e2"][1] == "binary"
     assert by_eval["e2"][3] == 0
     assert by_eval["e2"][4] == "r"
     assert by_eval["e3"][1] == "failure"
     assert "boom" in by_eval["e3"][5]
     assert by_eval["e4"][1] == "absent"
+
+
+def test_run_writer_continuous_empty_rationale_persists_as_empty_string(tmp_path):
+    """A ContinuousScore with no rationale persists "" — the same sentinel
+    the BinaryScore path uses for an empty rationale. The value is written
+    verbatim; it is NOT collapsed to SQL NULL (that would split the
+    "no rationale" sentinel by judge_kind)."""
+    topo = _toy_topology(n=1)
+    cell = _run(
+        run_variant(
+            topo, {"id": "e1", "input": "x"},
+            llm_callable=FakeLLM(),
+            judge=FakeJudge(score_to_return=ContinuousScore(value=0.6)),
+        )
+    )
+    with RunWriter(tmp_path, "run-1", topo) as w:
+        w.write(cell)
+    db = sqlite3.connect(str(tmp_path / "run.sqlite"))
+    try:
+        rationale = db.execute(
+            "SELECT rationale FROM judge_results WHERE eval_id = 'e1'"
+        ).fetchone()[0]
+    finally:
+        db.close()
+    assert rationale == ""
 
 
 def test_run_writer_records_topology_in_runs_table(tmp_path):

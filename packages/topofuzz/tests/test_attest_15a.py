@@ -395,6 +395,83 @@ def test_ba_drop_with_ground_truth(tmp_path: Path):
     assert out["drop"] == 1.0
 
 
+def test_ba_drop_aligns_ground_truth_by_eval_id_not_position(tmp_path: Path):
+    """Regression: the score-matrix eval axis is in judge-row insertion
+    order, NOT manifest plan order. Ground truth must be re-indexed by
+    eval_id. Here the db rows are seeded in a shuffled eval order (e3, e1,
+    e4, e2) so read_score_matrix yields a non-manifest eval axis; BA-drop
+    must still compute correctly. The previous positional-alignment code
+    returned None on every such run."""
+    _seed_db(
+        tmp_path / "run.sqlite",
+        "r1",
+        "rh",
+        rows=[
+            # vA (original): perfect vs GT. Inserted shuffled: e3,e1,e4,e2.
+            ("vA", "e3", 0.9), ("vA", "e1", 0.9), ("vA", "e4", 0.1), ("vA", "e2", 0.1),
+            # vB (permuted): inverse of GT.
+            ("vB", "e3", 0.1), ("vB", "e1", 0.1), ("vB", "e4", 0.9), ("vB", "e2", 0.9),
+        ],
+    )
+    manifest = _build_manifest(
+        "r1",
+        variant_canonical_hashes=["vA", "vB"],
+        # Manifest is in plan order — deliberately different from the
+        # e3,e1,e4,e2 axis read_score_matrix will discover.
+        eval_ids=["e1", "e2", "e3", "e4"],
+        eval_ground_truth=[1, 0, 1, 0],
+    )
+    out = compute_ba_drop_for_attestation(tmp_path, "r1", manifest)
+    assert out is not None
+    # If ground truth were aligned positionally against the shuffled axis,
+    # original would NOT be 1.0. By-eval-id alignment recovers the truth.
+    assert out["original"] == 1.0
+    assert out["mean_permuted"] == 0.0
+    assert out["drop"] == 1.0
+
+
+def test_ba_drop_none_when_matrix_eval_absent_from_manifest(tmp_path: Path):
+    """A score-matrix eval_id with no manifest ground-truth entry is a
+    structural bug signal — BA-drop skips rather than guessing."""
+    _seed_db(
+        tmp_path / "run.sqlite",
+        "r1",
+        "rh",
+        rows=[
+            ("vA", "e1", 0.9), ("vA", "e2", 0.1), ("vA", "e5", 0.9),
+            ("vB", "e1", 0.1), ("vB", "e2", 0.9), ("vB", "e5", 0.1),
+        ],
+    )
+    manifest = _build_manifest(
+        "r1",
+        variant_canonical_hashes=["vA", "vB"],
+        eval_ids=["e1", "e2"],  # no e5
+        eval_ground_truth=[1, 0],
+    )
+    assert compute_ba_drop_for_attestation(tmp_path, "r1", manifest) is None
+
+
+def test_ba_drop_none_on_manifest_array_length_mismatch(tmp_path: Path):
+    """manifest.eval_ids and manifest.eval_ground_truth must agree in
+    length — a producer bug if they don't; BA-drop skips."""
+    _seed_db(
+        tmp_path / "run.sqlite",
+        "r1",
+        "rh",
+        rows=[
+            ("vA", "e1", 0.9), ("vA", "e2", 0.1),
+            ("vB", "e1", 0.1), ("vB", "e2", 0.9),
+        ],
+    )
+    manifest = _build_manifest(
+        "r1",
+        variant_canonical_hashes=["vA", "vB"],
+        eval_ids=["e1", "e2"],
+        eval_ground_truth=[1],  # length 1 vs eval_ids length 2
+    )
+    assert compute_ba_drop_for_attestation(tmp_path, "r1", manifest) is None
+
+
 # ---------------------------------------------------------------------------
 # (f) + (g) compute_headline plumbing
 # ---------------------------------------------------------------------------
