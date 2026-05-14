@@ -62,6 +62,9 @@ runs/
 .cache/
 *.pem
 !keys/*.pub.pem
+# Published gallery runs (BLUEPRINT 19a) are committed deliberately
+!examples/gallery/*/runs/
+!examples/gallery/*/runs/**
 
 # uv lock state lives at workspace root only; per-package locks not used
 packages/*/uv.lock
