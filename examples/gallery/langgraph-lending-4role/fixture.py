@@ -27,10 +27,10 @@ from topofuzz.ir import LLMConfig
 AGENT_IDS: tuple[str, ...] = ("intake", "risk", "policy", "decision")
 
 LLM_CONFIGS: dict[str, LLMConfig] = {
-    "intake": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=1500),
-    "risk": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=1500),
-    "policy": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=1500),
-    "decision": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=1500),
+    "intake": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
+    "risk": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
+    "policy": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
+    "decision": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
 }
 
 

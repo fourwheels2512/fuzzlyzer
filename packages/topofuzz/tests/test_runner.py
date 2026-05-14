@@ -21,6 +21,7 @@ from fuzzeval.judge import BinaryScore, ContinuousScore  # noqa: E402
 from topofuzz.ir import Edge, LLMConfig, Node, Topology  # noqa: E402
 from topofuzz.runner import (  # noqa: E402
     _ANTHROPIC_SERVED_MAP,
+    _run_judge,
     Cell,
     NodeOutput,
     RunWriter,
@@ -819,7 +820,142 @@ def test_runner_calls_judge_with_final_agent_output():
     assert len(judge.seen_payloads) == 1
     pld = judge.seen_payloads[0]
     assert pld["variant_id"] == topo.canonical_hash()
-    assert pld["agent_output"] == cell.node_outputs[-1].response_text
+    # The judge sees the DECLARED terminal node's output. For this linear
+    # toy topology the terminal happens to also be the last walked node;
+    # assert against ``topo.terminal`` explicitly rather than ``[-1]`` so
+    # the test pins the *contract* (judge the verdict node), not the
+    # coincidence. See test_runner_judges_declared_terminal_not_last_walked_node.
+    terminal_out = next(
+        o for o in cell.node_outputs if o.node_id == topo.terminal[0]
+    )
+    assert pld["agent_output"] == terminal_out.response_text
+
+
+def test_runner_judges_declared_terminal_not_last_walked_node():
+    """Regression guard: the judge must score the topology's DECLARED
+    terminal node, NOT whatever node was walked last.
+
+    ``order_swap`` can land a non-verdict agent (e.g. ``intake``) last;
+    judging ``outputs[-1]`` there fabricates verdict-flips and corrupts
+    every score-matrix metric (see .planning/verdict-flip-rootcause/).
+    This is the structural check that would have caught that bug — it
+    builds a topology whose terminal is NOT the last walked node and
+    asserts the judge still scores the terminal."""
+    cfg = LLMConfig(model="google/gemini-2.5-pro", temperature=0.0)
+    # Nodes walk in order n0, n1, n2 — but n0 is the declared terminal,
+    # so outputs[-1] (n2) is deliberately NOT the verdict node.
+    topo = Topology(
+        name="terminal-not-last",
+        nodes=tuple(
+            Node(id=f"n{i}", role=f"r{i}", llm_config=cfg) for i in range(3)
+        ),
+        edges=(
+            Edge(from_id="n0", to_id="n1"),
+            Edge(from_id="n1", to_id="n2"),
+        ),
+        entrypoint="n0",
+        terminal=("n0",),
+    )
+    judge = FakeJudge(score_to_return=ContinuousScore(value=0.7))
+    cell = _run(
+        run_variant(
+            topo,
+            {"id": "e1", "input": "x"},
+            llm_callable=FakeLLM(),
+            judge=judge,
+        )
+    )
+    pld = judge.seen_payloads[0]
+    terminal_out = next(o for o in cell.node_outputs if o.node_id == "n0")
+    assert pld["agent_output"] == terminal_out.response_text
+    # And explicitly NOT the last walked node.
+    assert pld["agent_output"] != cell.node_outputs[-1].response_text
+
+
+def test_runner_judges_lex_first_terminal_when_multi_terminal():
+    """Multi-terminal topology: the judge scores the lex-first declared
+    terminal node, never the last walked node.
+
+    Locks the contract the step-20a audit's B1 exposed — the supervisor
+    gallery fixture was briefly multi-terminal (``critic`` + ``supervisor``
+    via a stray ``FINISH`` -> END edge) and judged ``critic`` only by
+    lexical luck. If a future fixture regresses to multi-terminal, this
+    test pins exactly which node gets judged.
+
+    Note: this topology is a synthetic shape (node ``c`` is a dangling
+    non-terminal) built to exercise ``_run_judge``'s terminal selection
+    directly — the LangGraph adapter would not normally emit it."""
+    cfg = LLMConfig(model="google/gemini-2.5-pro", temperature=0.0)
+    # Nodes walk a, b, c. terminal is passed UNSORTED as ("b", "a") to
+    # prove the runner judges the lex-first terminal ("a"), not the
+    # tuple-first one ("b"); c is last-walked but is not a terminal.
+    topo = Topology(
+        name="multi-terminal",
+        nodes=tuple(
+            Node(id=nid, role=f"r_{nid}", llm_config=cfg)
+            for nid in ("a", "b", "c")
+        ),
+        edges=(
+            Edge(from_id="a", to_id="b"),
+            Edge(from_id="b", to_id="c"),
+        ),
+        entrypoint="a",
+        terminal=("b", "a"),
+    )
+    judge = FakeJudge(score_to_return=ContinuousScore(value=0.7))
+    cell = _run(
+        run_variant(
+            topo,
+            {"id": "e1", "input": "x"},
+            llm_callable=FakeLLM(),
+            judge=judge,
+        )
+    )
+    pld = judge.seen_payloads[0]
+    out = {o.node_id: o.response_text for o in cell.node_outputs}
+    assert pld["agent_output"] == out["a"]  # lex-first terminal
+    assert pld["agent_output"] != out["b"]  # not the other terminal
+    assert pld["agent_output"] != out["c"]  # not the last walked node
+
+
+def test_run_judge_marks_failure_when_terminal_absent_from_outputs():
+    """Defence-in-depth: if the declared terminal node is absent from the
+    walked outputs, the judge call marks the cell judge_failure — it does
+    NOT fall back to ``outputs[-1]``. That fallback is the exact
+    wrong-node-laundering bug the terminal-aware judge exists to kill.
+
+    This guard is CURRENTLY UNREACHABLE via ``run_variant`` (the IR
+    validator guarantees ``terminal`` entries exist in ``nodes`` and the
+    runner walks every node) — the test calls ``_run_judge`` directly to
+    pin the contract so a future generator that drops the terminal node
+    fails loud instead of silently re-introducing the bug. Do not delete
+    it as 'dead code'."""
+    out = NodeOutput(
+        node_id="n0",
+        role="r0",
+        response_text="some text",
+        model_served_version="google/gemini-2.5-pro",
+        cache_hit=False,
+        latency_ms=0,
+    )
+    judge = FakeJudge(score_to_return=ContinuousScore(value=0.9))
+    result, judge_failure, reason = _run(
+        _run_judge(
+            judge=judge,
+            judge_cache=None,
+            outputs=[out],
+            terminal=("does_not_exist",),
+            eval_row={"id": "e1", "input": "x"},
+            variant_id="v1",
+            rubric_hash="h",
+            judge_model_version="m",
+        )
+    )
+    assert result is None
+    assert judge_failure is True
+    assert "does_not_exist" in reason
+    # The judge must NOT have been consulted — no fallback scoring.
+    assert judge.seen_payloads == []
 
 
 def test_runner_marks_judge_failure_when_judge_raises(tmp_path):

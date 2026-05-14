@@ -32,10 +32,10 @@ class _PostState(TypedDict, total=False):
 AGENT_IDS: tuple[str, ...] = ("extract", "classify", "policy_check", "decision")
 
 LLM_CONFIGS: dict[str, LLMConfig] = {
-    "extract": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=1500),
-    "classify": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=1500),
-    "policy_check": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=1500),
-    "decision": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=1500),
+    "extract": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
+    "classify": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
+    "policy_check": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
+    "decision": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
 }
 
 

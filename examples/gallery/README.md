@@ -1,5 +1,15 @@
 # topofuzz gallery
 
+> ⚠️ **UNDER RE-EVALUATION (2026-05-14).** A measurement bug was found
+> and fixed: the runner judged the last-*walked* node instead of the
+> declared verdict node, so `order_swap` permutations that landed a
+> non-verdict agent last fabricated verdict-flips. With the bug fixed,
+> both gallery entries' headline `verdict_flip_rate` collapses to `0`
+> (degenerate) — the "fragility" they appeared to show was the artifact.
+> **The numbers below predate the fix and must not be quoted.** The
+> gallery's headline framing is being re-decided — see
+> `.planning/verdict-flip-rootcause/` and the step-20a session handoff.
+
 Pre-built topofuzz runs against well-known LangGraph multi-agent
 patterns. Each gallery entry is a complete, reproducible artifact: the
 fixture source, eval rows, judge rubric, and the full run directory

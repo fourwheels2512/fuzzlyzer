@@ -1,5 +1,14 @@
 # langgraph-supervisor-research
 
+> ⚠️ **STALE — UNDER RE-EVALUATION (2026-05-14).** This README describes
+> the pre-fix fixture and run. The fixture has since changed (`writer`
+> role → `reviewer`, made single-terminal, eval reworded) and the
+> measurement bug behind its old `verdict_flip_rate` was fixed. The
+> entry has **not** yet been regenerated under the fixed runner — all
+> numbers and the `writer`/`FINISH` topology description below are
+> obsolete; do not quote them. See `.planning/verdict-flip-rootcause/`
+> and the step-20a session handoff.
+
 > 4-agent supervisor pattern (supervisor + researcher + writer +
 > critic) deciding whether a draft article is publication-ready.
 > Inspired by the LangGraph

@@ -1,5 +1,14 @@
 # langgraph-lending-4role
 
+> ⚠️ **NUMBERS STALE — UNDER RE-EVALUATION (2026-05-14).** Regenerated
+> under the fixed runner (run `2026-05-14-01KRKK2CHTNFNA48YG07D3WRVM`),
+> this entry's `verdict_flip_rate` is `0` (degenerate): honestly
+> measured, this topology is robust under permutation. The old
+> "~0.3 fragility" was a measurement artifact — the runner judged the
+> last-*walked* node, not the declared `decision` node. **All numbers
+> below predate the fix; do not quote them.** See
+> `.planning/verdict-flip-rootcause/`.
+
 > 4-agent linear chain (intake → risk → policy → decision) deciding
 > whether a mortgage application should be approved. The same
 > applicant data, same Gemini Flash model, same prompt structure

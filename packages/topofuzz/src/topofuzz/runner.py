@@ -582,6 +582,7 @@ async def run_variant(
         judge=judge,
         judge_cache=judge_cache,
         outputs=outputs,
+        terminal=variant_ir.terminal,
         eval_row=eval_row,
         variant_id=ir_hash,
         rubric_hash=rubric_hash,
@@ -755,6 +756,7 @@ async def _run_judge(
     judge: Judge | None,
     judge_cache: JudgeCache | None,
     outputs: list[NodeOutput],
+    terminal: tuple[str, ...],
     eval_row: dict,
     variant_id: str,
     rubric_hash: str,
@@ -764,7 +766,61 @@ async def _run_judge(
     if judge is None or not outputs:
         return None, False, None
 
-    final_output = outputs[-1].response_text
+    # The judged "pipeline output" is the DECLARED terminal node's
+    # response — NOT whatever node ``order_swap`` happened to walk last.
+    # ``Topology.terminal`` is populated by the adapter from
+    # ``add_edge(node, END)``, validated non-empty by the IR, and
+    # preserved verbatim by every variant generator, so it is the
+    # topology's own statement of "this node produces the verdict".
+    # Judging ``outputs[-1]`` instead let a permutation that lands a
+    # non-verdict agent (e.g. ``intake``) last be scored as a verdict —
+    # fabricating verdict-flips and corrupting every score-matrix metric.
+    # See .planning/verdict-flip-rootcause/ for the full root-cause.
+    #
+    # Note the terminal node may have run EARLY in a permuted variant
+    # (the runner walks ``nodes`` order), i.e. before its upstream
+    # context arrived. That is intentional: "the verdict node decided
+    # with starved context" IS the fragility signal we want to measure —
+    # not an artifact to skip.
+    #
+    # ``terminal`` has no priority among entries — the adapter sorts it,
+    # but the IR validator does NOT enforce sortedness, so a directly-
+    # constructed Topology could pass an unsorted tuple. We judge the
+    # lex-first terminal and apply ``sorted()`` here so that choice is
+    # deterministic regardless of how ``terminal`` was built. All v0.5
+    # fixtures are single-terminal so this never actually matters today;
+    # multi-terminal reduction is a documented BACKLOG item.
+    if len(terminal) > 1:
+        _log.warning(
+            "judge: topology declares %d terminal nodes %r; v0.5 judges "
+            "the lex-first present one. Multi-terminal reduction is BACKLOG.",
+            len(terminal), terminal,
+        )
+    # node_id is unique per topology — enforced by the IR structural
+    # validator (ir.py ``_check_structural_integrity``) and preserved by
+    # every variant generator's ``_rebuild`` — so this dict never silently
+    # drops an output.
+    by_node = {o.node_id: o for o in outputs}
+    terminal_output = next(
+        (by_node[t] for t in sorted(terminal) if t in by_node), None
+    )
+    if terminal_output is None:
+        # Terminal node produced no output. Unreachable in the v0.5
+        # runner — the IR validator guarantees every ``terminal`` entry
+        # is in ``nodes``, and cancellation returns a Cell before
+        # ``_run_judge`` — so this only fires if a future generator drops
+        # the terminal node. Mark the cell a judge_failure rather than
+        # fall back to ``outputs[-1]``: that fallback is the exact bug
+        # this function exists to kill (a wrong-node score laundered into
+        # the matrix as real data). A judge_failure cell is excluded from
+        # every metric — the honest outcome.
+        reason = (
+            f"terminal node(s) {terminal!r} absent from node_outputs "
+            f"(walked: {[o.node_id for o in outputs]!r})"
+        )
+        _log.warning("judge: %s for variant %s", reason, variant_id)
+        return None, True, reason
+    final_output = terminal_output.response_text
     payload = {
         "variant_id": variant_id,
         "eval_row": eval_row,

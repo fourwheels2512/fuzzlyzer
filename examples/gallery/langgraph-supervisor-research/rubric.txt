@@ -2,7 +2,7 @@ You are evaluating a multi-agent editorial pipeline that decides whether
 a draft article is publication-ready.
 
 The pipeline received a draft-article description and produced a chain of
-agent notes (supervisor plan, research notes, draft revision, critic
+agent notes (supervisor plan, research notes, review notes, critic
 verdict) ending in a final publication recommendation.
 
 Read the pipeline's output FIRST and form an independent view of how it
