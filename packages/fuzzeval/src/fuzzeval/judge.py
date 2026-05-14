@@ -277,17 +277,19 @@ def _parse_score(response_text: str) -> tuple[int, str]:
 SyncLLMCallable = Callable[..., Any]
 
 
-# Default ``max_tokens`` for the judge response. The rubric invites the
-# judge to reason about the pipeline output *before* emitting the
-# trailing ``Score:`` / ``Rationale:`` contract lines, so the budget
-# must cover that reasoning — not just the two contract lines. The
-# original 256 truncated Gemini Flash mid-response: the ``Score:`` line
-# sometimes never appeared (→ JudgeUnparseableError → judge_failure →
-# §8 degraded), and when it did the ``Rationale:`` was cut to 1-3 words
-# ("The", "The decision"). 1500 leaves headroom for the reasoning plus
-# both contract lines — empirically finish_reason='stop' with full
-# rationales on the gallery fixtures.
-_DEFAULT_MAX_TOKENS = 1500
+# Default ``max_tokens`` for the judge response. Gemini 2.5 Flash is a
+# *reasoning* model — it spends tokens on internal "thinking" that count
+# against this budget before any visible Score:/Rationale: text is
+# emitted. The original 256 truncated it mid-response: the ``Score:``
+# line sometimes never appeared (→ JudgeUnparseableError →
+# judge_failure → §8 degraded), and when it did the ``Rationale:`` was
+# cut to 1-3 words ("The", "The decision"). 1500 covered the simpler
+# lending fixture but still starved the supervisor fixture's longer
+# prompts (6/32 cells failed). 4000 leaves headroom for the thinking
+# budget plus the full response on both gallery fixtures — empirically
+# finish_reason='stop'. The cap costs nothing when unused (a reasoning
+# model stops when done); only actually-emitted tokens are billed.
+_DEFAULT_MAX_TOKENS = 4000
 
 
 class SingleJudge:
@@ -316,9 +318,9 @@ class SingleJudge:
         llm_callable: Optional sync callable for tests. Default is
             ``litellm.completion`` (lazy-imported so verify-only installs
             still load this module).
-        max_tokens: Cap on judge-response length. Default 1500 (see
-            :data:`_DEFAULT_MAX_TOKENS` — must cover the judge's
-            pre-verdict reasoning, not just the two contract lines).
+        max_tokens: Cap on judge-response length. Default 4000 (see
+            :data:`_DEFAULT_MAX_TOKENS` — must cover a reasoning model's
+            thinking budget, not just the two contract lines).
     """
 
     def __init__(
@@ -717,7 +719,7 @@ class JuryJudge:
             ``vendor_models``). Unsupplied vendors fall back to
             :mod:`litellm`.
         max_tokens: Cap passed through to each vendor's
-            :class:`SingleJudge`. Default 1500 (see
+            :class:`SingleJudge`. Default 4000 (see
             :data:`_DEFAULT_MAX_TOKENS`).
 
     Raises:
