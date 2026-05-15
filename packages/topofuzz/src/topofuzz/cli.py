@@ -150,12 +150,13 @@ def _variant_violates_edges(
 ) -> bool:
     """True if ``variant``'s node order violates the graph's data deps.
 
-    The §7 runner executes ``variant.nodes`` in tuple order, but
-    ``order_swap`` permutes that tuple WITHOUT consulting ``topology.edges``
-    (it is edge-blind in v0.5 — BLUEPRINT §6; the edge-aware fix is RT
-    option B, deferred to v0.5.1). So a permuted variant can execute an
-    edge's destination node *before* its source — the destination agent
-    runs on a scrambled / partial information flow.
+    The §7 runner executes ``variant.nodes`` in tuple order. As of
+    v0.5.1, ``order_swap`` is edge-aware — it only emits permutations
+    that are valid linear extensions of the DAG — so this predicate
+    should always return False for ``order_swap`` output. It is kept
+    as defence-in-depth (regression guard against a future generator
+    bug) and to surface the *original* topology's own edge-validity
+    when a fixture is declared out of dependency order.
 
     The predicate: for every edge ``(from_id, to_id)``, the position of
     ``from_id`` in the variant's node order must come strictly before the
@@ -627,31 +628,24 @@ def run(
         total=variants,
     )
 
-    # Edge-validity warnings (RT audit option C). ``order_swap`` is
-    # edge-blind in v0.5 — it permutes the node tuple without consulting
-    # ``topology.edges`` (BLUEPRINT §6; edge-aware generation is deferred
-    # to v0.5.1). On a near-linear-chain topology most permuted variants
-    # execute agents in an order that violates the graph's own data
-    # dependencies. The runner does NOT crash on these (topofuzz bypasses
-    # LangGraph's edge-driven scheduler) — the destination agent simply
-    # runs on a scrambled / partial information flow, so the verdict-flip
-    # signal from those variants mixes a real topology effect with a
-    # scrambled-information-flow artifact. Surface the count so the
-    # limitation is visible, not buried. WARNING ONLY — we do not block,
-    # filter, or change the exit code.
+    # Edge-validity warning on the *original* topology. As of v0.5.1
+    # ``order_swap`` is edge-aware (BLUEPRINT §6 / BACKLOG Option B), so
+    # permuted variants are guaranteed to be valid linear extensions of
+    # the DAG — no order_swap-blindness warning fires. But the adapter
+    # preserves ``add_node`` declaration order and does NOT topologically
+    # sort (see ``adapter.py`` + the ``test_nodes_in_declared_order``
+    # test), so a fixture declared out of dependency order — or a cyclic
+    # topology, for which no linearisation is valid — makes the original
+    # itself edge-invalid. That is a fixture/topology issue independent
+    # of order_swap; surface it so the user sees their baseline is
+    # running on a scrambled information flow. Fires in every run mode
+    # including ``--dry-run`` because it is a structural property of the
+    # loaded topology.
     #
-    # The original is checked SEPARATELY from the permuted variants. The
-    # adapter preserves ``add_node`` declaration order and does NOT
-    # topologically sort (see ``adapter.py`` + the
-    # ``test_nodes_in_declared_order`` test), so a fixture declared out
-    # of dependency order — or a cyclic topology — makes the original
-    # itself edge-invalid. That is a fixture/topology issue, NOT an
-    # order_swap artifact, so it gets its own message; folding it into
-    # the order_swap count would misdiagnose it. Both warnings fire in
-    # every run mode including ``--dry-run``: edge-invalidity is a
-    # structural property of the variant set, true regardless of whether
-    # the run bills LLM calls, so a user validating their setup with
-    # ``--dry-run`` should still see it.
+    # We additionally assert defensively that no permuted variant
+    # violates the DAG. This is belt-and-suspenders against a future
+    # regression in ``order_swap``: if it ever happens we want a loud
+    # message rather than silently shipping the v0.5 misdiagnosis.
     if _variant_violates_edges(original, topology.edges):
         typer.echo(
             "topofuzz: the original topology's own node order violates its "
@@ -661,17 +655,34 @@ def run(
             "order_swap artifact.",
             err=True,
         )
-    permuted = variant_list[1:]
+    # The regression-guard only applies to variants whose NODE-ID
+    # SEQUENCE actually differs from the original — i.e. order_swap
+    # output. ``role_swap`` and ``decoding_param_swap`` preserve node
+    # positions in place (they ``model_copy`` the role / llm_config on
+    # the same slot), so if the original is edge-invalid every role /
+    # decoding variant inherits the same invalid sequence. Counting
+    # those here would re-blame an order_swap bug for what is a fixture-
+    # authoring issue already diagnosed by the separate warning above
+    # (audit F2 RT MAJOR-1). Filter by id-sequence change so only true
+    # order_swap regressions trip this branch.
+    original_ids = tuple(n.id for n in original.nodes)
+    reordered = [
+        v for v in variant_list[1:]
+        if tuple(n.id for n in v.nodes) != original_ids
+    ]
     edge_invalid_count = sum(
-        1 for v in permuted if _variant_violates_edges(v, topology.edges)
+        1 for v in reordered if _variant_violates_edges(v, topology.edges)
     )
     if edge_invalid_count:
+        # Defence-in-depth: order_swap is edge-aware as of v0.5.1, so
+        # this branch is a regression signal. Surface it loudly and keep
+        # running (the warning is diagnostic — exit code is unchanged).
         typer.echo(
-            f"topofuzz: {edge_invalid_count} of {len(permuted)} permuted "
-            "variants execute agents in an order that violates the graph's "
-            "data dependencies (order_swap is edge-blind in v0.5 — see "
-            "BLUEPRINT §6). The verdict-flip signal from those variants "
-            "includes a scrambled-information-flow component.",
+            f"topofuzz: WARNING — {edge_invalid_count} of {len(reordered)} "
+            "reordered variants execute agents in an order that violates "
+            "the graph's data dependencies. order_swap is edge-aware as "
+            "of v0.5.1, so this should not happen; please file an issue "
+            "with the fixture and rng_seed.",
             err=True,
         )
 

@@ -10,6 +10,29 @@ placeholder version and are not separately enumerated.
 
 ## [Unreleased]
 
+### Changed
+
+- **`order_swap` is now edge-aware (BLUEPRINT §6 / BACKLOG Option B,
+  v0.5.1).** The generator previously permuted the `nodes` tuple
+  without consulting `topology.edges`, which on a near-linear-chain
+  topology yielded variants whose execution order violated the graph's
+  own data dependencies (the runner bypasses LangGraph's edge-driven
+  scheduler and runs `nodes` in tuple order). `order_swap` now
+  enumerates *valid linear extensions* of the DAG via Kahn-style
+  backtracking (`_enumerate_topological_orderings` in
+  `variants/generators.py`). Pinned nodes still keep their slot
+  indices; the enumerator prunes any branch that cannot satisfy the
+  pin. **Effect on the headline:** linear-chain fixtures (e.g.
+  `lending_4role`) now report `order_swap`-contribution variants =
+  just the original (1) instead of an inflated 8, because a strict
+  chain has only one valid topological ordering — the verdict-flip
+  signal from edge-invalid permutations was a
+  scrambled-information-flow artifact, not topology fragility. The
+  v0.5 CLI edge-blindness warning was replaced by a defence-in-depth
+  regression-guard message that fires only if a future bug re-emits
+  an edge-invalid permutation. Gallery hashes built before v0.5.1
+  are NOT compatible — re-run any pre-v0.5.1 lending gallery.
+
 ### Added
 
 - **`topofuzz inspect` — side-by-side flip inspector.** New CLI

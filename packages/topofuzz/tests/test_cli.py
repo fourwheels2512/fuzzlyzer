@@ -270,23 +270,30 @@ def test_round_robin_select_zero_total():
 
 
 # ---------------------------------------------------------------------------
-# Step 20a — edge-validity warning (RT audit option C)
+# Edge-validity (RT audit option C, v0.5; tightened to defence-in-depth in
+# v0.5.1 — order_swap is now edge-aware per BACKLOG Option B).
 #
-# ``order_swap`` is edge-blind in v0.5: it permutes the node tuple without
-# consulting ``topology.edges``. ``_variant_violates_edges`` lets the CLI
-# count how many selected variants execute agents in an order that violates
-# the graph's data dependencies, so the limitation is surfaced rather than
-# buried. See packages/topofuzz/BACKLOG.md "Step 20a — order_swap is
-# edge-blind on linear-chain fixtures".
+# ``_variant_violates_edges`` started life as the runtime check counting
+# how many edge-blind ``order_swap`` permutations violated the DAG. In
+# v0.5.1 ``order_swap`` is edge-aware, so the predicate now serves two
+# narrower purposes:
+#
+#   1. Surface the *original* topology's own edge-validity (fixtures
+#      declared out of dependency order, or cyclic topologies).
+#   2. Regression guard against a future order_swap bug that emits an
+#      edge-invalid permutation.
+#
+# See packages/topofuzz/BACKLOG.md "Step 20a — order_swap is edge-blind
+# on linear-chain fixtures" for history.
 # ---------------------------------------------------------------------------
 
 
 def _linear_chain_topology():
     """A strict 4-node linear chain ``a -> b -> c -> d``.
 
-    Only one of the 24 node orderings is edge-valid — the worst case for
-    edge-blind ``order_swap``, mirroring the packaged ``lending_4role``
-    fixture.
+    Only one of the 24 node orderings is edge-valid. Under the v0.5.1
+    edge-aware ``order_swap`` this means the chain emits ONLY the
+    original — no permuted variants, no edge-blindness warning.
     """
     from topofuzz.ir import Edge, Node, Topology
 
@@ -404,13 +411,19 @@ def test_variant_violates_edges_self_loop_is_valid():
     assert _variant_violates_edges(topo, topo.edges) is False
 
 
-def test_run_warns_on_edge_invalid_variants_linear_chain(tmp_path, monkeypatch):
-    """End-to-end: a ``run`` against the linear-chain lending fixture
-    selects ``order_swap`` permutations that violate the data deps, and
-    the CLI emits the single-line edge-blindness warning to stderr.
+def test_run_no_edge_blindness_warning_on_linear_chain(tmp_path, monkeypatch):
+    """End-to-end: under v0.5.1 edge-aware ``order_swap``, a ``run``
+    against the linear-chain lending fixture emits NO edge-blindness
+    warning, because every permuted variant is now a valid topological
+    extension of the DAG (and on a strict chain the only extension is
+    the original, so there are no permuted variants at all).
 
-    The orchestrator is monkey-patched to avoid the network; the warning
-    fires at variant-selection time, well before kickoff.
+    This test inverts the v0.5 contract from
+    ``test_run_warns_on_edge_invalid_variants_linear_chain``: the
+    warning used to fire because order_swap was edge-blind. Now it
+    must NOT fire on the same fixture/flags. A regression that
+    re-introduces edge-blind permutations would re-fire the warning
+    and this test would catch it.
     """
     pytest.importorskip("langgraph")
 
@@ -451,8 +464,10 @@ def test_run_warns_on_edge_invalid_variants_linear_chain(tmp_path, monkeypatch):
                 f"{fixture_path}:build_graph",
                 "--eval", str(eval_path),
                 "--n", "1",
-                # 8 variants → enough order_swap perms get selected that
-                # at least one violates the strict a->b->c->d chain.
+                # 8 variants requested. Under edge-aware order_swap the
+                # chain emits only the original (1) + role_swap (2) +
+                # decoding_param_swap (4) = 7 variants; none of the
+                # permuted ones (role/decoding) violate edges.
                 "--variants", "8",
                 "--out", str(tmp_path / "runs"),
                 "--no-cache",
@@ -463,19 +478,17 @@ def test_run_warns_on_edge_invalid_variants_linear_chain(tmp_path, monkeypatch):
         )
 
     assert result.exit_code == 0, result.output
-    import re
-
-    # Single-line warning, topofuzz: prefix, names the BLUEPRINT section.
-    # The count is over the PERMUTED variants (the original is excluded
-    # and reported separately — B-1 audit fix).
-    assert re.search(
-        r"topofuzz:\s+\d+\s+of\s+\d+\s+permuted\s+variants\s+execute\s+"
-        r"agents\s+in\s+an\s+order\s+that\s+violates\s+the\s+graph's\s+"
-        r"data\s+dependencies",
-        result.output,
-    ), f"edge-blindness warning missing. Output:\n{result.output}"
-    assert "order_swap is edge-blind" in result.output
-    assert "scrambled-information-flow" in result.output
+    # No edge-blindness regression warning fired.
+    assert "reordered variants execute agents" not in result.output, (
+        f"unexpected edge-blindness warning under edge-aware order_swap:\n"
+        f"{result.output}"
+    )
+    # The lending fixture is declared in dependency order so the
+    # 'original is edge-invalid' warning also does not fire.
+    assert (
+        "the original topology's own node order violates"
+        not in result.output
+    )
 
 
 def test_run_no_edge_warning_on_single_variant(tmp_path, monkeypatch):
@@ -532,8 +545,10 @@ def test_run_no_edge_warning_on_single_variant(tmp_path, monkeypatch):
         )
 
     assert result.exit_code == 0, result.output
-    # No permuted variants → no order_swap edge-blindness warning.
-    assert "permuted variants execute agents" not in result.output
+    # No reordered variants under v0.5.1 (the lending chain has only one
+    # valid topological ordering, the original) → no defence-in-depth
+    # regression warning.
+    assert "reordered variants execute agents" not in result.output
     # And the lending fixture's original is edge-valid → no 'original
     # topology' warning either. This second assert pins the premise.
     assert (
@@ -564,6 +579,111 @@ def _out_of_order_topology():
         edges=(Edge(from_id="a", to_id="b"),),
         entrypoint="a",
         terminal=("b",),
+    )
+
+
+def test_run_does_not_misblame_order_swap_on_out_of_order_fixture(
+    tmp_path, monkeypatch
+):
+    """F2 pass-1 RT audit MAJOR-1 regression: when the loaded topology
+    is declared out of dependency order, every ``role_swap`` and
+    ``decoding_param_swap`` variant inherits the same edge-invalid node
+    sequence (they preserve positions). The naive ``permuted = variant_list[1:]``
+    check counted those inherited-invalid variants and re-blamed
+    ``order_swap`` for what is correctly diagnosed by the separate
+    'fixture/topology issue' warning above. The fix filters the
+    regression-guard to variants whose node-id sequence ACTUALLY differs
+    from the original (i.e. true ``order_swap`` output); if no permuted
+    variant has a reordered sequence, no order_swap regression warning
+    fires.
+
+    This test wires the out-of-order fixture and a real role_swap
+    eligible pair so role_swap emits a variant that *does* have an
+    edge-invalid sequence (inherited). Without the fix the test sees a
+    false 'order_swap regression' warning; with the fix only the
+    'fixture/topology issue' warning fires.
+    """
+    pytest.importorskip("langgraph")
+
+    from importlib import resources
+
+    fixture_res = resources.files("topofuzz").joinpath(
+        "fixtures/lending_4role.py"
+    )
+    eval_path = tmp_path / "e.jsonl"
+    eval_path.write_text(
+        '{"id": "e1", "input": "x", "ground_truth_decision": "approve"}\n',
+        encoding="utf-8",
+    )
+
+    def _two_node_out_of_order():
+        # nodes=(b, a) with edges (a -> b); two same-model nodes so
+        # role_swap emits a variant. That variant preserves positions →
+        # its node-id sequence equals (b, a), which is still edge-invalid.
+        from topofuzz.ir import Edge, LLMConfig, Node, Topology
+
+        cfg = LLMConfig(model="google/gemini-2.5-flash", temperature=0.0)
+        return Topology(
+            name="out-of-order",
+            nodes=(
+                Node(id="b", role="rb", llm_config=cfg),
+                Node(id="a", role="ra", llm_config=cfg),
+            ),
+            edges=(Edge(from_id="a", to_id="b"),),
+            entrypoint="a",
+            terminal=("b",),
+        )
+
+    from topofuzz import loaders as loaders_mod
+    monkeypatch.setattr(
+        loaders_mod,
+        "load_topology",
+        lambda _fixture: _two_node_out_of_order(),
+    )
+
+    async def fake_llm(**kwargs):
+        return {
+            "choices": [{"message": {"content": "ok"}}],
+            "model": kwargs["model"],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5},
+        }
+
+    from topofuzz import orchestrator as orch_mod
+    real_execute_run = orch_mod.execute_run
+
+    async def execute_run_with_fake(plan, **kwargs):
+        kwargs.setdefault("llm_callable", fake_llm)
+        return await real_execute_run(plan, **kwargs)
+
+    monkeypatch.setattr(orch_mod, "execute_run", execute_run_with_fake)
+
+    with resources.as_file(fixture_res) as fixture_path:
+        result = CliRunner().invoke(
+            app,
+            [
+                "run",
+                f"{fixture_path}:build_graph",
+                "--eval", str(eval_path),
+                "--n", "1",
+                "--variants", "8",
+                "--out", str(tmp_path / "runs"),
+                "--no-cache",
+                "--dry-run",
+                "--yes",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    # Fixture-out-of-order warning fires.
+    assert (
+        "the original topology's own node order violates" in result.output
+    ), f"fixture-out-of-order warning missing. Output:\n{result.output}"
+    # And — the critical fix — the order_swap regression warning is NOT
+    # triggered by role_swap / decoding_param_swap variants that
+    # inherited the invalid sequence.
+    assert "reordered variants execute agents" not in result.output, (
+        "order_swap regression warning fired on inherited-invalid "
+        f"role/decoding variants. Output:\n{result.output}"
     )
 
 
@@ -641,9 +761,9 @@ def test_run_warns_when_original_topology_is_edge_invalid(tmp_path, monkeypatch)
     ), f"original-edge-invalid warning missing. Output:\n{result.output}"
     # ...and it is correctly NOT attributed to order_swap.
     assert "order_swap is edge-blind" not in result.output
-    # ...and the permuted-variant warning does not fire (permuted is
-    # empty at --variants 1).
-    assert "permuted variants execute agents" not in result.output
+    # ...and the order_swap regression-guard does not fire (reordered
+    # is empty at --variants 1; only the original is present).
+    assert "reordered variants execute agents" not in result.output
 
 
 # ---------------------------------------------------------------------------

@@ -21,7 +21,10 @@ those validators to catch dangling-reference IRs. Going through
   (no original).
 
 For a 4-agent topology with two model groups and all-zero temperatures
-that yields 8 + 2 + 4 = 14 variants — inside the §6 8–16 envelope.
+that yields up-to 8 + 2 + 4 = 14 variants — inside the §6 8–16 envelope.
+The actual ``order_swap`` count is bounded by the number of *valid
+topological orderings* of the DAG (see below), so a strict linear chain
+returns just the original.
 
 **Pinned nodes.** ``Node.pinned=True`` excludes a node from *all* three
 generators (it keeps its slot index in order_swap, is skipped during
@@ -29,19 +32,48 @@ role_swap pairing, and is not perturbed by decoding_param_swap). This is
 what makes the §6a "pin its position" influence-remediation text actually
 freeze the agent — see ``ir.py`` Node.pinned for the contract.
 
-**Determinism.** ``order_swap`` samples permutations using a seeded
-:class:`random.Random` (default ``rng_seed=0``) so the same topology
-produces the same variant sequence across runs. ``role_swap`` and
-``decoding_param_swap`` iterate the input ``nodes`` tuple in declared
-order, which is itself stable (the adapter sorts terminal ids but
-preserves user node order).
+**Determinism.** ``order_swap`` enumerates topological orderings in a
+deterministic backtracking order and then shuffles the result via a
+seeded :class:`random.Random` (default ``rng_seed=0``), so the same
+topology produces the same variant sequence across runs. ``role_swap``
+and ``decoding_param_swap`` iterate the input ``nodes`` tuple in
+declared order, which is itself stable (the adapter sorts terminal ids
+but preserves user node order).
 
-**Order-swap memory bound.** For ``N <= 6`` non-pinned nodes we
-enumerate all N! permutations (max 720 at N=6) and shuffle. For ``N > 6``
-we rejection-sample random permutations, which keeps memory at
-O(max_variants) instead of O(N!). The cutoff catches the edge case
-noted in the step-4 RT audit (N=10 produces 3.6M perms ≈ 472 MB before
-the cap took effect).
+**Edge-aware ``order_swap`` (v0.5.1).** ``order_swap`` was edge-blind in
+v0.5 — it permuted the node tuple without consulting ``topology.edges``,
+so on a near-linear-chain topology most "permutations" executed agents
+in an order the graph's own data dependencies forbid. The §7 runner
+bypasses LangGraph's edge-driven scheduler and runs ``nodes`` in tuple
+order, so an edge-invalid variant did not crash — it measured a
+scrambled-information-flow effect instead of pure topology fragility,
+muddling the verdict-flip headline.
+
+v0.5.1 replaces that with a topological-sort-respecting sampler: a
+backtracking enumerator emits permutations that are valid linear
+extensions of the DAG induced by ``topology.edges`` (pinned nodes still
+keep their slots and must remain available at the appropriate
+backtracking step, or that branch is pruned). The enumeration is capped
+at ``max(max_variants * 8, 64)`` to bound work on highly-branchy DAGs
+where the number of linear extensions can be huge; the cap is well above
+the §6 default of 7 non-identity variants.
+
+Net effect on the headline:
+
+- **Linear chain** — only the original is a valid topological ordering,
+  so ``order_swap`` returns ``[original]``. The verdict-flip headline
+  loses the order_swap contribution entirely (correct: there is no
+  ordering fragility to measure on a strict chain).
+- **Branchy DAG** — multiple linear extensions exist, the sampler emits
+  them, and the headline now reflects "fragility under valid orderings"
+  rather than a mixture with edge-invalid scrambled flows.
+
+**Cycles.** A topology with a directed cycle has zero valid topological
+orderings; ``_enumerate_topological_orderings`` returns an empty list
+and ``order_swap`` falls back to ``[original]``. The original itself
+may still be edge-invalid (the adapter does not topologically sort
+declared nodes); that condition is surfaced separately by the CLI's
+``_variant_violates_edges`` warning on the loaded topology.
 
 **Determinism contract scope.** ``rng_seed`` produces a reproducible
 permutation sequence within a single Python *minor* version. Python
@@ -54,10 +86,12 @@ upgrades should pin their Python version or stage a re-bless.
 from __future__ import annotations
 
 import random
-from itertools import permutations
-from math import factorial
+from typing import TYPE_CHECKING
 
 from topofuzz.ir import Node, Topology
+
+if TYPE_CHECKING:
+    from topofuzz.ir import Edge
 
 # §6 caps. order_swap includes the original at index 0; role_swap and
 # decoding_param_swap do not include the original.
@@ -71,11 +105,19 @@ _ROLE_SWAP_MAX = 4
 _DECODING_LOW = 0.0
 _DECODING_HIGH = 0.3
 
-# At or below this non-pinned-node count we enumerate all N! perms and
-# shuffle (max 720 at N=6). Above it we rejection-sample. 6 was picked
-# because 7! = 5040 starts to look wasteful when only ~7 variants are
-# kept; the exact threshold is not load-bearing.
-_ORDER_SWAP_ENUMERATE_MAX_N = 6
+# Hard upper bound on the topological-ordering enumeration pool, before
+# we trim to ``max_variants``. A DAG's number of linear extensions can be
+# huge (10! = 3.6M on a fully-disconnected graph), so we cap to bound
+# backtracking work. When the number of linear extensions exceeds the
+# cap, the enumerator returns a random subset rather than a deterministic
+# prefix — see the per-step shuffle in ``_enumerate_topological_orderings``.
+# Without that shuffle, the deterministic ``range(n)`` candidate iteration
+# would pin low-indexed nodes to leading slots on wide / sparse DAGs
+# (e.g. a 20-node free graph: every emitted ordering shared the prefix
+# ``a0..a14`` because the cap of 64 < 6! = 720). The seeded per-step
+# shuffle breaks that collapse so every node has a chance at every slot,
+# while preserving the ``rng_seed`` determinism contract.
+_ENUMERATION_FLOOR = 64
 
 
 def _validate_max_variants(max_variants: int, *, allow_none: bool = False) -> None:
@@ -116,45 +158,162 @@ def _rebuild(topology: Topology, new_nodes: tuple[Node, ...]) -> Topology:
     )
 
 
-def _sample_perms(
-    n: int, *, target: int, rng: random.Random
+def _enumerate_topological_orderings(
+    nodes: tuple[Node, ...],
+    edges: "tuple[Edge, ...]",
+    *,
+    limit: int,
+    rng: random.Random | None = None,
 ) -> list[tuple[int, ...]]:
-    """Return up to ``target`` distinct non-identity permutations of ``range(n)``.
+    """Up to ``limit`` topological orderings of ``nodes`` respecting ``edges``.
 
-    For ``N <= _ORDER_SWAP_ENUMERATE_MAX_N`` we enumerate all N! perms —
-    max 720 at N=6 — and shuffle, which is unbiased. For larger N we
-    rejection-sample so memory stays at O(target) instead of O(N!).
+    Each ordering is a tuple of length ``len(nodes)`` whose ``k``-th entry
+    is the *original* index of the node placed at slot ``k`` in the output
+    variant. So the identity ordering ``(0, 1, ..., n-1)`` means "the
+    variant's node tuple equals the input's node tuple."
 
-    The rejection sampler may underfill by 1–2 perms when ``target``
-    approaches ``N! - 1`` (coupon-collector variance against the
-    attempt budget). The §6 contract is an upper bound — at the v0.5
-    default cap of 7 non-identity perms this never bites — so we
-    return whatever distinct perms we got rather than retrying forever.
+    The enumeration is a Kahn-style backtracking sampler:
+
+    - At each slot ``k``, choose any node whose remaining in-degree is 0
+      (all its predecessors have already been placed) and which has not
+      yet been placed. If the slot is *pinned* (the original node at that
+      slot has ``pinned=True``), the only legal choice is that pinned
+      node — if it is not currently available (in-degree > 0), this
+      branch of the search is pruned.
+    - Recurse with the chosen node placed, in-degrees of its children
+      decremented, and the in-use flag set. Undo on return.
+    - Stop once ``limit`` orderings have been collected.
+
+    Sampling. When ``rng`` is None, the candidate loop iterates
+    ``range(n)`` deterministically — orderings starting with low-indexed
+    nodes come first. When ``rng`` is a seeded :class:`random.Random`,
+    each non-pinned slot's candidate list is shuffled in place before
+    being iterated. This breaks the structural prefix bias that would
+    otherwise collapse the sample on wide / sparse DAGs (RT audit F2-1:
+    on a 20-node free graph with cap=64, every emitted ordering shared
+    the prefix ``a0..a14`` because 64 < 6! = 720 — the cap was reached
+    deep inside the first low-index branch before the search ever
+    backtracked to a different slot-0 choice). The shuffle is per-step,
+    so the resulting distribution is not uniform over linear extensions
+    (uniform sampling is NP-hard), but every node has a non-zero
+    probability at every slot it is reachable in.
+
+    Determinism. Same ``rng`` state → same enumeration sequence. Callers
+    threading ``random.Random(rng_seed)`` get reproducible output. The
+    ``rng=None`` path is also deterministic (the bias is the cost of
+    that determinism) and is useful for ordering tests that need a
+    stable prefix.
+
+    Self-loops (``from_id == to_id``) and edges referencing nodes outside
+    ``nodes`` contribute no constraint. The Topology validator rejects
+    dangling edges at construction, so the latter is defensive; the
+    former matches the existing :func:`topofuzz.cli._variant_violates_edges`
+    contract. Duplicate edge declarations are deduplicated internally so
+    they do not inflate in-degree past what the in-degree decrements can
+    drain.
+
+    Cycles. A topology with a directed cycle has no valid topological
+    ordering; ``indegree`` never reaches zero for some node and
+    backtracking returns an empty list. Callers are responsible for
+    handling the empty result (``order_swap`` falls back to
+    ``[original]``).
+
+    Pinned-slot infeasibility. If the original topology was declared out
+    of dependency order — e.g. ``nodes=(b, a)`` with edge ``a -> b`` —
+    *and* some nodes are pinned in a way that no topological extension
+    can satisfy, the enumerator simply returns an empty list. The
+    "original out-of-order" condition is itself surfaced separately by
+    the CLI's ``_variant_violates_edges`` warning on the loaded topology.
     """
-    if target <= 0:
+    n = len(nodes)
+    if n == 0 or limit <= 0:
         return []
-    identity = tuple(range(n))
-    if n <= _ORDER_SWAP_ENUMERATE_MAX_N:
-        all_perms = [p for p in permutations(identity) if p != identity]
-        rng.shuffle(all_perms)
-        return all_perms[:target]
 
-    # Rejection-sample. The attempt budget is sized for the typical case
-    # (target << N!); near-full-coverage requests may underfill — see
-    # the docstring note above.
-    seen: set[tuple[int, ...]] = {identity}
-    chosen: list[tuple[int, ...]] = []
-    attempt_budget = max(target * 10, 64)
-    indices = list(identity)
-    while len(chosen) < target and attempt_budget > 0:
-        attempt_budget -= 1
-        rng.shuffle(indices)
-        perm = tuple(indices)
-        if perm in seen:
+    # Pinned slot s requires the original node at index s to remain at
+    # slot s in every variant. Build a slot→required-original-index map
+    # and a set of pinned original indices for fast lookup.
+    pinned_slots: dict[int, int] = {
+        i: i for i, node in enumerate(nodes) if node.pinned
+    }
+    pinned_set: set[int] = set(pinned_slots.values())
+
+    # Build the DAG over original indices. Self-loops and dangling edges
+    # contribute no constraint (see docstring). Duplicate edges inflate
+    # in-degree by design — the constraint is still "u before v," counted
+    # once per declaration — so we deduplicate at the (u, v) pair level
+    # to avoid the rare topology that declares the same edge twice from
+    # leaving a child permanently unreachable.
+    id_to_idx = {node.id: i for i, node in enumerate(nodes)}
+    seen_edges: set[tuple[int, int]] = set()
+    children: list[list[int]] = [[] for _ in range(n)]
+    indegree: list[int] = [0] * n
+    for edge in edges:
+        u = id_to_idx.get(edge.from_id)
+        v = id_to_idx.get(edge.to_id)
+        if u is None or v is None:
+            # Dangling edge — defensive; Topology validator catches this
+            # at construction, so we should never reach here in practice.
             continue
-        seen.add(perm)
-        chosen.append(perm)
-    return chosen
+        if u == v:
+            # Self-loop — equal positions are not "backwards" (see the
+            # ``_variant_violates_edges`` contract for the same rule).
+            continue
+        if (u, v) in seen_edges:
+            continue
+        seen_edges.add((u, v))
+        children[u].append(v)
+        indegree[v] += 1
+
+    results: list[tuple[int, ...]] = []
+    in_use: list[bool] = [False] * n
+    indeg: list[int] = list(indegree)
+    current: list[int] = []
+
+    def backtrack(slot: int) -> None:
+        if len(results) >= limit:
+            return
+        if slot == n:
+            results.append(tuple(current))
+            return
+
+        if slot in pinned_slots:
+            req = pinned_slots[slot]
+            # Pinned slot must take its required node. If that node is
+            # already placed, or some predecessor hasn't been placed yet,
+            # there is no extension consistent with this pin from here.
+            if in_use[req] or indeg[req] != 0:
+                return
+            candidates: tuple[int, ...] = (req,)
+        else:
+            candidate_list = [
+                i
+                for i in range(n)
+                if not in_use[i] and indeg[i] == 0 and i not in pinned_set
+            ]
+            # Shuffle each non-pinned slot's candidates per the audit
+            # finding: without this, ``range(n)``'s deterministic order
+            # pins low-indexed nodes to leading slots on wide DAGs.
+            # The seeded rng keeps the contract reproducible per
+            # ``rng_seed`` while breaking the prefix collapse.
+            if rng is not None:
+                rng.shuffle(candidate_list)
+            candidates = tuple(candidate_list)
+
+        for i in candidates:
+            in_use[i] = True
+            current.append(i)
+            for c in children[i]:
+                indeg[c] -= 1
+            backtrack(slot + 1)
+            for c in children[i]:
+                indeg[c] += 1
+            current.pop()
+            in_use[i] = False
+            if len(results) >= limit:
+                return
+
+    backtrack(0)
+    return results
 
 
 def order_swap(
@@ -163,19 +322,36 @@ def order_swap(
     rng_seed: int = 0,
     max_variants: int = _ORDER_SWAP_MAX,
 ) -> list[Topology]:
-    """Up to ``max_variants`` orderings of the non-pinned agents.
+    """Up to ``max_variants`` valid topological orderings of the agents.
 
     Variant 0 is always the original topology (same identity, not a
     rebuild). The remaining variants permute only the slots occupied by
     non-pinned nodes; pinned nodes (``Node.pinned=True``) keep their
-    slot indices in the ``nodes`` tuple. ``edges``, ``entrypoint``, and
-    ``terminal`` are unchanged — the §7 runner executes agents in
-    ``nodes`` order, so reordering the tuple *is* the execution-order
-    change.
+    slot indices. Every emitted variant is a *valid linear extension*
+    of the DAG induced by ``topology.edges`` — that is, for every edge
+    ``from_id -> to_id``, the position of ``from_id`` in the variant
+    comes strictly before the position of ``to_id``. ``edges``,
+    ``entrypoint``, and ``terminal`` are unchanged — the §7 runner
+    executes agents in ``nodes`` order, so reordering the tuple *is*
+    the execution-order change, but every permutation respects the
+    graph's own data dependencies.
 
     Sampling is deterministic for a given ``rng_seed`` (default ``0``).
-    Per §6, there is no isomorphism dedup — duplicates (if any) are
-    absorbed by the §7 LLM-response cache downstream.
+    The enumerator emits orderings in a deterministic backtracking
+    order; the shuffle that follows is seeded; same seed → same
+    sequence. Per §6, there is no isomorphism dedup — duplicates
+    (if any) are absorbed by the §7 LLM-response cache downstream.
+
+    On a strict linear chain — where exactly one topological ordering
+    exists — the only valid extension is the original, so this
+    function returns ``[original]``. That is the correct measurement:
+    a linear chain has no ordering fragility to fuzz. For a fragility
+    headline, run against a branchy fixture.
+
+    On a topology with a directed cycle — where no topological
+    ordering exists — this function also returns ``[original]``. The
+    original itself may then be edge-invalid; the CLI surfaces that
+    separately via ``_variant_violates_edges``.
 
     Args:
         topology: The base topology to permute.
@@ -184,34 +360,46 @@ def order_swap(
 
     Returns:
         A list of distinct Topology instances. Length is at most
-        ``max_variants`` and at most ``factorial(non_pinned_count)``,
-        with the original always at index 0.
+        ``max_variants`` and at most ``1 + (#linear extensions - 1)``
+        for the DAG, with the original always at index 0.
     """
     _validate_max_variants(max_variants)
 
     nodes = topology.nodes
-    non_pinned_indices = tuple(i for i, n in enumerate(nodes) if not n.pinned)
-
     variants: list[Topology] = [topology]
-    if max_variants < 2 or len(non_pinned_indices) < 2:
-        # Either the caller wants the original only, or there is no
-        # permutation degree of freedom (0 or 1 non-pinned node).
+    if max_variants < 2:
         return variants
 
-    non_pinned_nodes = tuple(nodes[i] for i in non_pinned_indices)
-    n = len(non_pinned_nodes)
-    max_distinct = factorial(n) - 1
-    target = min(max_variants - 1, max_distinct)
-
+    # Enumerate a generous pool, then trim. The pool size is well above
+    # the §6 default (7 variants) without enumerating astronomically-many
+    # linear extensions on a near-disconnected graph. We thread a single
+    # seeded RNG through the per-step candidate shuffle (inside the
+    # enumerator) AND the final pool reorder, so the same ``rng_seed``
+    # reproduces the same variant sequence across runs.
+    enumeration_cap = max(max_variants * 8, _ENUMERATION_FLOOR)
     rng = random.Random(rng_seed)
-    chosen = _sample_perms(n, target=target, rng=rng)
+    orderings = _enumerate_topological_orderings(
+        nodes, topology.edges, limit=enumeration_cap, rng=rng,
+    )
 
-    for perm in chosen:
-        new_nodes_list = list(nodes)
-        for subset_slot, src_subset_idx in enumerate(perm):
-            target_slot = non_pinned_indices[subset_slot]
-            new_nodes_list[target_slot] = non_pinned_nodes[src_subset_idx]
-        variants.append(_rebuild(topology, tuple(new_nodes_list)))
+    identity = tuple(range(len(nodes)))
+    # Drop the identity ordering — it equals the original, which we
+    # already include as variant 0. A duplicate would silently consume
+    # one of the §6 budget slots with a hash-twin variant.
+    non_identity = [perm for perm in orderings if perm != identity]
+    if not non_identity:
+        return variants
+
+    # Final reorder of the pool before trimming. Per-step shuffle inside
+    # the enumerator already randomises which extensions are reached;
+    # this trailing shuffle randomises which subset of the reached pool
+    # survives the ``[: max_variants - 1]`` slice. Both share the same
+    # rng instance so the determinism contract holds.
+    rng.shuffle(non_identity)
+
+    for perm in non_identity[: max_variants - 1]:
+        new_nodes = tuple(nodes[i] for i in perm)
+        variants.append(_rebuild(topology, new_nodes))
 
     return variants
 
@@ -322,7 +510,9 @@ def generate_variants(
     Output layout::
 
         index 0           — original (from order_swap)
-        index 1..K        — additional order_swap permutations
+        index 1..K        — additional order_swap permutations (valid
+                            topological extensions of the DAG; may be 0
+                            for a linear chain)
         index K+1..K+R    — role_swap variants
         index K+R+1..end  — decoding_param_swap variants
 
@@ -333,10 +523,10 @@ def generate_variants(
     denominator is inflated by hash-twin variants and the CI tightens
     artificially. Each individual generator avoids producing trivially
     hash-duplicate output (role_swap skips same-role pairs; order_swap
-    samples distinct non-identity perms; decoding_param_swap perturbs a
-    distinct node per variant), but cross-generator collisions are still
-    possible for pathological topologies and are the caller's problem
-    to dedupe.
+    emits distinct non-identity topological extensions;
+    decoding_param_swap perturbs a distinct node per variant), but
+    cross-generator collisions are still possible for pathological
+    topologies and are the caller's problem to dedupe.
     """
     out = order_swap(topology, rng_seed=rng_seed)
     out.extend(role_swap(topology))
