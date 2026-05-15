@@ -1388,6 +1388,72 @@ def repro(
         "allow_extra_args": True,
     }
 )
+def inspect(
+    ctx: typer.Context,
+    run_dir: str = typer.Argument(
+        ...,
+        help="Run directory (contains manifest.json + run.sqlite).",
+    ),
+    eval_id: str | None = typer.Option(
+        None,
+        "--eval",
+        help=(
+            "Specific eval id to inspect. Default: lexically-first eval "
+            "id whose original variant disagrees with another variant."
+        ),
+    ),
+    out: Path | None = typer.Option(
+        None,
+        "--out",
+        help=(
+            "Destination for the generated HTML. Defaults to "
+            "<run_dir>/inspect_<eval_id>.html."
+        ),
+    ),
+) -> None:
+    """Render a side-by-side HTML inspector for one verdict flip.
+
+    Shows the original ordering on the left and the flipping ordering
+    on the right, stacked agent-by-agent so the reader can see exactly
+    where the reasoning diverged. Key risk phrases ("deny", "approve",
+    "concerning", ...) are colour-coded.
+
+    Exit codes:
+
+    * 0 — HTML written; path printed to stdout.
+    * 1 — no verdict flip found in the run (or for ``--eval``).
+    * 2 — usage error (run_dir is not a directory, missing files).
+    """
+    _reject_reserved_flags(list(ctx.args))
+    _reject_unknown_extras(list(ctx.args))
+
+    run_dir_path = Path(run_dir)
+    if not run_dir_path.is_dir():
+        typer.echo(
+            f"topofuzz inspect: run_dir is not a directory: {run_dir}",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT)
+
+    from topofuzz.inspect import InspectError, write_inspect_html
+
+    try:
+        target = write_inspect_html(
+            run_dir_path, eval_id=eval_id, out_path=out
+        )
+    except InspectError as e:
+        typer.echo(f"topofuzz inspect: {e}", err=True)
+        raise typer.Exit(code=_VERIFY_FAIL_EXIT) from e
+
+    typer.echo(str(target))
+
+
+@app.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
 def confirm(
     ctx: typer.Context,
     run_dir: str = typer.Argument(

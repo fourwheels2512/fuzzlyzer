@@ -12,6 +12,26 @@ placeholder version and are not separately enumerated.
 
 ### Added
 
+- **`topofuzz inspect` — side-by-side flip inspector.** New CLI
+  subcommand and UI route that render one verdict-flipping eval as a
+  two-column HTML page: original ordering on the left, the flipping
+  ordering on the right, each agent's raw output stacked agent-by-
+  agent so a reader can see the exact step whose response changed
+  when the ordering changed. Editorial palette matches `report.html`
+  (warm cream + Source Serif). Risk phrases — deny / approve /
+  concern stems — are highlighted server-side. Verdict pills derive
+  from the §6 binarisation (`score >= threshold` when `passed` is
+  None) so continuous-judge cells still read as APPROVE/DENY at a
+  glance. `topofuzz inspect <run_dir> --eval <eid> [--out <path>]`;
+  default destination `<run_dir>/inspect_<eid>.html` (atomic
+  `os.replace` write to survive concurrent UI fetches). The UI's
+  results page surfaces a "Inspect a flip →" button next to the
+  full-report link whenever `headline.flip_count > 0`; the route
+  returns HTML 200 with a friendly empty-state page when there's
+  nothing to inspect (a clean run is not an error). Dual-audited
+  twice (code + red-team, two passes); 14 new tests covering shape
+  validation, UTF-8-safe truncation, byte-stability, CLI reserved/
+  unknown flag rejection, and `Markup("")` empty-rationale handling.
 - **`topofuzz langgraph-import` CLI subcommand + regulatory crosswalk
   doc.** Imports a user's existing compiled LangGraph (a `path:attr`
   spec, same shape as `topofuzz run`) and saves it as a BYOP custom

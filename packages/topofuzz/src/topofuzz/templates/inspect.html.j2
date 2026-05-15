@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'none'; base-uri 'none'; form-action 'none';">
+<meta name="referrer" content="no-referrer">
+<title>topofuzz inspect &mdash; {{ run_id }} / {{ eval_id }}</title>
+<style>
+  :root {
+    --bg: #faf7f2;
+    --surface: #ffffff;
+    --surface-warm: #fbf6ee;
+    --border: #e7d8c2;
+    --border-soft: #f0eae0;
+    --ink: #2a2622;
+    --ink-strong: #1f1c19;
+    --muted: #897764;
+    --muted-soft: #6b5f54;
+    --accent: #c25024;
+    --accent-soft: #d97757;
+    --approve: #5a8b6b;
+    --approve-bg: #ecf3ed;
+    --approve-border: #cfe1d3;
+    --deny: #9a1c0f;
+    --deny-bg: #fce8e3;
+    --deny-border: #ecbf9a;
+    --concern: #8c4318;
+    --concern-bg: #fce8d8;
+    --concern-border: #ecbf9a;
+    --font-serif: "Source Serif Pro", "Source Serif 4", Georgia, "Times New Roman", serif;
+    --font-sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--bg); }
+  body {
+    margin: 0;
+    font-family: var(--font-sans);
+    background: var(--bg);
+    color: var(--ink);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  .container {
+    max-width: 1160px;
+    margin: 0 auto;
+    padding: 40px 28px 80px;
+  }
+  h1 {
+    font-family: var(--font-serif);
+    font-size: 30px;
+    font-weight: 500;
+    margin: 0 0 8px;
+    line-height: 1.2;
+    letter-spacing: -0.01em;
+    color: var(--ink-strong);
+  }
+  .subhead {
+    font-family: var(--font-serif);
+    font-size: 16px;
+    color: var(--muted-soft);
+    font-style: italic;
+    margin: 0 0 28px;
+    line-height: 1.55;
+    max-width: 720px;
+  }
+
+  /* Run-metadata strip — small monospace tags. */
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px 22px;
+    padding: 14px 18px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 32px;
+    font-size: 13px;
+    color: var(--muted-soft);
+  }
+  .meta .pair { display: inline-flex; gap: 6px; align-items: baseline; }
+  .meta .k {
+    font-family: var(--font-serif);
+    font-style: italic;
+    color: var(--muted);
+  }
+  .meta .v {
+    font-family: var(--font-mono);
+    color: var(--ink-strong);
+    font-size: 12.5px;
+    background: var(--border-soft);
+    padding: 1px 7px;
+    border-radius: 4px;
+  }
+
+  /* Two-column comparison grid. */
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+  }
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .panel.flipping { border-color: var(--accent-soft); }
+  .panel header {
+    padding: 22px 24px 18px;
+    background: var(--surface-warm);
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .panel.flipping header { background: #fbf1ec; }
+  .panel-eyebrow {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+  .panel.flipping .panel-eyebrow { color: var(--accent); }
+  .panel h2 {
+    font-family: var(--font-serif);
+    font-size: 22px;
+    font-weight: 500;
+    color: var(--ink-strong);
+    margin: 0 0 4px;
+    letter-spacing: -0.005em;
+  }
+  .panel-hash {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 14px;
+  }
+  .panel-hash code {
+    background: var(--border-soft);
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: var(--ink-strong);
+  }
+  .verdict {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px;
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    border: 1px solid;
+  }
+  .verdict-approve { background: var(--approve-bg); color: var(--approve); border-color: var(--approve-border); }
+  .verdict-deny    { background: var(--deny-bg);    color: var(--deny);    border-color: var(--deny-border); }
+  .verdict-unknown { background: var(--border-soft); color: var(--muted);  border-color: var(--border); }
+
+  .ordering {
+    margin-top: 14px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--muted-soft);
+    line-height: 1.7;
+    word-break: break-word;
+  }
+  .ordering .step {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 4px;
+    background: var(--surface);
+    border: 1px solid var(--border-soft);
+    color: var(--ink-strong);
+  }
+  .ordering .arrow { color: var(--accent); margin: 0 4px; }
+
+  .panel-body {
+    padding: 18px 24px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .rationale {
+    background: var(--surface-warm);
+    border: 1px solid var(--border-soft);
+    border-left: 3px solid var(--accent-soft);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-family: var(--font-serif);
+    font-size: 14px;
+    color: var(--ink);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .rationale-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+
+  .error-banner {
+    background: var(--deny-bg);
+    color: var(--deny);
+    border: 1px solid var(--deny-border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-family: var(--font-serif);
+    font-size: 13px;
+  }
+
+  /* Numbered agent cards — the position-in-ordering is the load-bearing
+     cue, so the index circle is sized to read at a glance. */
+  .agent-card {
+    border: 1px solid var(--border-soft);
+    border-radius: 10px;
+    background: var(--surface);
+    overflow: hidden;
+  }
+  .agent-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px;
+    background: var(--surface-warm);
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .agent-index {
+    flex: 0 0 auto;
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .panel.canonical .agent-index { background: var(--muted-soft); }
+  .agent-name {
+    font-family: var(--font-serif);
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--ink-strong);
+    margin: 0;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .agent-meta {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted);
+    text-align: right;
+  }
+  .agent-meta .cache-hit {
+    color: var(--approve);
+    font-weight: 600;
+    margin-left: 6px;
+  }
+  .agent-response {
+    margin: 0;
+    padding: 14px 16px;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--ink);
+    background: var(--surface);
+    max-height: 520px;
+    overflow: auto;
+  }
+
+  .empty {
+    color: var(--muted);
+    font-family: var(--font-serif);
+    font-style: italic;
+    font-size: 13px;
+  }
+
+  /* Risk-phrase highlights — three pastels keyed to the report palette. */
+  .phrase-deny    { background: var(--deny-bg);    color: var(--deny);    padding: 0 3px; border-radius: 3px; font-weight: 600; }
+  .phrase-approve { background: var(--approve-bg); color: var(--approve); padding: 0 3px; border-radius: 3px; font-weight: 600; }
+  .phrase-concern { background: var(--concern-bg); color: var(--concern); padding: 0 3px; border-radius: 3px; font-weight: 600; }
+
+  .legend {
+    margin-top: 32px;
+    padding: 14px 18px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    font-family: var(--font-serif);
+    font-size: 13px;
+    color: var(--muted-soft);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 16px;
+    align-items: center;
+  }
+  .legend-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .legend span.phrase-deny,
+  .legend span.phrase-approve,
+  .legend span.phrase-concern {
+    font-family: var(--font-sans);
+    font-size: 12px;
+  }
+  .legend .legend-note {
+    flex-basis: 100%;
+    color: var(--muted-soft);
+    font-style: italic;
+    margin-top: 4px;
+    line-height: 1.45;
+    font-size: 12.5px;
+  }
+
+  @media (max-width: 1000px) {
+    .grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Where did the AIs diverge?</h1>
+  <p class="subhead">
+    Same agents. Same input. Two different orderings &mdash; and two
+    different verdicts. Read the responses agent-by-agent to see exactly
+    which step changed its mind.
+  </p>
+  <div class="meta">
+    <span class="pair"><span class="k">Run</span><span class="v">{{ run_id }}</span></span>
+    <span class="pair"><span class="k">Eval</span><span class="v">{{ eval_id }}</span></span>
+    <span class="pair"><span class="k">Topology</span><span class="v">{{ topology_name }}</span></span>
+    <span class="pair"><span class="k">Verdict threshold</span><span class="v">{{ "%.2f"|format(threshold) }}</span></span>
+  </div>
+  <div class="grid">
+    {% for side in [canonical, flipping] %}
+    <section class="panel {{ 'canonical' if loop.first else 'flipping' }}">
+      <header>
+        <div class="panel-eyebrow">
+          {% if loop.first %}Original ordering &middot; baseline{% else %}Reordered &middot; verdict flipped{% endif %}
+        </div>
+        <h2>{{ side.label }}
+          <span class="verdict {{ side.verdict_class }}">{{ side.verdict }}</span>
+        </h2>
+        <div class="panel-hash">Variant <code>{{ side.short_hash }}</code></div>
+        <div class="ordering">
+          {% for node_id in side.ordering -%}
+            <span class="step">{{ node_id }}</span>
+            {%- if not loop.last %}<span class="arrow">&rarr;</span>{% endif -%}
+          {%- endfor %}
+        </div>
+      </header>
+      <div class="panel-body">
+        {% if side.error %}
+          <div class="error-banner">Cell error: {{ side.error }}</div>
+        {% endif %}
+        {% if side.rationale_html %}
+          <div class="rationale">
+            <div class="rationale-label">Judge rationale</div>
+            {{ side.rationale_html }}
+          </div>
+        {% endif %}
+        {% for agent in side.agents %}
+          <div class="agent-card">
+            <div class="agent-head">
+              <span class="agent-index">{{ loop.index }}</span>
+              <p class="agent-name">{{ agent.role or agent.node_id }}</p>
+              <span class="agent-meta">
+                {%- if agent.role and agent.role != agent.node_id -%}
+                  {{ agent.node_id }} &middot;
+                {% endif -%}
+                {{ agent.model }}
+                {% if agent.cache_hit %}<span class="cache-hit">&middot; cache hit</span>{% endif %}
+              </span>
+            </div>
+            <pre class="agent-response">{{ agent.response_html }}</pre>
+          </div>
+        {% else %}
+          <p class="empty">No agent outputs recorded for this cell.</p>
+        {% endfor %}
+      </div>
+    </section>
+    {% endfor %}
+  </div>
+  <div class="legend">
+    <span class="legend-label">Highlighted phrases</span>
+    <span class="phrase-deny">deny &middot; decline &middot; reject</span>
+    <span class="phrase-approve">approve &middot; grant</span>
+    <span class="phrase-concern">concern &middot; risk &middot; exception</span>
+    <span class="legend-note">
+      Highlights are case-insensitive matches on common decision verbs.
+      They're a reading aid, not a verdict &mdash; the binary call comes
+      from the judge model named in the run report.
+    </span>
+  </div>
+</div>
+</body>
+</html>

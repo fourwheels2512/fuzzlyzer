@@ -41,7 +41,15 @@
 <section class="card flush mt-32">
   <div class="card-header">
     <h3>Full report</h3>
-    <a href="/runs/{{ run.run_id }}/report" target="_blank" rel="noopener noreferrer">Open in new tab</a>
+    <div class="card-header-actions">
+      {% if headline.flip_count and headline.flip_count > 0 %}
+      <a class="btn ghost"
+         href="/runs/{{ run.run_id }}/inspect"
+         target="_blank"
+         rel="noopener noreferrer">Inspect a flip &rarr;</a>
+      {% endif %}
+      <a href="/runs/{{ run.run_id }}/report" target="_blank" rel="noopener noreferrer">Open in new tab</a>
+    </div>
   </div>
   <div class="report-frame">
     {# RT-audit B2: ``sandbox=""`` is fully sandboxed. The iframe loads

@@ -31,7 +31,7 @@ from typing import Any
 
 _log = logging.getLogger(__name__)
 
-from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import FastAPI, Form, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -78,6 +78,49 @@ _STATIC_DIR = _THIS_DIR / "static"
 # the legitimate form size (label + 10 agents + 2 KB rubric ≈ 3 KB) and
 # below any value that could exhaust memory by request flood.
 _CUSTOM_FORM_MAX_BYTES = 64 * 1024
+
+# Strict CSP applied to both ``/runs/{id}/inspect`` outputs (the rendered
+# inspect HTML and the "no flips" fallback). Identical to the report
+# route's posture: inline styles only, nothing else.
+_INSPECT_HEADERS: dict[str, str] = {
+    "Content-Security-Policy": (
+        "default-src 'none'; "
+        "style-src 'unsafe-inline'; "
+        "frame-ancestors 'self'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+}
+
+# Friendly empty-state page for ``GET /runs/{id}/inspect`` when the run
+# had no verdict flips to inspect. A clean run is not an error condition;
+# returning HTML 200 lets the iframe show a useful message instead of
+# the browser's default 404 chrome.
+_NO_FLIPS_HTML = (
+    "<!DOCTYPE html>"
+    "<html lang=\"en\"><head>"
+    "<meta charset=\"utf-8\">"
+    "<title>topofuzz inspect — no flips</title>"
+    "<style>"
+    "html,body{margin:0;background:#faf7f2;color:#2a2622;"
+    "font-family:Inter,-apple-system,system-ui,sans-serif;}"
+    ".wrap{max-width:560px;margin:80px auto;padding:32px;"
+    "background:#fff;border:1px solid #e7d8c2;border-radius:12px;}"
+    "h1{font-family:'Source Serif Pro',Georgia,serif;font-weight:500;"
+    "font-size:24px;margin:0 0 10px;color:#1f1c19;}"
+    "p{margin:0 0 8px;line-height:1.6;color:#6b5f54;}"
+    "code{font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;"
+    "background:#f0eae0;padding:1px 6px;border-radius:3px;font-size:13px;}"
+    "</style></head><body><div class=\"wrap\">"
+    "<h1>Nothing to inspect on this run.</h1>"
+    "<p>The inspector compares two orderings whose verdicts disagreed. "
+    "On this run, no scenario produced a verdict flip across orderings — "
+    "your pipeline was stable.</p>"
+    "<p>To see this view in action, try a more borderline scenario, "
+    "increase thoroughness, or open <code>topofuzz inspect</code> on a "
+    "run that flips.</p>"
+    "</div></body></html>"
+)
 
 
 def _default_runs_root() -> Path:
@@ -509,6 +552,42 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
                 "X-Content-Type-Options": "nosniff",
                 "Referrer-Policy": "no-referrer",
             },
+        )
+
+    @app.get("/runs/{run_id}/inspect")
+    async def run_inspect(run_id: str) -> Response:
+        """Render + serve the side-by-side flip inspector for one eval.
+
+        Picks the first flipping eval deterministically (lex-order),
+        writes ``inspect_<eid>.html`` into the run dir on demand, and
+        serves it with the same strict CSP as ``/report``. When there
+        are no flips to inspect we return a friendly 200 HTML "nothing
+        to inspect" page rather than a 404 — a clean run is not an
+        error condition (audit RT-pass-1 MINOR-4).
+        """
+        try:
+            run = registry.get(run_id)
+        except UnknownRunError as exc:
+            raise HTTPException(status_code=404, detail="unknown run") from exc
+        inner = run.inner_run_dir
+        if inner is None:
+            raise HTTPException(
+                status_code=404, detail="run output directory not yet written"
+            )
+        # Lazy import — inspect.py pulls jinja2/markupsafe (from the
+        # ``[full]`` extra). Keeps the UI module importable in a verify-
+        # only install.
+        from topofuzz.inspect import InspectError, write_inspect_html
+
+        try:
+            target = write_inspect_html(inner)
+        except InspectError:
+            # Not a failure mode — the run had no verdict flips to show.
+            return HTMLResponse(_NO_FLIPS_HTML, headers=_INSPECT_HEADERS)
+        return FileResponse(
+            target,
+            media_type="text/html",
+            headers=_INSPECT_HEADERS,
         )
 
     # ---- Custom workflow ("BYOP") routes -----------------------------

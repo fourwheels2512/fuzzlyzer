@@ -208,6 +208,12 @@ p {
   margin: 0;
 }
 
+.card-header-actions {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+}
+
 .card-body {
   padding: 24px;
 }
