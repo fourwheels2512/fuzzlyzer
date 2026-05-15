@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{% block title %}topofuzz{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://unpkg.com/htmx.org@1.9.12"
+          integrity="sha384-ujb1lZYygJmzgSwoxRggbCHcjc0rB2XoQrxeTUQyRjrOnlCoYta87iKBWq3EsdM2"
+          crossorigin="anonymous"></script>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="/">topofuzz</a>
+        <nav>
+          <a href="/setup">New run</a>
+          <a href="/runs">History</a>
+        </nav>
+      </div>
+    </header>
+    <main class="{% block main_class %}{% endblock %}">
+      {% block content %}{% endblock %}
+    </main>
+    <footer>
+      topofuzz {{ topofuzz_version }} · local-only research tool, no warranty
+    </footer>
+  </div>
+</body>
+</html>

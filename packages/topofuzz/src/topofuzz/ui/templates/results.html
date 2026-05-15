@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block main_class %}wide{% endblock %}
+{% block title %}Results · topofuzz{% endblock %}
+{% block content %}
+<p class="muted mb-16">
+  <a href="/runs">← All runs</a>
+</p>
+
+{% if run.status == "failed" %}
+<div class="banner danger">
+  <strong>The run stopped before it finished.</strong>
+  {{ run.failure_reason }}
+</div>
+{% elif run.status == "cancelled" %}
+<div class="banner warn">
+  This run was cancelled before it finished. The numbers below are
+  partial.
+</div>
+{% endif %}
+
+<h1 class="headline">{{ headline.title }}</h1>
+<p class="subhead">{{ headline.subtitle }}</p>
+
+<section class="card">
+  <h3>Run details</h3>
+  <dl class="kv">
+    <dt>Workflow</dt><dd>{{ workflow.label }}</dd>
+    <dt>Status</dt>
+    <dd><span class="status-pill {{ run.status }}">{{ run.status }}</span></dd>
+    <dt>Time</dt><dd>{{ "%d"|format(snap.elapsed_seconds) }} seconds</dd>
+    <dt>Real cost</dt><dd>{{ format_dollars(snap.real_spend_usd) }}</dd>
+    <dt>Scenarios tested</dt><dd>{{ headline.n_total }}</dd>
+  </dl>
+  <div class="btn-row">
+    <a class="btn" href="/setup">Run again</a>
+    <a class="btn ghost" href="/runs">See all runs</a>
+  </div>
+</section>
+
+{% if report_exists %}
+<section class="card flush mt-32">
+  <div class="card-header">
+    <h3>Full report</h3>
+    <a href="/runs/{{ run.run_id }}/report" target="_blank" rel="noopener noreferrer">Open in new tab</a>
+  </div>
+  <div class="report-frame">
+    {# RT-audit B2: ``sandbox=""`` is fully sandboxed. The iframe loads
+       report.html which embeds LLM-generated text — we must NOT trust it
+       enough to give it ``allow-same-origin``. Charts in topofuzz's
+       report.html are inline SVG (no JS), so dropping allow-scripts is
+       also safe today. ``allow-popups`` keeps any future "Open in new
+       tab" link inside the report working. #}
+    <iframe src="/runs/{{ run.run_id }}/report"
+            title="topofuzz run report"
+            sandbox="allow-popups allow-popups-to-escape-sandbox"></iframe>
+  </div>
+</section>
+{% else %}
+<section class="card">
+  <p class="muted">
+    The full report wasn't written — the run may have failed early. Open
+    the run log below for details.
+  </p>
+  <details class="disclosure mt-16" open>
+    <summary>Run log</summary>
+    <pre class="log">{% for line in snap.log_tail %}{{ line }}
+{% endfor %}</pre>
+  </details>
+</section>
+{% endif %}
+{% endblock %}

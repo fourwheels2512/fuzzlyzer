@@ -1,0 +1,31 @@
+<div class="scenario-card">
+  <div class="scenario-card-header">
+    <span class="index">Scenario</span>
+    <button type="button"
+            class="btn-remove"
+            onclick="this.closest('.scenario-card').remove();">
+      Remove
+    </button>
+  </div>
+  <div class="field">
+    <label>What's the case?</label>
+    <p class="field-hint">
+      One paragraph in plain English. Include the facts your AI would
+      see.
+    </p>
+    <textarea name="scenario_case" rows="4" maxlength="3000"
+              placeholder="e.g. Applicant requests a $24,000 personal loan. Annual income $78,000...">{{ starter.case }}</textarea>
+  </div>
+  <div class="field">
+    <label>Why is this case tricky or borderline? (optional)</label>
+    <textarea name="scenario_why" rows="2" maxlength="800"
+              placeholder="e.g. Short job tenure, but ratios are otherwise fine.">{{ starter.why_borderline }}</textarea>
+  </div>
+  <div class="field">
+    <label>What should the AI decide?</label>
+    <select name="scenario_expected" class="expected-select">
+      <option value="approve" {% if starter.expected == "approve" %}selected{% endif %}>Approve</option>
+      <option value="deny" {% if starter.expected != "approve" %}selected{% endif %}>Deny</option>
+    </select>
+  </div>
+</div>

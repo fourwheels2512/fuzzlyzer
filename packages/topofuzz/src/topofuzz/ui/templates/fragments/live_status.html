@@ -1,0 +1,54 @@
+{% if snap.status != "running" %}
+  <div hx-get="/runs/{{ run.run_id }}"
+       hx-trigger="load"
+       hx-target="body"
+       hx-swap="outerHTML"
+       hx-push-url="/runs/{{ run.run_id }}">
+    <p>Finished — loading your results…</p>
+  </div>
+{% else %}
+  {% set rows_done = snap.rows_done or 0 %}
+  {% set rows_total = snap.rows_total or 0 %}
+  {% set pct = (rows_done * 100 // rows_total) if rows_total else 5 %}
+  <dl class="kv">
+    <dt>Status</dt><dd><span class="status-pill running">Running</span></dd>
+    <dt>Workflow</dt><dd>{{ workflow.label }}</dd>
+    <dt>Started</dt><dd>{{ "%d"|format(snap.elapsed_seconds) }} sec ago</dd>
+  </dl>
+
+  <div class="progress" aria-label="progress">
+    <div class="progress-bar" style="width: {{ pct }}%;"></div>
+  </div>
+  <p class="muted">
+    {% if rows_total %}
+      Scenario {{ rows_done }} of {{ rows_total }}
+      {% if snap.variants_total %}
+        · ordering {{ snap.current_variant }} of {{ snap.variants_total }}
+      {% endif %}
+    {% else %}
+      Starting up…
+    {% endif %}
+  </p>
+
+  <dl class="kv mt-16">
+    <dt>Spent so far</dt>
+    <dd>{{ format_dollars(snap.real_spend_usd) }} of about {{ format_dollars(snap.real_cap_usd) }}</dd>
+  </dl>
+
+  {% if snap.error_class == "rate_limit" %}
+    <div class="banner warn">
+      Gemini is rate-limiting us. The run will keep retrying — hold tight.
+    </div>
+  {% elif snap.error_class == "auth" %}
+    <div class="banner danger">
+      Your Gemini API key was rejected. We'll stop the run shortly so you
+      can fix it.
+    </div>
+  {% endif %}
+
+  <details class="disclosure mt-16">
+    <summary>What's happening behind the scenes</summary>
+    <pre class="log">{% for line in snap.log_tail %}{{ line }}
+{% endfor %}</pre>
+  </details>
+{% endif %}

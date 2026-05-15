@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Running · topofuzz{% endblock %}
+{% block content %}
+<h1>Running your test…</h1>
+<p class="lede">
+  We're shuffling the order of your AI's steps and checking whether the
+  decision changes. You can leave this tab open — or come back later to
+  <code>/runs/{{ run.run_id }}</code>.
+</p>
+
+<section class="card flush">
+  <div class="card-body">
+    <div id="live-status"
+         hx-get="/runs/{{ run.run_id }}/status"
+         hx-trigger="load, every 2s"
+         hx-swap="innerHTML">
+      {% include "fragments/live_status.html" %}
+    </div>
+  </div>
+  <div class="card-body" style="border-top: 1px solid var(--border);">
+    <form method="post" action="/runs/{{ run.run_id }}/cancel">
+      <button type="submit" class="btn danger">Cancel this run</button>
+    </form>
+  </div>
+</section>
+{% endblock %}

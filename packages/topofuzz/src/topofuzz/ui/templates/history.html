@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Past runs · topofuzz{% endblock %}
+{% block content %}
+<h1>Past runs</h1>
+<p class="lede">
+  Every test you've run on this computer.
+</p>
+
+{% if not runs %}
+<section class="card">
+  <p class="muted">No runs yet.</p>
+  <a class="btn" href="/setup">Start your first one</a>
+</section>
+{% else %}
+<div class="history-list">
+  {% for run in runs %}
+    {% set snap = run.snapshot() %}
+    <a class="history-row" href="/runs/{{ run.run_id }}">
+      <div class="meta">
+        <div class="title">
+          {{ run.workflow_key.replace("-", " ") }}
+          · {{ run.thoroughness_key }}
+        </div>
+        <div class="sub">
+          {{ run.run_id }} · {{ "%d"|format(snap.elapsed_seconds) }} sec
+          · {{ format_dollars(snap.real_spend_usd) }}
+        </div>
+      </div>
+      <span class="status-pill {{ run.status }}">{{ run.status }}</span>
+    </a>
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}

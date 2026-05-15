@@ -66,6 +66,12 @@ runs/
 !examples/gallery/*/runs/
 !examples/gallery/*/runs/**
 
+# topofuzz UI server runtime artifacts (local-only, ephemeral)
+ui_server.log
+ui_server.err.log
+.playwright-mcp/
+ui-*.png
+
 # uv lock state lives at workspace root only; per-package locks not used
 packages/*/uv.lock
 

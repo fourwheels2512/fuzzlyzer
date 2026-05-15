@@ -1,0 +1,12 @@
+<div id="cost-row" class="cost-row">
+  <div>
+    <p class="cost-label">Estimated real cost</p>
+    <p class="cost-value">{{ cost.real_cap_fmt }}</p>
+    <p class="cost-finer">Up to this much in real Gemini API charges</p>
+  </div>
+  <div>
+    <p class="cost-label">Estimated time</p>
+    <p class="cost-value">~{{ cost.minutes_typical }} min</p>
+    <p class="cost-finer">{{ cost.n_scenarios }} scenario(s) queued</p>
+  </div>
+</div>

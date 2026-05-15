@@ -1597,6 +1597,139 @@ def keygen(
     )
 
 
+@app.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+def ui(
+    ctx: typer.Context,
+    host: str = typer.Option(
+        "127.0.0.1",
+        "--host",
+        help=(
+            "Bind address. Locked to loopback (127.0.0.1, localhost, ::1) "
+            "because the UI has no auth and shouldn't reach the LAN. "
+            "Override only via --i-understand-no-auth."
+        ),
+    ),
+    port: int = typer.Option(
+        8765,
+        "--port",
+        help=(
+            "Preferred port. If taken, the launcher walks up to find a "
+            "free one and prints the actual URL."
+        ),
+    ),
+    open_browser: bool = typer.Option(
+        True,
+        "--open-browser/--no-open-browser",
+        help="Open the default browser to the UI on startup.",
+    ),
+    allow_remote: bool = typer.Option(
+        False,
+        "--i-understand-no-auth",
+        help=(
+            "Explicit acknowledgement that exposing the UI beyond loopback "
+            "lets ANYONE on your network start runs (spending your Gemini "
+            "key) and read every past run's report. Required to use a non-"
+            "loopback --host. Do NOT pass this on a coffee-shop network."
+        ),
+    ),
+) -> None:
+    """Launch the topofuzz web UI on http://localhost:<port>.
+
+    Plug-and-play: one command, browser opens, click and go. No CSV
+    editing, no Python knowledge, no config files. See
+    ``topofuzz.ui.app:build_app`` for the route map.
+
+    Loopback-only by default — there is no auth on this UI. RT-audit
+    blocker B1: a `--host 0.0.0.0` invocation on a public Wi-Fi network
+    would let anyone on the LAN POST /setup and spend the user's API
+    budget. ``--i-understand-no-auth`` is the explicit override.
+    """
+    _reject_reserved_flags(list(ctx.args))
+    _reject_unknown_extras(list(ctx.args))
+
+    # Loopback enforcement — RT-audit B1.
+    _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+    # Note: "0.0.0.0" is technically loopback-binding-equivalent on some
+    # systems but exposes every interface on others; treat it as remote.
+    is_loopback = host in {"127.0.0.1", "localhost", "::1"}
+    if not is_loopback and not allow_remote:
+        typer.echo(
+            f"topofuzz ui: refusing to bind {host!r}. The UI has no "
+            f"authentication. Pass --i-understand-no-auth to override. "
+            f"See `topofuzz ui --help` for details.",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT)
+
+    # Lazy import — FastAPI / uvicorn aren't on the verify-path install.
+    try:
+        import socket
+        import threading
+        import time
+        import webbrowser
+
+        import uvicorn
+
+        from topofuzz.ui.app import build_app
+    except ImportError as exc:
+        typer.echo(
+            f"topofuzz ui: required dependency missing ({exc}). "
+            "Install with `pip install topofuzz[ui]`.",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from exc
+
+    # Walk to find a free port if the preferred one is taken. RT axis 9.
+    actual_port = port
+    for candidate in range(port, port + 20):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((host, candidate))
+                actual_port = candidate
+                break
+            except OSError:
+                continue
+    else:
+        typer.echo(
+            f"topofuzz ui: no free port found between {port} and {port + 19}.",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT)
+
+    url = f"http://{host}:{actual_port}/"
+    typer.echo(f"topofuzz UI running at {url}")
+    typer.echo("Press Ctrl+C to stop.")
+
+    fastapi_app = build_app()
+
+    if open_browser:
+        # Open browser shortly after uvicorn starts. Run in a thread so
+        # we don't block on a hung browser launch.
+        def _open_later() -> None:
+            time.sleep(0.6)
+            try:
+                webbrowser.open(url)
+            except OSError:
+                pass
+
+        threading.Thread(target=_open_later, daemon=True).start()
+
+    config = uvicorn.Config(
+        fastapi_app,
+        host=host,
+        port=actual_port,
+        log_level="warning",
+        access_log=False,
+    )
+    server = uvicorn.Server(config)
+    server.run()
+
+
 def main() -> None:
     """Module entry-point used by ``python -m topofuzz``."""
     logging.basicConfig(level=logging.WARNING)

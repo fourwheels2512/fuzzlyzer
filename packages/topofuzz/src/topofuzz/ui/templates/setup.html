@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}New run · topofuzz{% endblock %}
+{% block content %}
+<h1>Set up your run.</h1>
+<p class="lede">
+  Three steps. Pick a workflow, write a few scenarios, then start the run.
+</p>
+
+{% if form_error %}
+<div class="banner danger">{{ form_error }}</div>
+{% endif %}
+
+{% if active_run_id %}
+<div class="banner warn">
+  Another run is in progress.
+  <a href="/runs/{{ active_run_id }}/live">Open it</a>
+  or cancel it before starting a new one.
+</div>
+{% endif %}
+
+<form method="post" action="/setup" id="setup-form">
+  <section class="card">
+    <h3>1. Pick a workflow</h3>
+    <p class="field-hint">
+      This decides what your AI is being tested on. Each workflow comes
+      with three example scenarios — you can edit or remove them.
+    </p>
+    <div class="tile-group"
+         hx-trigger="change from:input[name=workflow]"
+         hx-get="/setup/example"
+         hx-include="[name=workflow]"
+         hx-target="#scenario-list"
+         hx-swap="innerHTML">
+      {% for workflow in workflows %}
+      <label class="tile">
+        <input type="radio" name="workflow" value="{{ workflow.key }}"
+               {% if workflow.key == selected_workflow.key %}checked{% endif %} />
+        <div class="tile-title">{{ workflow.label }}</div>
+        <div class="tile-desc">{{ workflow.short_desc }}</div>
+      </label>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="card">
+    <h3>2. Pick how thorough</h3>
+    <p class="field-hint">
+      More thorough = more shuffles to try, smarter judge, costs more.
+    </p>
+    <div class="tile-group"
+         hx-trigger="change from:input[name=thoroughness]"
+         hx-get="/setup/cost-preview"
+         hx-include="[name=workflow],[name=thoroughness],input[name='scenario_case']"
+         hx-vals='js:{n_scenarios: document.querySelectorAll(".scenario-card").length}'
+         hx-target="#cost-row"
+         hx-swap="outerHTML">
+      {% for t in thoroughnesses %}
+      <label class="tile">
+        <input type="radio" name="thoroughness" value="{{ t.key }}"
+               {% if t.key == selected_thoroughness.key %}checked{% endif %} />
+        <div class="tile-title">{{ t.label }}</div>
+        <div class="tile-desc">{{ t.short_desc }}</div>
+      </label>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="card">
+    <h3>3. Write your scenarios</h3>
+    <p class="field-hint">
+      Each scenario is one real-world case your AI has to decide on.
+      Write at least three. A good mix is some <em>borderline</em> cases
+      and at least one clear-approve case as a sanity check.
+    </p>
+    <div id="scenario-list" class="scenarios">
+      {% for starter in starters %}
+        {% include "fragments/scenario_card.html" %}
+      {% endfor %}
+    </div>
+    <div class="mt-16">
+      <button type="button"
+              class="btn muted"
+              hx-post="/setup/scenario"
+              hx-target="#scenario-list"
+              hx-swap="beforeend">
+        Add another scenario
+      </button>
+    </div>
+  </section>
+
+  {% include "fragments/cost_row.html" %}
+
+  <div class="btn-row" style="margin-top: 28px;">
+    <button type="submit" class="btn large">Start the test</button>
+    <span class="muted">Takes about {{ cost.minutes_typical }} minute(s) · costs about {{ cost.real_cap_fmt }}</span>
+  </div>
+</form>
+{% endblock %}

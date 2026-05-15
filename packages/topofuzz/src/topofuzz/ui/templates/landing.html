@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}topofuzz · test your AI pipeline{% endblock %}
+{% block content %}
+<section class="hero">
+  <h1>Test your AI pipeline.</h1>
+  <p class="lede">
+    See if your AI gives different answers when we change the order of
+    its steps. No coding required.
+  </p>
+  <div class="btn-row" style="justify-content: center;">
+    <a class="btn large" href="/setup">Start a test</a>
+    <a class="btn large ghost" href="/runs">See past runs</a>
+  </div>
+  {% if not key_present %}
+  <p class="muted mt-32" style="max-width: 480px; margin-left: auto; margin-right: auto;">
+    You'll need a Google Gemini API key the first time. We'll walk you
+    through it.
+  </p>
+  {% endif %}
+</section>
+
+<section class="card mt-32">
+  <h2>How it works</h2>
+  <p class="muted">
+    Pick a real-world workflow (loan approval, insurance claim triage).
+    Describe a few cases your AI has to handle. We run those cases through
+    the AI, then shuffle the order of its steps and run them again. If the
+    AI's answer flips depending on the order, that's a fairness or
+    reliability issue you'd want to catch before shipping.
+  </p>
+  <ol class="muted">
+    <li>Pick a workflow.</li>
+    <li>Write or edit a few scenarios in plain English.</li>
+    <li>Pick a thoroughness level — Quick, Balanced, or Premium.</li>
+    <li>Click <strong>Test for flips</strong> and wait a few minutes.</li>
+    <li>Read your plain-English report.</li>
+  </ol>
+</section>
+{% endblock %}

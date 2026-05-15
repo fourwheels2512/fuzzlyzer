@@ -44,6 +44,16 @@ dependencies = [
 # Kept as an extras name for forward-compat and documentation.
 verify = []
 
+# topofuzz[ui]: the 5th-grader-runnable web UI (python -m topofuzz ui).
+# Pulled separately from `full` so users who only want the CLI don't drag
+# in a web framework.
+ui = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "jinja2>=3.1",
+]
+
 # topofuzz[full]: adds LLM SDKs, plotting, secrets/retry/logging. Pulls ~400MB.
 # Stats (numpy+scipy) and cache (diskcache) come transitively via
 # fuzzeval[stats,cache] so they aren't duplicated here.
