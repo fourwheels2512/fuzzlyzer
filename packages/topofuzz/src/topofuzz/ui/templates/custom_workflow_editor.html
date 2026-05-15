@@ -1,0 +1,244 @@
+{% extends "base.html" %}
+{% block title %}{% if cw %}Edit{% else %}New{% endif %} custom workflow · topofuzz{% endblock %}
+{% block content %}
+<h1>{% if cw %}Edit your workflow{% else %}Build a custom workflow{% endif %}</h1>
+<p class="lede">
+  Describe a chain of agents your AI pipeline runs, in order. Each agent
+  is one step. Topofuzz will swap their order and re-run to find
+  fragility. No code required.
+</p>
+
+{% if form_errors and form_errors._general %}
+<div class="banner danger">{{ form_errors._general }}</div>
+{% endif %}
+
+<form method="post" action="{{ form_action }}" id="custom-workflow-form">
+
+  <section class="card">
+    <h3>1. Workflow basics</h3>
+
+    <div class="field">
+      <label for="label">Workflow name</label>
+      <p class="field-hint">Short. Shows up as a tile on the New Run page.</p>
+      <input type="text" name="label" id="label"
+             value="{{ label }}" required minlength="2" maxlength="60"
+             placeholder="e.g. Mortgage approval pipeline" />
+      {% if form_errors.label %}<p class="field-error">{{ form_errors.label }}</p>{% endif %}
+    </div>
+
+    <div class="field">
+      <label for="domain_noun">What kind of thing is being decided?</label>
+      <p class="field-hint">Singular noun. Used in the AI's prompts and your report.</p>
+      <input type="text" name="domain_noun" id="domain_noun"
+             value="{{ domain_noun }}" required minlength="2" maxlength="30"
+             placeholder="e.g. loan application, insurance claim, hiring decision" />
+      {% if form_errors.domain_noun %}<p class="field-error">{{ form_errors.domain_noun }}</p>{% endif %}
+    </div>
+
+    <div class="field">
+      <label for="decision_verb">What's the decision?</label>
+      <p class="field-hint">Default is approve / deny. Use other phrasing if it fits your domain.</p>
+      <input type="text" name="decision_verb" id="decision_verb"
+             value="{{ decision_verb }}" required minlength="2" maxlength="40"
+             placeholder="e.g. approve / deny" />
+      {% if form_errors.decision_verb %}<p class="field-error">{{ form_errors.decision_verb }}</p>{% endif %}
+    </div>
+  </section>
+
+  <section class="card">
+    <h3>2. Agents (in order)</h3>
+    <p class="field-hint">
+      Add 1-10 agents. Order matters — they run top to bottom.
+      The agent's name IS its prompt: a "senior_underwriter_arguing_for_denial"
+      will behave very differently from an "intake_clerk".
+      Use snake_case (lowercase letters, digits, underscores).
+    </p>
+
+    {% if form_errors.agents %}<p class="field-error">{{ form_errors.agents }}</p>{% endif %}
+
+    <div id="agent-list" class="agents">
+      {% for aid, mdl in agents %}
+        {% set idx = loop.index %}
+        <div class="scenario-card agent-row">
+          <div class="scenario-card-header">
+            <span class="index">Agent {{ idx }}</span>
+            <button type="button" class="btn-remove"
+                    onclick="this.closest('.agent-row').remove();">
+              Remove
+            </button>
+          </div>
+          <div class="field">
+            <label>Agent name</label>
+            <input type="text" name="agent_id"
+                   value="{{ aid }}"
+                   pattern="[a-z][a-z0-9_]{1,39}"
+                   maxlength="40"
+                   placeholder="e.g. intake_clerk, senior_underwriter, devils_advocate" />
+            {% if form_errors['agent_id_' ~ idx] %}<p class="field-error">{{ form_errors['agent_id_' ~ idx] }}</p>{% endif %}
+          </div>
+          <div class="field">
+            <label>Model</label>
+            <select name="agent_model">
+              {% for mid, mlabel in models %}
+                <option value="{{ mid }}" {% if mid == mdl %}selected{% endif %}>{{ mlabel }}</option>
+              {% endfor %}
+            </select>
+            {% if form_errors['agent_model_' ~ idx] %}<p class="field-error">{{ form_errors['agent_model_' ~ idx] }}</p>{% endif %}
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+
+    <div class="mt-16">
+      <button type="button" class="btn muted" id="add-agent-btn">
+        Add another agent
+      </button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h3>3. Verdict agent</h3>
+    <p class="field-hint">
+      Which agent's output is the final decision? Defaults to the LAST
+      agent in the chain — change the order above if a different one
+      should be the verdict.
+    </p>
+    <div class="field">
+      <label for="verdict_agent_id">Verdict agent</label>
+      <select name="verdict_agent_id" id="verdict_agent_id">
+        {% for aid, _mdl in agents %}
+          <option value="{{ aid }}" {% if aid == verdict_agent_id %}selected{% endif %}>{{ aid }}</option>
+        {% endfor %}
+      </select>
+      <p class="field-hint" id="verdict-hint" style="margin-top: 6px;">
+        Auto-syncs from agent rows above. Linear chains require this be the last agent.
+      </p>
+      {% if form_errors.verdict_agent_id %}<p class="field-error">{{ form_errors.verdict_agent_id }}</p>{% endif %}
+    </div>
+  </section>
+
+  <section class="card">
+    <h3>4. Rubric paragraph</h3>
+    <p class="field-hint">
+      One paragraph of plain English. Topofuzz uses this to tell the
+      judge what counts as APPROVE vs DENY in your domain. 50-2000
+      characters.
+    </p>
+    <div class="field">
+      <textarea name="rubric_paragraph" rows="6"
+                minlength="50" maxlength="2000"
+                placeholder="e.g. The pipeline approves a mortgage application when the applicant has stable income, manageable debt-to-income ratio, and adequate credit history. Denials are warranted when the applicant has insufficient income, high DTI, recent missed payments, or insufficient employment history. Borderline cases are common — focus on the verdict the pipeline ultimately states.">{{ rubric_paragraph }}</textarea>
+      {% if form_errors.rubric_paragraph %}<p class="field-error">{{ form_errors.rubric_paragraph }}</p>{% endif %}
+    </div>
+  </section>
+
+  <div class="btn-row" style="margin-top: 28px;">
+    <button type="submit" class="btn large">Save and use</button>
+    <a href="/setup" class="muted">Cancel</a>
+  </div>
+</form>
+
+{# Empty agent-row template — cloned client-side when the user clicks
+   "Add another agent". No HTMX needed for this one — the row carries
+   no server state. #}
+<template id="agent-row-template">
+  <div class="scenario-card agent-row">
+    <div class="scenario-card-header">
+      <span class="index">Agent</span>
+      <button type="button" class="btn-remove"
+              onclick="this.closest('.agent-row').remove();">
+        Remove
+      </button>
+    </div>
+    <div class="field">
+      <label>Agent name</label>
+      <input type="text" name="agent_id" value=""
+             pattern="[a-z][a-z0-9_]{1,39}" maxlength="40"
+             placeholder="e.g. intake_clerk" />
+    </div>
+    <div class="field">
+      <label>Model</label>
+      <select name="agent_model">
+        {% for mid, mlabel in models %}
+          <option value="{{ mid }}">{{ mlabel }}</option>
+        {% endfor %}
+      </select>
+    </div>
+  </div>
+</template>
+
+<script>
+  // Renumber agent rows + drive the "Add another agent" button + keep the
+  // verdict-agent <select> in sync with whatever agent_ids exist right now.
+  // Plain JS — no framework needed; one page, one feature.
+  (function () {
+    var list = document.getElementById('agent-list');
+    var verdictSel = document.getElementById('verdict_agent_id');
+
+    function renumber() {
+      var rows = document.querySelectorAll('#agent-list .agent-row');
+      rows.forEach(function (row, i) {
+        var span = row.querySelector('.index');
+        if (span) span.textContent = 'Agent ' + (i + 1);
+      });
+    }
+
+    function syncVerdictOptions() {
+      if (!verdictSel || !list) return;
+      var prev = verdictSel.value;
+      var ids = [];
+      list.querySelectorAll('.agent-row input[name="agent_id"]').forEach(function (inp) {
+        var v = (inp.value || '').trim();
+        if (v) ids.push(v);
+      });
+      // Default selection: keep prior pick if still present, else last (the
+      // valid choice for a linear chain). The validator falls back to the
+      // last agent if the user submits blank, so an empty list is fine.
+      var nextSel = ids.indexOf(prev) >= 0 ? prev : (ids.length ? ids[ids.length - 1] : '');
+      verdictSel.innerHTML = '';
+      ids.forEach(function (id) {
+        var opt = document.createElement('option');
+        opt.value = id;
+        opt.textContent = id;
+        if (id === nextSel) opt.selected = true;
+        verdictSel.appendChild(opt);
+      });
+    }
+
+    if (list) {
+      // Re-sync on any keystroke in any agent_id field, and on row add/remove.
+      list.addEventListener('input', function (e) {
+        if (e.target && e.target.name === 'agent_id') syncVerdictOptions();
+      });
+    }
+
+    var btn = document.getElementById('add-agent-btn');
+    var tpl = document.getElementById('agent-row-template');
+    if (btn && tpl && list) {
+      btn.addEventListener('click', function () {
+        var rows = list.querySelectorAll('.agent-row').length;
+        if (rows >= {{ max_agents }}) {
+          alert('At most {{ max_agents }} agents.');
+          return;
+        }
+        var node = tpl.content.firstElementChild.cloneNode(true);
+        list.appendChild(node);
+        renumber();
+        syncVerdictOptions();
+      });
+    }
+
+    // The Remove button uses inline onclick (matches the scenario card
+    // pattern). Re-sync after the click handler fires.
+    document.addEventListener('click', function (e) {
+      if (e.target && e.target.classList && e.target.classList.contains('btn-remove')) {
+        // Defer one tick — the inline onclick removes the row first.
+        setTimeout(function () { renumber(); syncVerdictOptions(); }, 0);
+      }
+    });
+
+    renumber();
+    syncVerdictOptions();
+  })();
+</script>
+{% endblock %}

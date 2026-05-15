@@ -234,7 +234,12 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     # Pretend a key is set so we don't bounce into the no_key page.
     monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
     app = build_app(runs_root=tmp_path / "ui-runs")
-    return TestClient(app)
+    c = TestClient(app)
+    # POST routes enforce same-origin via Origin header (CSRF defense in
+    # app.py:_csrf_guard). Mirror TestClient's default Host="testserver"
+    # so legitimate POSTs in tests don't trip the guard.
+    c.headers["Origin"] = "http://testserver"
+    return c
 
 
 @pytest.fixture()

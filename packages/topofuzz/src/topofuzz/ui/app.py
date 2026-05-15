@@ -24,9 +24,12 @@ banner. This is the simplest concurrency model that doesn't surprise a
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
+
+_log = logging.getLogger(__name__)
 
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
@@ -36,15 +39,28 @@ from fastapi.templating import Jinja2Templates
 from topofuzz import __version__
 from topofuzz.ui.cost import format_dollars, real_dollars
 from topofuzz.ui.presets import (
+    ALLOWED_CUSTOM_MODELS,
+    CUSTOM_WORKFLOW_KEY_PREFIX,
     DEFAULT_THOROUGHNESS,
     DEFAULT_WORKFLOW,
     THOROUGHNESS,
     WORKFLOWS,
+    CustomWorkflow,
     StarterScenario,
     Thoroughness,
     Workflow,
     get_thoroughness,
     get_workflow,
+)
+from topofuzz.ui.custom_storage import (
+    delete_custom_workflow,
+    list_custom_workflows,
+    load_custom_workflow,
+    save_custom_workflow,
+)
+from topofuzz.ui.custom_validation import (
+    CustomFormError,
+    validate_custom_workflow_form,
 )
 from topofuzz.ui.runs import (
     RunInProgressError,
@@ -57,6 +73,11 @@ from topofuzz.ui.runs import (
 _THIS_DIR = Path(__file__).resolve().parent
 _TEMPLATES_DIR = _THIS_DIR / "templates"
 _STATIC_DIR = _THIS_DIR / "static"
+
+# Maximum POST body the custom-workflow editor accepts. 64 KB is far above
+# the legitimate form size (label + 10 agents + 2 KB rubric ≈ 3 KB) and
+# below any value that could exhaust memory by request flood.
+_CUSTOM_FORM_MAX_BYTES = 64 * 1024
 
 
 def _default_runs_root() -> Path:
@@ -147,6 +168,48 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
     def _starters_as_scenarios(workflow: Workflow) -> list[StarterScenario]:
         return list(workflow.starters)
 
+    def _all_workflows_for_setup() -> list[Workflow]:
+        """Built-ins (in their declared order) plus saved custom workflows.
+
+        Custom workflows come last, sorted by ``created_at`` descending —
+        i.e. the freshest custom workflow appears just after the built-ins.
+        """
+        out: list[Workflow] = list(WORKFLOWS.values())
+        for cw in list_custom_workflows():
+            try:
+                out.append(_materialize_custom(cw))
+            except (OSError, KeyError, ValueError) as exc:
+                # Narrow except: never let one bad workflow break the setup
+                # page, but log the failure so the user has something to
+                # diagnose. Don't catch Exception — that would hide real
+                # bugs in template rendering or schema construction.
+                _log.warning(
+                    "could not materialize custom workflow %s: %s",
+                    cw.workflow_id,
+                    exc,
+                )
+                continue
+        return out
+
+    def _materialize_custom(cw: CustomWorkflow) -> Workflow:
+        """Resolve a CustomWorkflow into a runnable :class:`Workflow`.
+
+        Goes through :func:`get_workflow` so the same on-disk path is
+        exercised that ``POST /setup`` will hit when the user clicks Run.
+        """
+        return get_workflow(cw.key)
+
+    def _resolve_workflow_or_default(key: str) -> Workflow:
+        """Look up ``key`` (built-in OR ``custom:...``); fall back to default.
+
+        Used in error-path renders where we just need *something* sensible
+        to show the user — never raises.
+        """
+        try:
+            return get_workflow(key)
+        except KeyError:
+            return WORKFLOWS[DEFAULT_WORKFLOW]
+
     # ---------- routes ---------------------------------------------------
 
     @app.get("/healthz")
@@ -171,7 +234,14 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
             return templates.TemplateResponse(
                 request, "no_key.html", {}, status_code=200
             )
-        workflow_obj = WORKFLOWS.get(workflow) or WORKFLOWS[DEFAULT_WORKFLOW]
+        all_workflows = _all_workflows_for_setup()
+        # Resolve selected workflow against built-ins AND custom; fall back
+        # to the default if the requested key has been deleted.
+        workflow_obj: Workflow
+        try:
+            workflow_obj = get_workflow(workflow)
+        except KeyError:
+            workflow_obj = WORKFLOWS[DEFAULT_WORKFLOW]
         thoroughness_obj = THOROUGHNESS.get(thoroughness) or THOROUGHNESS[DEFAULT_THOROUGHNESS]
         starters = _starters_as_scenarios(workflow_obj)
         # Pad to 5 cards by default so the page feels prepared rather than empty.
@@ -189,18 +259,20 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
             request,
             "setup.html",
             {
-                "workflows": list(WORKFLOWS.values()),
+                "workflows": all_workflows,
                 "thoroughnesses": list(THOROUGHNESS.values()),
                 "selected_workflow": workflow_obj,
                 "selected_thoroughness": thoroughness_obj,
                 "starters": starters,
                 "cost": cost,
                 "active_run_id": active.run_id if active else None,
+                "custom_prefix": CUSTOM_WORKFLOW_KEY_PREFIX,
             },
         )
 
     @app.post("/setup", response_model=None)
     async def setup_post(request: Request):  # noqa: ANN202 — union response
+        _csrf_guard(request)
         form = await request.form()
         workflow_key = (form.get("workflow") or DEFAULT_WORKFLOW).strip()
         thoroughness_key = (form.get("thoroughness") or DEFAULT_THOROUGHNESS).strip()
@@ -227,7 +299,7 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
                 request,
                 "setup.html",
                 {
-                    "workflows": list(WORKFLOWS.values()),
+                    "workflows": _all_workflows_for_setup(),
                     "thoroughnesses": list(THOROUGHNESS.values()),
                     "selected_workflow": workflow_obj,
                     "selected_thoroughness": thoroughness_obj,
@@ -258,7 +330,7 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
                 request,
                 "setup.html",
                 {
-                    "workflows": list(WORKFLOWS.values()),
+                    "workflows": _all_workflows_for_setup(),
                     "thoroughnesses": list(THOROUGHNESS.values()),
                     "selected_workflow": workflow_obj,
                     "selected_thoroughness": thoroughness_obj,
@@ -305,7 +377,7 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
         workflow's starters, padded to 5 cards. The form template's
         scenario-card container target swaps with this fragment.
         """
-        workflow_obj = WORKFLOWS.get(workflow) or WORKFLOWS[DEFAULT_WORKFLOW]
+        workflow_obj = _resolve_workflow_or_default(workflow)
         starters = _starters_as_scenarios(workflow_obj)
         while len(starters) < 5:
             starters.append(
@@ -345,7 +417,7 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
         if run.status != "running":
             return RedirectResponse(url=f"/runs/{run_id}", status_code=303)
         snap = run.snapshot()
-        workflow_obj = WORKFLOWS.get(run.workflow_key) or WORKFLOWS[DEFAULT_WORKFLOW]
+        workflow_obj = _resolve_workflow_or_default(run.workflow_key)
         thoroughness_obj = THOROUGHNESS.get(run.thoroughness_key) or THOROUGHNESS[DEFAULT_THOROUGHNESS]
         return templates.TemplateResponse(
             request,
@@ -365,7 +437,7 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
         except UnknownRunError as exc:
             raise HTTPException(status_code=404, detail="unknown run") from exc
         snap = run.snapshot()
-        workflow_obj = WORKFLOWS.get(run.workflow_key) or WORKFLOWS[DEFAULT_WORKFLOW]
+        workflow_obj = _resolve_workflow_or_default(run.workflow_key)
         return templates.TemplateResponse(
             request,
             "fragments/live_status.html",
@@ -377,7 +449,8 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
         )
 
     @app.post("/runs/{run_id}/cancel")
-    async def run_cancel(run_id: str) -> RedirectResponse:
+    async def run_cancel(request: Request, run_id: str) -> RedirectResponse:
+        _csrf_guard(request)
         try:
             registry.cancel(run_id)
         except UnknownRunError as exc:
@@ -394,7 +467,7 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
             return RedirectResponse(url=f"/runs/{run_id}/live", status_code=303)
         snap = run.snapshot()
         summary = run.read_summary()
-        workflow_obj = WORKFLOWS.get(run.workflow_key) or WORKFLOWS[DEFAULT_WORKFLOW]
+        workflow_obj = _resolve_workflow_or_default(run.workflow_key)
         headline = _build_headline(run=run, summary=summary, workflow=workflow_obj)
         report_exists = run.report_html_path.exists()
         return templates.TemplateResponse(
@@ -437,6 +510,324 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
                 "Referrer-Policy": "no-referrer",
             },
         )
+
+    # ---- Custom workflow ("BYOP") routes -----------------------------
+
+    def _render_custom_editor(
+        request: Request,
+        *,
+        cw: CustomWorkflow | None,
+        form_errors: dict[str, str] | None = None,
+        form_values: dict[str, Any] | None = None,
+        status_code: int = 200,
+    ) -> HTMLResponse:
+        """Render the custom-workflow editor in create or edit mode.
+
+        ``cw`` is the existing workflow being edited (None on create).
+        ``form_values`` lets the route preserve a partially-filled form
+        when validation fails — without it, the user retypes everything.
+        """
+        # Build the editor's "current state": prefer form_values (latest
+        # user input that failed validation), then fall back to the saved
+        # custom workflow, then to a sensible blank create-mode default.
+        if form_values is not None:
+            ctx_label = form_values.get("label", "")
+            ctx_domain = form_values.get("domain_noun", "")
+            ctx_verb = form_values.get("decision_verb", "")
+            ctx_rubric = form_values.get("rubric_paragraph", "")
+            ctx_agents = form_values.get(
+                "agents", [("", ALLOWED_CUSTOM_MODELS[0][0])]
+            )
+            ctx_verdict = form_values.get("verdict_agent_id", "")
+        elif cw is not None:
+            ctx_label = cw.label
+            ctx_domain = cw.domain_noun
+            ctx_verb = cw.decision_verb
+            ctx_rubric = cw.rubric_paragraph
+            ctx_agents = [(a.agent_id, a.model) for a in cw.agents]
+            ctx_verdict = cw.verdict_agent_id
+        else:
+            # Blank create-mode form: 4 starter empty rows.
+            ctx_label = ""
+            ctx_domain = "loan application"
+            ctx_verb = "approve / deny"
+            ctx_rubric = ""
+            ctx_agents = [("", ALLOWED_CUSTOM_MODELS[0][0])] * 4
+            ctx_verdict = ""
+        return templates.TemplateResponse(
+            request,
+            "custom_workflow_editor.html",
+            {
+                "cw": cw,
+                "label": ctx_label,
+                "domain_noun": ctx_domain,
+                "decision_verb": ctx_verb,
+                "rubric_paragraph": ctx_rubric,
+                "agents": ctx_agents,
+                "verdict_agent_id": ctx_verdict,
+                "models": ALLOWED_CUSTOM_MODELS,
+                "form_errors": form_errors or {},
+                "form_action": (
+                    f"/custom-workflow/{cw.workflow_id}"
+                    if cw is not None
+                    else "/custom-workflow"
+                ),
+                "min_agents": 1,
+                "max_agents": 10,
+            },
+            status_code=status_code,
+        )
+
+    def _form_values_from_post(form: Any) -> dict[str, Any]:
+        """Extract form fields into the dict shape _render_custom_editor wants.
+
+        Used to round-trip a failed POST back through the editor without
+        losing the user's input.
+        """
+        agent_ids = (
+            form.getlist("agent_id") if hasattr(form, "getlist") else []
+        )
+        agent_models = (
+            form.getlist("agent_model") if hasattr(form, "getlist") else []
+        )
+        n = max(len(agent_ids), len(agent_models))
+        agents = []
+        for i in range(n):
+            aid = (agent_ids[i] if i < len(agent_ids) else "").strip()
+            mdl = (agent_models[i] if i < len(agent_models) else "").strip()
+            agents.append((aid, mdl))
+        return {
+            "label": (form.get("label") or "").strip(),
+            "domain_noun": (form.get("domain_noun") or "").strip(),
+            "decision_verb": (form.get("decision_verb") or "").strip(),
+            "rubric_paragraph": (form.get("rubric_paragraph") or "").strip(),
+            "agents": agents or [("", ALLOWED_CUSTOM_MODELS[0][0])],
+            "verdict_agent_id": (
+                form.get("verdict_agent_id") or ""
+            ).strip(),
+        }
+
+    def _csrf_guard(request: Request) -> None:
+        """Reject cross-origin / cross-site state-mutating requests.
+
+        Defense against the localhost-bound UI being POST'd by any tab the
+        user has open on a malicious site (browsers send the request
+        regardless of SameSite cookies on form-encoded POSTs). Two checks,
+        either one of which passes is fine:
+
+        * ``Sec-Fetch-Site: same-origin`` — modern browsers set this and it's
+          the cleanest signal.
+        * ``Origin`` header equals our own scheme://host — fallback for
+          older browsers that don't send Sec-Fetch-Site.
+
+        A request that fails both is rejected with 403. ``Origin`` MUST be
+        present on cross-origin POSTs; same-origin POSTs from a browser
+        page also send it. A direct ``curl`` without either header is
+        treated as ambiguous and refused — the legitimate UI always has
+        them. This is a localhost-only tool; we lose no real users.
+        """
+        sec_fetch_site = request.headers.get("sec-fetch-site", "").lower()
+        if sec_fetch_site in ("same-origin", "none"):
+            # "none" = top-level navigation typed into address bar (still
+            # safe — the attacker page can't make this happen). "same-origin"
+            # = the page making the request was loaded from us.
+            return
+        origin = request.headers.get("origin", "")
+        if origin:
+            host = request.headers.get("host", "")
+            # Build the expected origin from the request's own host header,
+            # not a hard-coded value. Localhost can be 127.0.0.1, localhost,
+            # or an alias.
+            expected = f"http://{host}"
+            expected_https = f"https://{host}"
+            if origin == expected or origin == expected_https:
+                return
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "cross-origin request refused. This UI accepts POSTs only "
+                "from its own pages."
+            ),
+        )
+
+    async def _read_capped_form(request: Request) -> Any:
+        """Read the form body, refusing anything over _CUSTOM_FORM_MAX_BYTES.
+
+        Always enforces the CSRF guard first so a cross-origin attacker
+        can't even reach the form parser. Then enforces the size cap by
+        explicitly reading the body and counting bytes — Content-Length
+        alone is forgeable (chunked transfer-encoding omits it entirely),
+        so we don't trust it as the only line of defense.
+        """
+        _csrf_guard(request)
+        # Reject when Content-Length is missing — closes the chunked-bypass
+        # case. The legitimate editor form always sends Content-Length;
+        # only an attacker hand-crafting a chunked POST omits it.
+        cl = request.headers.get("content-length")
+        if cl is None:
+            raise HTTPException(
+                status_code=411,
+                detail="content-length header required",
+            )
+        try:
+            cl_int = int(cl)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="invalid content-length"
+            ) from exc
+        if cl_int > _CUSTOM_FORM_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"form too large: max {_CUSTOM_FORM_MAX_BYTES} bytes",
+            )
+        # Re-verify after reading — Content-Length is advisory; the actual
+        # body could be longer. Starlette buffers the whole body anyway
+        # before form() returns, so this just makes the check load-bearing.
+        body = await request.body()
+        if len(body) > _CUSTOM_FORM_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"form too large: max {_CUSTOM_FORM_MAX_BYTES} bytes",
+            )
+        # Replay the buffered body so request.form() can parse it. Without
+        # this, form() would try to read again from an exhausted stream.
+        async def _replay() -> dict:
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        request._receive = _replay  # type: ignore[attr-defined]
+        return await request.form()
+
+    @app.get("/custom-workflow/new", response_class=HTMLResponse)
+    async def custom_workflow_new(request: Request) -> HTMLResponse:
+        return _render_custom_editor(request, cw=None)
+
+    @app.get("/custom-workflow/{workflow_id}", response_class=HTMLResponse)
+    async def custom_workflow_edit(
+        request: Request, workflow_id: str
+    ) -> HTMLResponse:
+        cw = load_custom_workflow(workflow_id)
+        if cw is None:
+            raise HTTPException(status_code=404, detail="custom workflow not found")
+        return _render_custom_editor(request, cw=cw)
+
+    @app.post("/custom-workflow", response_model=None)
+    async def custom_workflow_create(request: Request):  # noqa: ANN202
+        form = await _read_capped_form(request)
+        values = _form_values_from_post(form)
+        try:
+            cw = validate_custom_workflow_form(
+                label=values["label"],
+                domain_noun=values["domain_noun"],
+                decision_verb=values["decision_verb"],
+                agent_ids=[aid for aid, _ in values["agents"]],
+                agent_models=[mdl for _, mdl in values["agents"]],
+                verdict_agent_id=values["verdict_agent_id"],
+                rubric_paragraph=values["rubric_paragraph"],
+                workflow_id=None,
+            )
+        except CustomFormError as exc:
+            return _render_custom_editor(
+                request,
+                cw=None,
+                form_errors=exc.errors,
+                form_values=values,
+                status_code=400,
+            )
+        try:
+            wf = save_custom_workflow(cw)
+        except (OSError, ValueError) as exc:
+            # Narrow except: OSError covers disk full / permission /
+            # symlink issues; ValueError covers schema invariant misses
+            # (e.g. verdict-not-last). A wider Exception would hide real
+            # bugs. Log server-side, show a generic message to the user.
+            _log.warning(
+                "custom_workflow_create save failed: %s", exc, exc_info=True
+            )
+            return _render_custom_editor(
+                request,
+                cw=None,
+                form_errors={
+                    "_general": (
+                        "Could not save the workflow. Check the server log "
+                        "for details."
+                    )
+                },
+                form_values=values,
+                status_code=500,
+            )
+        return RedirectResponse(
+            url=f"/setup?workflow={wf.key}", status_code=303
+        )
+
+    @app.post("/custom-workflow/{workflow_id}", response_model=None)
+    async def custom_workflow_update(
+        request: Request, workflow_id: str
+    ):  # noqa: ANN202
+        existing = load_custom_workflow(workflow_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="custom workflow not found")
+        form = await _read_capped_form(request)
+        values = _form_values_from_post(form)
+        try:
+            cw = validate_custom_workflow_form(
+                label=values["label"],
+                domain_noun=values["domain_noun"],
+                decision_verb=values["decision_verb"],
+                agent_ids=[aid for aid, _ in values["agents"]],
+                agent_models=[mdl for _, mdl in values["agents"]],
+                verdict_agent_id=values["verdict_agent_id"],
+                rubric_paragraph=values["rubric_paragraph"],
+                workflow_id=workflow_id,  # preserve id on edit
+            )
+        except CustomFormError as exc:
+            return _render_custom_editor(
+                request,
+                cw=existing,
+                form_errors=exc.errors,
+                form_values=values,
+                status_code=400,
+            )
+        try:
+            wf = save_custom_workflow(cw)
+        except (OSError, ValueError) as exc:
+            _log.warning(
+                "custom_workflow_update save failed: %s", exc, exc_info=True
+            )
+            return _render_custom_editor(
+                request,
+                cw=existing,
+                form_errors={
+                    "_general": (
+                        "Could not save the workflow. Check the server log "
+                        "for details."
+                    )
+                },
+                form_values=values,
+                status_code=500,
+            )
+        return RedirectResponse(
+            url=f"/setup?workflow={wf.key}", status_code=303
+        )
+
+    @app.post("/custom-workflow/{workflow_id}/delete", response_model=None)
+    async def custom_workflow_delete(
+        request: Request, workflow_id: str
+    ):  # noqa: ANN202
+        _csrf_guard(request)
+        # Validate the id format before touching disk — refuses any
+        # non-conforming string at the path level.
+        from topofuzz.ui.custom_storage import is_valid_workflow_id
+
+        if not is_valid_workflow_id(workflow_id):
+            raise HTTPException(status_code=400, detail="invalid workflow id")
+        delete_custom_workflow(workflow_id)
+        return RedirectResponse(url="/setup", status_code=303)
+
+    def _resolve_target_dir(workflow_id: str) -> Path:
+        """Resolve the on-disk dir for a workflow id, with containment check."""
+        from topofuzz.ui.custom_storage import workflow_dir
+
+        return workflow_dir(workflow_id)
 
     return app
 

@@ -32,13 +32,38 @@
          hx-target="#scenario-list"
          hx-swap="innerHTML">
       {% for workflow in workflows %}
-      <label class="tile">
+      {% set is_custom = workflow.key.startswith(custom_prefix or 'custom:') %}
+      <label class="tile{% if is_custom %} tile-custom{% endif %}">
         <input type="radio" name="workflow" value="{{ workflow.key }}"
                {% if workflow.key == selected_workflow.key %}checked{% endif %} />
-        <div class="tile-title">{{ workflow.label }}</div>
+        <div class="tile-title">
+          {{ workflow.label }}
+          {% if is_custom %}<span class="tile-tag">custom</span>{% endif %}
+        </div>
         <div class="tile-desc">{{ workflow.short_desc }}</div>
+        {% if is_custom %}
+        {% set wf_id = workflow.key.split(':', 1)[1] %}
+        <div class="tile-actions">
+          <a href="/custom-workflow/{{ wf_id }}" class="muted">Edit</a>
+          <span class="muted">·</span>
+          {# Sibling form so the click isn't captured by the outer
+             radio label. The confirm dialog avoids accidental delete. #}
+          <a href="#"
+             onclick="event.preventDefault(); event.stopPropagation();
+                      if (confirm('Delete this custom workflow?')) {
+                        document.getElementById('delete-{{ wf_id }}').submit();
+                      }"
+             class="muted danger-link">Delete</a>
+        </div>
+        {% endif %}
       </label>
       {% endfor %}
+      {# "Create your own" tile — links straight to the editor. Not a
+         radio: clicking it navigates rather than selecting a workflow. #}
+      <a class="tile tile-create" href="/custom-workflow/new">
+        <div class="tile-title">+ Create your own</div>
+        <div class="tile-desc">Build a custom workflow from scratch</div>
+      </a>
     </div>
   </section>
 
@@ -95,4 +120,16 @@
     <span class="muted">Takes about {{ cost.minutes_typical }} minute(s) · costs about {{ cost.real_cap_fmt }}</span>
   </div>
 </form>
+
+{# Hidden delete-forms submitted by the per-tile Delete links. Kept
+   OUTSIDE the main #setup-form because nested <form>s are invalid HTML
+   (browsers silently drop the inner one and a Delete click would post
+   the wrong action). #}
+{% for workflow in workflows %}
+  {% if workflow.key.startswith(custom_prefix or 'custom:') %}
+    {% set wf_id = workflow.key.split(':', 1)[1] %}
+    <form method="post" action="/custom-workflow/{{ wf_id }}/delete"
+          id="delete-{{ wf_id }}" style="display:none;"></form>
+  {% endif %}
+{% endfor %}
 {% endblock %}

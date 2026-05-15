@@ -16,6 +16,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+# Prefix used for the `Workflow.key` of every user-defined ("custom") workflow.
+# Reserved — built-in workflow keys MUST NOT start with this prefix, so a
+# custom workflow can never collide with or shadow a built-in.
+CUSTOM_WORKFLOW_KEY_PREFIX = "custom:"
+
+
 # Repo root — five levels up from this file
 # (packages/topofuzz/src/topofuzz/ui/presets.py → repo root):
 #   parents[0] = ui/
@@ -49,6 +55,79 @@ class Workflow:
     fixture_path: Path
     rubric_path: Path
     starters: tuple[StarterScenario, ...] = field(default_factory=tuple)
+
+
+# ---- Custom workflow ("BYOP") types ------------------------------------
+#
+# These let a buyer plug in their own pipeline (1-10 agents, linear chain)
+# via the UI form, with no code. Materialized to disk by
+# :mod:`topofuzz.ui.custom_storage` as a real fixture.py + rubric.txt so
+# the existing CLI runner can load them unchanged.
+
+# Allow-listed model identifiers a custom workflow may pick. Server-side
+# enforced — the dropdown is only the UX surface; a hand-crafted POST that
+# tries another model is rejected by :mod:`topofuzz.ui.custom_validation`.
+ALLOWED_CUSTOM_MODELS: tuple[tuple[str, str], ...] = (
+    ("google/gemini-2.5-flash", "Gemini 2.5 Flash (cheap, fast)"),
+    ("google/gemini-2.5-pro", "Gemini 2.5 Pro (smart, slower)"),
+)
+
+ALLOWED_CUSTOM_MODEL_KEYS: frozenset[str] = frozenset(
+    m for m, _label in ALLOWED_CUSTOM_MODELS
+)
+
+
+@dataclass(frozen=True)
+class CustomAgent:
+    """One agent in a user-defined linear pipeline."""
+
+    agent_id: str  # snake_case, ^[a-z][a-z0-9_]{1,39}$
+    model: str  # one of ALLOWED_CUSTOM_MODEL_KEYS
+
+
+@dataclass(frozen=True)
+class CustomWorkflow:
+    """A user-defined workflow built via the UI form.
+
+    Materialized to disk under ``~/.topofuzz/custom-workflows/{workflow_id}/``
+    as ``meta.json`` (this object) + ``fixture.py`` + ``rubric.txt`` so the
+    existing topofuzz runner can load it like any gallery fixture.
+    """
+
+    workflow_id: str  # YYYYMMDDThhmmss-<8hex>, server-generated
+    label: str  # user-facing, 2-60 chars
+    domain_noun: str  # e.g. "loan application"
+    decision_verb: str  # e.g. "approve / deny"
+    agents: tuple[CustomAgent, ...]  # 1-10 agents, in execution order
+    verdict_agent_id: str  # MUST equal agents[-1].agent_id
+    rubric_paragraph: str  # user's 1-paragraph rubric, 50-2000 chars
+    created_at: float  # unix timestamp
+    starter_scenarios: tuple["StarterScenario", ...] = field(default_factory=tuple)
+
+    @property
+    def key(self) -> str:
+        """The :class:`Workflow.key` this custom workflow materializes as."""
+        return f"{CUSTOM_WORKFLOW_KEY_PREFIX}{self.workflow_id}"
+
+    def to_workflow(self, base_dir: "Path") -> "Workflow":
+        """Construct a :class:`Workflow` pointing at the on-disk paths.
+
+        Pure: does NOT write files. Caller must have already saved via
+        :func:`topofuzz.ui.custom_storage.save_custom_workflow` (or
+        equivalent) so the paths exist. The previous behavior was to
+        re-render on every call, which fired on every ``/setup`` GET and
+        clobbered any concurrent edit; that's now an explicit save step.
+        """
+        return Workflow(
+            key=self.key,
+            label=self.label,
+            short_desc=f"{len(self.agents)} agents (custom)",
+            domain_noun=self.domain_noun,
+            decision_verb=self.decision_verb,
+            fixture_path=base_dir / "fixture.py",
+            rubric_path=base_dir / "rubric.txt",
+            starters=self.starter_scenarios,
+        )
 
 
 @dataclass(frozen=True)
@@ -214,7 +293,38 @@ DEFAULT_THOROUGHNESS = "balanced"
 
 
 def get_workflow(key: str) -> Workflow:
-    """Return the workflow by key, raising KeyError if unknown."""
+    """Return the workflow by key, raising KeyError if unknown.
+
+    Built-in workflows live in ``WORKFLOWS``. Keys prefixed with
+    ``custom:`` are resolved through the on-disk custom workflow
+    storage and materialized into a fresh :class:`Workflow` whose
+    ``fixture_path`` and ``rubric_path`` point at the user's saved
+    files under ``~/.topofuzz/custom-workflows/``.
+    """
+    if key and key.startswith(CUSTOM_WORKFLOW_KEY_PREFIX):
+        # Local import — custom_storage imports from this module.
+        from topofuzz.ui.custom_storage import (
+            load_custom_workflow,
+            workflow_dir,
+            write_workflow_files,
+        )
+
+        workflow_id = key[len(CUSTOM_WORKFLOW_KEY_PREFIX):]
+        cw = load_custom_workflow(workflow_id)
+        if cw is None:
+            raise KeyError(key)
+        try:
+            target = workflow_dir(workflow_id)
+        except ValueError as exc:
+            raise KeyError(key) from exc
+        # Regenerate fixture.py / rubric.txt only if they're missing —
+        # the previous behavior of writing on every lookup clobbered
+        # concurrent edits and changed mtimes on every page load.
+        fixture_path = target / "fixture.py"
+        rubric_path = target / "rubric.txt"
+        if not fixture_path.exists() or not rubric_path.exists():
+            write_workflow_files(cw, target)
+        return cw.to_workflow(target)
     return WORKFLOWS[key]
 
 
