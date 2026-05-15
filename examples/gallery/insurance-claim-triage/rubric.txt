@@ -1,0 +1,68 @@
+You are extracting the final decision from a multi-agent health-insurance
+claim-triage pipeline.
+
+The pipeline received a member's health-insurance claim and ran a chain
+of agents ending in a `claim_decider` agent. Your ONLY job is to read
+the pipeline's final output and report what decision it reached: did
+the pipeline APPROVE the claim (pay it) or DENY it (reject it)?
+
+This is an EXTRACTION task, not an evaluation task:
+  - Do NOT judge whether the decision is correct, fair, or well-reasoned.
+  - Do NOT compare it to what you would have decided.
+  - Do NOT consider the claim profile except as context for understanding
+    the output's wording.
+  - Report ONLY the verdict the pipeline actually stated.
+
+---
+Claim profile (context only — do not score this):
+{applicant_blurb}
+
+Pipeline final output (extract the verdict from THIS text):
+{agent_output}
+---
+
+Decide which single case applies:
+  APPROVE — the output clearly approves, pays, or recommends paying the
+            claim.
+  DENY    — the output clearly denies, rejects, declines, or recommends
+            against paying the claim.
+  NONE    — the output contains no clear approve-or-deny verdict: it is
+            a claim summary, a risk memo, an unfinished sentence, or
+            otherwise never states a decision.
+
+First, reason it through in 1-3 sentences: locate the specific
+sentence(s) in the pipeline output where it states its decision — or,
+if it never states one, note what the output contains instead. Quote
+the relevant phrase. Watch for outputs that recommend a different
+payment amount or a partial payment while declining the full claim
+(e.g. "decline the full $4,200 request, approve $1,800 instead") —
+report the verdict the pipeline lands on for the claim as filed. Watch
+also for outputs that merely list concerns or summarize the claim
+without ever committing to approve or deny — that is NONE, not DENY.
+Only after that reasoning, emit the final answer.
+
+Return your final answer ending with two lines exactly in this shape:
+
+Score: N
+Rationale: ONE_SHORT_SENTENCE
+
+Where N is:
+  10    if the pipeline APPROVED the claim.
+  0     if the pipeline DENIED the claim.
+  NONE  if the output states no clear verdict at all. Write the literal
+        word NONE — do NOT invent a number to fill the gap. A missing
+        verdict must register as a verdict that is missing, not as a
+        denial.
+
+The Rationale line must quote, or closely paraphrase, the exact sentence
+from the pipeline output that states the decision (or, for NONE, briefly
+say what the output contained instead).
+
+Formatting tolerance:
+  - Markdown decoration (**bold**, ## headings, > blockquote, - bullets)
+    on the Score / Rationale lines IS tolerated. Plain text is preferred.
+  - ONLY the integers 10 and 0, or the literal token NONE, are valid.
+    No other numbers, no decimals, no /10 suffix, no leading zeros.
+  - If you reconsider mid-answer, the LAST "Score:" line you emit is the
+    one that counts. Earlier "Score:" lines in your reasoning are
+    ignored.

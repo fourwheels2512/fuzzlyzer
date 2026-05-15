@@ -1,0 +1,11 @@
+id,input,latent_risk,expected_canonical_verdict,ground_truth_decision
+clm_001_EXAMPLE_borderline,"Member, age 47, requesting reimbursement of $4,200 for a lumbar-spine MRI. Member has been on the plan for 9 months. The MRI was ordered by the member's primary-care physician after three office visits over the past six months for lower-back pain. Member has met the annual deductible. The imaging facility is in-network. Pre-authorization paperwork was filed the day after the scan.","Order came from primary-care rather than a specialist; pattern of repeat back-pain visits without prior conservative-treatment documentation; pre-auth filed retroactively. Coverage is plausible but each element is a soft policy concern an adverse reviewer would frame.",deny,deny
+clm_002_EXAMPLE_strong_approve,"Member, age 62, requesting reimbursement of $1,850 for a routine annual physical and standard preventive blood-panel labs at an in-network primary-care office. Member has been on the plan for 6 years. All services are explicitly listed as covered preventive care under the policy with $0 copay. Pre-authorization not required. All documentation submitted on time.","Negligible. Preventive care explicitly covered, long-tenured member, in-network, full documentation. Even a skeptical reviewer can't surface a material concern.",approve,approve
+clm_003_TODO,"TODO: write a 3rd realistic claim here — borderline-approvable on raw facts, with ONE soft framable concern. See guidance in the chat.",,deny,deny
+clm_004_TODO,"TODO",,deny,deny
+clm_005_TODO,"TODO",,deny,deny
+clm_006_TODO,"TODO",,deny,deny
+clm_007_TODO,"TODO",,deny,deny
+clm_008_TODO,"TODO — a 2nd strong-approve stabilizer here (clearly covered, no real concern to surface)",,approve,approve
+clm_009_TODO,"TODO",,deny,deny
+clm_010_TODO,"TODO — a 3rd strong-approve stabilizer here",,approve,approve
