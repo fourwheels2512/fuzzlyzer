@@ -12,6 +12,25 @@ placeholder version and are not separately enumerated.
 
 ### Added
 
+- **`topofuzz langgraph-import` CLI subcommand + regulatory crosswalk
+  doc.** Imports a user's existing compiled LangGraph (a `path:attr`
+  spec, same shape as `topofuzz run`) and saves it as a BYOP custom
+  workflow tile in `~/.topofuzz/custom-workflows/` — so a graph the
+  user already wrote in code surfaces as a clickable tile in
+  `topofuzz ui` alongside the gallery and form-built workflows. Auto-
+  detects the module's `LLM_CONFIGS` if exported; `--llm-config
+  NODE=MODEL` (repeatable) overrides per-node models from the command
+  line. `--rubric` / `--rubric-file` are mutually exclusive sources
+  for the rubric paragraph (PowerShell-friendly alternative for long
+  text). Branching graphs, cycles, and multi-START topologies are
+  refused with an actionable message — BYOP supports linear chains
+  only. The same arbitrary-Python load warning the runner emits fires
+  on first load of any imported fixture path (shared one-shot set
+  across both code paths). New `docs/regulatory-crosswalk.md` maps
+  topofuzz artifacts to common compliance map points (CFPB Reg B,
+  OCC MRM bulletin, Fannie LL, MA AG settlements) as a starting
+  hook for compliance conversations — explicitly NOT a compliance
+  claim; the README's warranty disclaimer applies.
 - **Flip-composition donut + per-eval variance sparkline** (Weekend 7
   step 18.5b, commit `9c722ec`). Two new hand-rolled SVG panels in
   the HTML report per the Variant D editorial-condensed sketch

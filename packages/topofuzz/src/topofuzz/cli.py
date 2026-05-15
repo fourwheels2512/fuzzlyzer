@@ -1598,6 +1598,198 @@ def keygen(
 
 
 @app.command(
+    name="langgraph-import",
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    },
+)
+def langgraph_import_cmd(
+    ctx: typer.Context,
+    spec: str = typer.Argument(
+        ...,
+        help=(
+            "Fixture spec in 'path/to/file.py:attr' form. ``attr`` is "
+            "either a compiled LangGraph or a no-arg callable that returns "
+            "one (e.g. ``build_graph``). Same shape as ``topofuzz run``."
+        ),
+    ),
+    label: str = typer.Option(
+        ...,
+        "--label",
+        help="User-facing workflow name shown on the UI tile (2-60 chars).",
+    ),
+    rubric: str | None = typer.Option(
+        None,
+        "--rubric",
+        help=(
+            "Rubric paragraph the judge uses to extract the verdict from "
+            "the final agent's output (50-2000 chars). For longer rubrics "
+            "use --rubric-file. Exactly one of --rubric / --rubric-file "
+            "is required."
+        ),
+    ),
+    rubric_file: Path | None = typer.Option(
+        None,
+        "--rubric-file",
+        help=(
+            "Path to a UTF-8 text file containing the rubric paragraph. "
+            "PowerShell-friendly alternative to --rubric for long rubrics. "
+            "Exactly one of --rubric / --rubric-file is required."
+        ),
+    ),
+    domain_noun: str = typer.Option(
+        "case",
+        "--domain-noun",
+        help="What the pipeline decides on (e.g. 'loan application').",
+    ),
+    decision_verb: str = typer.Option(
+        "approve / deny",
+        "--decision-verb",
+        help="What the verdict is phrased as (e.g. 'approve / deny').",
+    ),
+    fallback_model: str = typer.Option(
+        "google/gemini-2.5-flash",
+        "--fallback-model",
+        help=(
+            "Model used for any node not covered by --llm-config or by "
+            "the module's LLM_CONFIGS dict. Must be in the BYOP allow-"
+            "list. Currently google/gemini-2.5-flash or google/gemini-2.5-pro."
+        ),
+    ),
+    llm_config: list[str] = typer.Option(
+        [],
+        "--llm-config",
+        help=(
+            "Per-node model override in NODE=MODEL form, repeatable: "
+            "--llm-config reviewer=google/gemini-2.5-pro "
+            "--llm-config decider=google/gemini-2.5-pro. Useful when the "
+            "user's LangGraph module does not export an LLM_CONFIGS dict. "
+            "CLI overrides take precedence over the module's LLM_CONFIGS."
+        ),
+    ),
+) -> None:
+    """Import a user's existing LangGraph as a topofuzz custom workflow tile.
+
+    Walks the compiled graph at SPEC, asserts it's a linear chain, and
+    writes a CustomWorkflow under ``~/.topofuzz/custom-workflows/`` —
+    surfacing the graph as a clickable tile in ``topofuzz ui``. If the
+    module also exports ``LLM_CONFIGS: dict[str, LLMConfig]`` (the
+    gallery convention), per-node models are picked up automatically.
+
+    Branching graphs, cycles, and multi-START topologies are refused with
+    a clear message — BYOP supports linear chains only. Rename or flatten
+    in your LangGraph source, then re-import.
+
+    Exit codes:
+
+    * 0 — workflow imported and saved.
+    * 2 — usage error (bad spec, branching graph, validation failure).
+    """
+    _reject_reserved_flags(list(ctx.args))
+    _reject_unknown_extras(list(ctx.args))
+
+    # Resolve rubric source: exactly one of --rubric / --rubric-file. Tested
+    # via test_cli_langgraph_import.
+    if rubric is not None and rubric_file is not None:
+        typer.echo(
+            "topofuzz langgraph-import: pass --rubric OR --rubric-file, "
+            "not both.",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT)
+    if rubric is None and rubric_file is None:
+        typer.echo(
+            "topofuzz langgraph-import: one of --rubric / --rubric-file "
+            "is required.",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT)
+    if rubric_file is not None:
+        try:
+            rubric = rubric_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            typer.echo(
+                f"topofuzz langgraph-import: could not read --rubric-file "
+                f"{rubric_file!s}: {exc}",
+                err=True,
+            )
+            raise typer.Exit(code=_BAD_USAGE_EXIT) from exc
+
+    # Lazy imports: pull the BYOP and LangGraph stacks only when the
+    # subcommand actually runs, preserving the §11a verify-path-safe
+    # contract used elsewhere in this CLI.
+    from topofuzz.ir import LLMConfig
+    from topofuzz.ui.custom_storage import save_custom_workflow
+    from topofuzz.ui.custom_validation import CustomFormError
+    from topofuzz.ui.langgraph_import import (
+        LangGraphImportError,
+        custom_workflow_from_module_spec,
+    )
+
+    # Parse --llm-config NODE=MODEL pairs into LLMConfigs. Empty list is fine
+    # — the function-side default detects the module's LLM_CONFIGS.
+    override_configs: dict[str, LLMConfig] = {}
+    for raw in llm_config:
+        if "=" not in raw:
+            typer.echo(
+                f"topofuzz langgraph-import: --llm-config must be NODE=MODEL "
+                f"(got {raw!r}).",
+                err=True,
+            )
+            raise typer.Exit(code=_BAD_USAGE_EXIT)
+        node, _, model = raw.partition("=")
+        node = node.strip()
+        model = model.strip()
+        if not node or not model:
+            typer.echo(
+                f"topofuzz langgraph-import: --llm-config NODE=MODEL needs "
+                f"both sides (got {raw!r}).",
+                err=True,
+            )
+            raise typer.Exit(code=_BAD_USAGE_EXIT)
+        if node in override_configs:
+            typer.echo(
+                f"topofuzz langgraph-import: --llm-config {node!r} "
+                f"specified more than once.",
+                err=True,
+            )
+            raise typer.Exit(code=_BAD_USAGE_EXIT)
+        override_configs[node] = LLMConfig(model=model)
+
+    try:
+        cw = custom_workflow_from_module_spec(
+            spec,
+            label=label,
+            domain_noun=domain_noun,
+            decision_verb=decision_verb,
+            rubric_paragraph=rubric,
+            fallback_model=fallback_model,
+            llm_config_overrides=override_configs or None,
+        )
+    except LangGraphImportError as exc:
+        typer.echo(f"topofuzz langgraph-import: {exc}", err=True)
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from exc
+    except CustomFormError as exc:
+        # Per-field errors — render them as a short list so the user can
+        # fix the offending node id / rubric / etc.
+        typer.echo("topofuzz langgraph-import: validation failed:", err=True)
+        for field, msg in exc.errors.items():
+            typer.echo(f"  {field}: {msg}", err=True)
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from exc
+
+    workflow = save_custom_workflow(cw)
+
+    typer.echo(f"Imported {label!r} as custom workflow {cw.key}.")
+    ordered = " -> ".join(a.agent_id for a in cw.agents)
+    typer.echo(f"{len(cw.agents)} agents in order: {ordered}")
+    typer.echo(f"Saved to {workflow.fixture_path.parent}")
+    typer.echo(
+        "Start the UI with `topofuzz ui` -- the workflow appears as a tile."
+    )
+
+
+@app.command(
     context_settings={
         "ignore_unknown_options": True,
         "allow_extra_args": True,
