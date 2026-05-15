@@ -175,7 +175,12 @@ def compute_headline(
 
     * ``voo_per_eval`` — list of ``{eval_id, point, ci_lower, ci_upper,
       degenerate_flag}`` per BLUEPRINT §14 sub-deliverable (b).
-    * ``verdict_flip_rate`` — ``{point, ci_lower, ci_upper}`` per (c).
+    * ``verdict_flip_rate`` — ``{point, ci_lower, ci_upper,
+      degenerate_flag, numerator, denominator, wilson_ci_lower,
+      wilson_ci_upper, wilson_conf_level}`` per (c). The last five
+      fields are F1 additions (numerator/denominator + Wilson CI on
+      the binomial proportion + the conf level the Wilson CI was
+      computed at).
     * ``kappa_original_vs_permuted`` — scalar float per (d).
     * ``balanced_accuracy_drop`` — ``{original, mean_permuted, drop}`` per (e).
     * ``judge_failure_rate`` — cell-level §8 rate in [0, 1] per (f).
@@ -195,8 +200,11 @@ def compute_headline(
       control). Scalar in [0, 1].
     * ``confirmed_verdict_flip_rate`` — ``{point, ci_lower, ci_upper,
       confirmed, flaky, unstable_baseline, missing_baseline,
-      judge_failure_pairs, n_screened_pairs, degenerate_flag}``: the
-      noise-corrected flip rate (majority-vote-vs-majority-vote).
+      judge_failure_pairs, n_screened_pairs, degenerate_flag,
+      wilson_ci_lower, wilson_ci_upper, wilson_conf_level}``: the
+      noise-corrected flip rate (majority-vote-vs-majority-vote). The
+      Wilson keys are F1 additions, computed on the (confirmed,
+      confirmed + flaky) binomial proportion.
     * ``voo_noise_floor`` — VOO over the K reference repeats of the
       original variant; the updated §22 gate input is ``voo_ci_lower >
       voo_noise_floor`` instead of ``> 0`` (no in-tree caller applies
@@ -1023,7 +1031,11 @@ def compute_verdict_flip_for_attestation(
     try:
         import sqlite3
 
-        from topofuzz.metrics import compute_verdict_flip_rate, read_score_matrix
+        from topofuzz.metrics import (
+            compute_verdict_flip_rate,
+            read_score_matrix,
+            wilson_score_interval,
+        )
     except ImportError as e:
         log.warning(
             "topofuzz.metrics unavailable; verdict_flip skipped in attestation: %s",
@@ -1052,11 +1064,39 @@ def compute_verdict_flip_for_attestation(
             "verdict_flip computation failed in attestation path: %s", e
         )
         return None
+    # Wilson CI on the flip proportion (count, total). Adds defensible
+    # uncertainty bounds independent of the cluster-bootstrap CI above:
+    # the bootstrap quantifies "how much would re-sampling the eval set
+    # move it"; Wilson quantifies "is the rate non-zero given this many
+    # paired observations". Both are surfaced — buyers asked for both.
+    # ``wilson_conf_level`` is persisted so the renderers (§17 paragraph,
+    # UI subtitle) can show the correct percentage even if a future
+    # caller passes a non-default ``conf`` (audit pass-1 Fuzzer-MAJOR-4).
+    wilson_lo: float | None = None
+    wilson_hi: float | None = None
+    if (
+        result.numerator is not None
+        and result.denominator is not None
+        and result.denominator > 0
+    ):
+        try:
+            wilson_lo, wilson_hi = wilson_score_interval(
+                result.numerator, result.denominator, conf=conf,
+            )
+        except (ValueError, TypeError) as e:
+            log.warning(
+                "wilson CI failed in attestation path: %s", e,
+            )
     return {
         "point": result.point,
         "ci_lower": result.ci_lower,
         "ci_upper": result.ci_upper,
         "degenerate_flag": result.degenerate_flag,
+        "numerator": result.numerator,
+        "denominator": result.denominator,
+        "wilson_ci_lower": wilson_lo,
+        "wilson_ci_upper": wilson_hi,
+        "wilson_conf_level": conf if wilson_lo is not None else None,
     }
 
 
@@ -1422,6 +1462,30 @@ def compute_noise_floor_for_attestation(
                 "the screened-pair count — confirm data is internally "
                 "inconsistent; re-run `topofuzz confirm`"
             )
+    # F1: Wilson CI on the noise-corrected rate. The denominator for the
+    # confirmed metric is ``confirmed + flaky`` per the module docstring
+    # — "candidate pairs with stable baseline". Other buckets
+    # (unstable_baseline, missing_baseline, judge_failure_pairs) are NOT
+    # candidate-pair observations; they are pair-level data-coverage
+    # gaps, excluded by construction. User feedback 2026-05-15:
+    # "Wilson must apply to the noise-corrected number, not just the
+    # raw rate; otherwise it's a half-fix to flag." Skipped on the
+    # degenerate-result branch (no Wilson on a None point).
+    conf_wilson_lo: float | None = None
+    conf_wilson_hi: float | None = None
+    if not confirmed_result.degenerate_flag and confirmed_result.point is not None:
+        conf_denom = confirmed_result.confirmed + confirmed_result.flaky
+        if conf_denom > 0:
+            try:
+                from topofuzz.metrics import wilson_score_interval
+                conf_wilson_lo, conf_wilson_hi = wilson_score_interval(
+                    confirmed_result.confirmed, conf_denom, conf=conf,
+                )
+            except (ValueError, TypeError, ImportError) as e:
+                log.warning(
+                    "wilson CI on confirmed rate failed in attestation: %s",
+                    e,
+                )
     confirmed_dict: dict[str, Any] = {
         "point": confirmed_result.point,
         "ci_lower": confirmed_result.ci_lower,
@@ -1433,6 +1497,9 @@ def compute_noise_floor_for_attestation(
         "judge_failure_pairs": confirmed_result.judge_failure_pairs,
         "n_screened_pairs": confirmed_result.n_screened_pairs,
         "degenerate_flag": confirmed_result.degenerate_flag,
+        "wilson_ci_lower": conf_wilson_lo,
+        "wilson_ci_upper": conf_wilson_hi,
+        "wilson_conf_level": conf if conf_wilson_lo is not None else None,
     }
 
     voo_noise_floor = compute_voo_noise_floor(reference_rows, repeats=repeats)

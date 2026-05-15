@@ -25,6 +25,7 @@ banner. This is the simplest concurrency model that doesn't surprise a
 from __future__ import annotations
 
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -961,29 +962,106 @@ def _build_headline(
         except OSError:
             n_total = 0
 
-    # Confirmed verdict-flip rate (post-noise-floor confirm pass).
-    confirmed_rate = headline_d.get("confirmed_verdict_flip_rate")
-    confirmed_count: int | None
-    if isinstance(confirmed_rate, (int, float)) and n_total:
-        confirmed_count = round(confirmed_rate * n_total)
-    else:
-        confirmed_count = None
+    # Confirmed verdict-flip rate (post-noise-floor confirm pass). The
+    # canonical schema (per topofuzz.attest.compute_noise_floor_for_
+    # attestation) is a dict ``{point, ci_lower, ci_upper, ..., wilson_*}``,
+    # NOT a scalar — the prior ``isinstance(int, float)`` gate silently
+    # treated the dict as missing and never rendered the confirmed
+    # branch. Fixed during F1 because Wilson on confirmed (user-flagged
+    # half-fix gap) requires the confirmed branch to actually fire.
+    confirmed_rate_obj = headline_d.get("confirmed_verdict_flip_rate")
+    confirmed_count: int | None = None
+    conf_wilson_lo: float | None = None
+    conf_wilson_hi: float | None = None
+    conf_wilson_conf: float | None = None
+    if isinstance(confirmed_rate_obj, dict):
+        cp = confirmed_rate_obj.get("point")
+        # F1 audit pass-2 Fuzzer-MAJOR-1: a corrupted/hand-edited report.json
+        # carrying NaN or Inf in point would crash ``round()`` (ValueError on
+        # NaN, OverflowError on Inf) and surface as HTTP 500 on the results
+        # page. Producer math is finite; this is defence in depth at the
+        # rendering boundary. Same gate added on the raw branch below.
+        if (
+            isinstance(cp, (int, float))
+            and not isinstance(cp, bool)
+            and n_total
+            and math.isfinite(cp)
+        ):
+            confirmed_count = round(cp * n_total)
+        cwl = confirmed_rate_obj.get("wilson_ci_lower")
+        cwh = confirmed_rate_obj.get("wilson_ci_upper")
+        if (
+            isinstance(cwl, (int, float)) and not isinstance(cwl, bool)
+            and isinstance(cwh, (int, float)) and not isinstance(cwh, bool)
+        ):
+            conf_wilson_lo, conf_wilson_hi = float(cwl), float(cwh)
+        cwc = confirmed_rate_obj.get("wilson_conf_level")
+        if isinstance(cwc, (int, float)) and not isinstance(cwc, bool):
+            conf_wilson_conf = float(cwc)
+    elif (
+        isinstance(confirmed_rate_obj, (int, float))
+        and not isinstance(confirmed_rate_obj, bool)
+        and n_total
+        and math.isfinite(confirmed_rate_obj)
+    ):
+        # Forward-compat: a producer that emits the scalar form keeps
+        # rendering the count; no CI surfaces on this legacy path. Same
+        # finite-check as the dict-shape branch above (audit pass-2
+        # Fuzzer-MAJOR-1).
+        confirmed_count = round(confirmed_rate_obj * n_total)
 
     # Raw verdict-flip rate from the run (always present on a clean run).
     raw_rate_d = headline_d.get("verdict_flip_rate")
     raw_count: int | None = None
+    wilson_lo: float | None = None
+    wilson_hi: float | None = None
+    wilson_conf: float | None = None
     if isinstance(raw_rate_d, dict):
         point = raw_rate_d.get("point")
-        if isinstance(point, (int, float)) and n_total:
+        if (
+            isinstance(point, (int, float))
+            and not isinstance(point, bool)
+            and n_total
+            and math.isfinite(point)
+        ):
             raw_count = round(point * n_total)
+        # Wilson CI is the F1 addition; pre-F1 runs have neither key
+        # (read returns None) and the headline silently drops the CI
+        # sentence. Bool guard rejects True/False which are valid
+        # numeric instances under isinstance(int) but bogus CIs.
+        wlo = raw_rate_d.get("wilson_ci_lower")
+        whi = raw_rate_d.get("wilson_ci_upper")
+        if (
+            isinstance(wlo, (int, float)) and not isinstance(wlo, bool)
+            and isinstance(whi, (int, float)) and not isinstance(whi, bool)
+        ):
+            wilson_lo, wilson_hi = float(wlo), float(whi)
+        wc = raw_rate_d.get("wilson_conf_level")
+        if isinstance(wc, (int, float)) and not isinstance(wc, bool):
+            wilson_conf = float(wc)
 
-    # Judge-failure flag — degraded runs need a caveat.
+    # Judge-failure flag — degraded runs need a caveat. Same finite +
+    # bool gate pattern as the point branches above (audit pass-3
+    # Fuzzer-MAJOR-2): ``or 0`` does NOT replace NaN (NaN is truthy in
+    # Python), so a corrupted dict would crash ``round()``.
     judge_failure_rate = headline_d.get("judge_failure_rate") or 0
     judge_failed_count = 0
-    if isinstance(judge_failure_rate, (int, float)) and n_total:
+    if (
+        isinstance(judge_failure_rate, (int, float))
+        and not isinstance(judge_failure_rate, bool)
+        and n_total
+        and math.isfinite(judge_failure_rate)
+    ):
         judge_failed_count = round(
             judge_failure_rate * n_total * (headline_d.get("n_variants") or 4)
         )
+
+    raw_wilson_sentence = _format_wilson_sentence_for_ui(
+        wilson_lo, wilson_hi, conf=wilson_conf,
+    )
+    confirmed_wilson_sentence = _format_wilson_sentence_for_ui(
+        conf_wilson_lo, conf_wilson_hi, conf=conf_wilson_conf,
+    )
 
     if run.status in ("succeeded", "failed"):
         if confirmed_count is not None:
@@ -996,6 +1074,7 @@ def _build_headline(
                 "subtitle": (
                     "This is the noise-checked count — apparent flips that "
                     "could be the AI second-guessing itself have been removed."
+                    + confirmed_wilson_sentence
                 ),
                 "flip_count": confirmed_count,
                 "n_total": n_total,
@@ -1017,7 +1096,7 @@ def _build_headline(
                 "subtitle": (
                     "We haven't run the optional noise check — some flips could "
                     "be the AI second-guessing itself rather than real "
-                    "order-sensitivity." + caveat
+                    "order-sensitivity." + caveat + raw_wilson_sentence
                 ),
                 "flip_count": raw_count,
                 "n_total": n_total,
@@ -1033,6 +1112,62 @@ def _build_headline(
         "flip_count": None,
         "n_total": n_total,
     }
+
+
+def _format_wilson_sentence_for_ui(
+    lower: float | None,
+    upper: float | None,
+    *,
+    conf: float | None = None,
+) -> str:
+    """Plain-English Wilson CI sentence for the UI subtitle.
+
+    Returns a leading-space sentence ``" Statistical confidence: 95%
+    confident the true rate is between L% and H%."`` when both bounds
+    are finite floats with ``0 <= lower <= upper <= 1``, else ``""``.
+    Pre-F1 runs and degenerate metrics suppress the sentence cleanly.
+
+    F1 audit pass-1 hardening:
+    * ``lower <= upper`` gate (Fuzzer-MAJOR-1) — a corrupted dict that
+      swaps the keys would otherwise render "between 50% and 30%".
+    * ``conf`` parameter (Fuzzer-MAJOR-4) — the rendered percentage
+      tracks the conf level the bounds were computed at, instead of a
+      hardcoded ``95%`` that would drift silently if a caller raised
+      ``conf`` to 0.99.
+
+    Wording unified with ``summary._format_wilson_clause`` so the same
+    bound renders identically in both surfaces (audit pass-1 NIT-1).
+    """
+    if lower is None or upper is None:
+        return ""
+    if lower != lower or upper != upper:  # NaN-safe (NaN != NaN)
+        return ""
+    if not (0.0 <= lower <= upper <= 1.0):
+        return ""
+    lo_pct = round(lower * 100)
+    hi_pct = round(upper * 100)
+    conf_pct = _format_ui_conf_pct(conf)
+    return (
+        f" Statistical confidence: {conf_pct} confident the true rate "
+        f"is between {lo_pct}% and {hi_pct}%."
+    )
+
+
+def _format_ui_conf_pct(conf: float | None) -> str:
+    """Render the conf level as ``"95%"`` for UI display.
+
+    Mirrors ``summary._format_conf_pct``; defaults to ``"95%"`` when
+    ``conf`` is missing or invalid because every in-tree caller uses
+    the 0.95 default.
+    """
+    if conf is None or isinstance(conf, bool):
+        return "95%"
+    if not isinstance(conf, (int, float)):
+        return "95%"
+    cf = float(conf)
+    if cf != cf or not (0.0 < cf < 1.0):  # NaN or out of (0, 1)
+        return "95%"
+    return f"{round(cf * 100)}%"
 
 
 def _plural(noun: str, n: int) -> str:

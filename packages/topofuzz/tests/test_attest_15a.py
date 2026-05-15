@@ -672,6 +672,22 @@ def test_emit_run_attestation_headline_carries_15a_fields(tmp_path: Path):
     assert headline["voo_per_eval"] is not None
     # verdict_flip_rate was computed (vA & vB disagree on every eval → 1.0)
     assert headline["verdict_flip_rate"]["point"] == 1.0
+    # F1: numerator/denominator + Wilson CI keys are populated end-to-end.
+    vfr = headline["verdict_flip_rate"]
+    assert {
+        "point", "ci_lower", "ci_upper", "degenerate_flag",
+        "numerator", "denominator",
+        "wilson_ci_lower", "wilson_ci_upper", "wilson_conf_level",
+    } <= set(vfr)
+    assert isinstance(vfr["numerator"], int)
+    assert isinstance(vfr["denominator"], int)
+    assert vfr["denominator"] > 0
+    # Wilson CI must bracket the point (defining property of any valid CI).
+    assert vfr["wilson_ci_lower"] is not None
+    assert vfr["wilson_ci_upper"] is not None
+    assert vfr["wilson_ci_lower"] <= vfr["point"] <= vfr["wilson_ci_upper"]
+    # Wilson conf level is persisted alongside the bounds; default 0.95.
+    assert vfr["wilson_conf_level"] == 0.95
     # kappa_original_vs_permuted is computable (κ=-1 for opposite constants
     # would be 0 by Cohen's formula, but with mixed predictions, this
     # specific fixture yields 0.0 because both raters are constant).

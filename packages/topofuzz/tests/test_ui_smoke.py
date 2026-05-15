@@ -520,3 +520,506 @@ class TestErrorClassification:
         )
         run.append_log("HTTP 429 rate-limit, retrying in 30s")
         assert run.parsed.error_class == "rate_limit"
+
+
+# ---------------------------------------------------------------------------
+# F1: Wilson CI surfacing in the UI headline subtitle
+# ---------------------------------------------------------------------------
+
+
+class TestBuildHeadlineWilson:
+    """Coverage for ``ui.app._build_headline``'s F1 Wilson clause."""
+
+    @staticmethod
+    def _make_run(tmp_path: Path, status: str = "succeeded") -> "Run":
+        import time as _time
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir(exist_ok=True)
+        eval_csv = tmp_path / "e.csv"
+        eval_csv.write_text(
+            "eval_id,prompt\nE1,p1\nE2,p2\nE3,p3\nE4,p4\nE5,p5\n",
+            encoding="utf-8",
+        )
+        run = Run(
+            run_id="t1",
+            workflow_key="loan-approval",
+            thoroughness_key="balanced",
+            out_dir=out_dir,
+            fixture_path=tmp_path / "f.py",
+            eval_csv_path=eval_csv,
+            rubric_path=tmp_path / "r.txt",
+            raw_cost_cap_usd=8.0,
+            started_at=_time.time(),
+        )
+        run.status = status  # type: ignore[assignment]
+        return run
+
+    def test_wilson_sentence_appears_in_subtitle_when_present(
+        self, tmp_path: Path,
+    ) -> None:
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                "verdict_flip_rate": {
+                    "point": 0.4,
+                    "wilson_ci_lower": 0.20,
+                    "wilson_ci_upper": 0.65,
+                },
+                "judge_failure_rate": 0.0,
+            }
+        }
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        assert "Statistical confidence:" in out["subtitle"]
+        # Rounded to integer percent.
+        assert "between 20% and 65%" in out["subtitle"]
+        # Default conf level rendered (no wilson_conf_level in dict).
+        assert "95% confident" in out["subtitle"]
+
+    def test_wilson_sentence_dropped_when_keys_missing(
+        self, tmp_path: Path,
+    ) -> None:
+        """Pre-F1 runs / degenerate metric → no Wilson sentence."""
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                # No wilson_ci_lower / wilson_ci_upper.
+                "verdict_flip_rate": {"point": 0.4},
+                "judge_failure_rate": 0.0,
+            }
+        }
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        assert "Statistical confidence" not in out["subtitle"]
+
+    def test_wilson_sentence_dropped_on_partial_bounds(
+        self, tmp_path: Path,
+    ) -> None:
+        """Single bound → never render half a CI."""
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                "verdict_flip_rate": {
+                    "point": 0.4,
+                    "wilson_ci_lower": 0.20,
+                    "wilson_ci_upper": None,
+                },
+                "judge_failure_rate": 0.0,
+            }
+        }
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        assert "Statistical confidence" not in out["subtitle"]
+
+    def test_wilson_sentence_dropped_on_out_of_range_bounds(
+        self, tmp_path: Path,
+    ) -> None:
+        """Bound outside [0, 1] is rejected as malformed."""
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                "verdict_flip_rate": {
+                    "point": 0.4,
+                    "wilson_ci_lower": 0.20,
+                    "wilson_ci_upper": 1.7,  # invalid
+                },
+                "judge_failure_rate": 0.0,
+            }
+        }
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        assert "Statistical confidence" not in out["subtitle"]
+
+    def test_wilson_sentence_dropped_on_nan_bound(
+        self, tmp_path: Path,
+    ) -> None:
+        """NaN slipping through json round-trip → no clause, no crash."""
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                "verdict_flip_rate": {
+                    "point": 0.4,
+                    "wilson_ci_lower": float("nan"),
+                    "wilson_ci_upper": 0.65,
+                },
+                "judge_failure_rate": 0.0,
+            }
+        }
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        assert "Statistical confidence" not in out["subtitle"]
+
+    def test_wilson_sentence_rejects_bool_bounds(
+        self, tmp_path: Path,
+    ) -> None:
+        """``True`` / ``False`` are ``isinstance(_, int)`` in Python; they
+        must NOT slip through the float gate as 0/1 percent CIs."""
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                "verdict_flip_rate": {
+                    "point": 0.4,
+                    "wilson_ci_lower": True,
+                    "wilson_ci_upper": False,
+                },
+                "judge_failure_rate": 0.0,
+            }
+        }
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        assert "Statistical confidence" not in out["subtitle"]
+
+    def test_wilson_sentence_dropped_on_lower_greater_than_upper(
+        self, tmp_path: Path,
+    ) -> None:
+        """Corrupted dict with lower > upper → no rendered nonsense
+        ``"between 50% and 30%"`` (Fuzzer-MAJOR-1)."""
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                "verdict_flip_rate": {
+                    "point": 0.4,
+                    "wilson_ci_lower": 0.50,
+                    "wilson_ci_upper": 0.30,
+                },
+                "judge_failure_rate": 0.0,
+            }
+        }
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        assert "Statistical confidence" not in out["subtitle"]
+
+    def test_wilson_sentence_renders_persisted_conf_level(
+        self, tmp_path: Path,
+    ) -> None:
+        """A non-default ``wilson_conf_level`` (e.g. 0.99) is reflected
+        in the rendered percent (Fuzzer-MAJOR-4)."""
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                "verdict_flip_rate": {
+                    "point": 0.4,
+                    "wilson_ci_lower": 0.10,
+                    "wilson_ci_upper": 0.75,
+                    "wilson_conf_level": 0.99,
+                },
+                "judge_failure_rate": 0.0,
+            }
+        }
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        assert "99% confident" in out["subtitle"]
+        assert "95% confident" not in out["subtitle"]
+
+
+class TestBuildHeadlineConfirmedBranch:
+    """The confirmed-branch UI path: dict-shaped confirmed_verdict_flip_rate
+    + Wilson CI surfacing on the noise-corrected number."""
+
+    @staticmethod
+    def _make_run(tmp_path: Path) -> "Run":
+        return TestBuildHeadlineWilson._make_run(tmp_path)
+
+    def test_confirmed_branch_fires_for_dict_shape(
+        self, tmp_path: Path,
+    ) -> None:
+        """Pre-F1 bug: UI tested ``isinstance(confirmed_rate, (int, float))``
+        but the schema is a dict — confirmed branch never fired. Fixed
+        as a prerequisite of Wilson-on-confirmed surfacing."""
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                "verdict_flip_rate": {"point": 0.4},
+                "confirmed_verdict_flip_rate": {
+                    "point": 0.3,
+                    "confirmed": 2,
+                    "flaky": 4,
+                },
+                "judge_failure_rate": 0.0,
+            }
+        }
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        # title: confirmed_count = round(0.3 * 5) = 2 (the "noise-checked count")
+        assert "your AI pipeline changed its mind on 2 of them" in out["title"]
+        # subtitle: the confirmed-branch caveat text
+        assert "noise-checked count" in out["subtitle"]
+
+    def test_confirmed_branch_carries_wilson_from_confirmed_dict(
+        self, tmp_path: Path,
+    ) -> None:
+        """Wilson CI on the noise-corrected metric — user's explicit
+        requirement: ``"both numbers get CIs you have full coverage; if
+        only raw, that's a half-fix"``."""
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                # Raw rate has Wilson on a DIFFERENT bound — confirmed
+                # branch must use the CONFIRMED Wilson, not the raw one.
+                "verdict_flip_rate": {
+                    "point": 0.4,
+                    "wilson_ci_lower": 0.05,
+                    "wilson_ci_upper": 0.85,
+                },
+                "confirmed_verdict_flip_rate": {
+                    "point": 0.3,
+                    "confirmed": 2,
+                    "flaky": 4,
+                    "wilson_ci_lower": 0.15,
+                    "wilson_ci_upper": 0.55,
+                    "wilson_conf_level": 0.95,
+                },
+                "judge_failure_rate": 0.0,
+            }
+        }
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        # Confirmed branch fired (title uses confirmed_count of 2 not raw 2).
+        assert "your AI pipeline changed its mind on 2 of them" in out["title"]
+        # Wilson sentence reflects the CONFIRMED bounds (15-55), NOT the
+        # raw bounds (5-85).
+        assert "between 15% and 55%" in out["subtitle"]
+        assert "between 5% and 85%" not in out["subtitle"]
+
+    def test_confirmed_branch_no_wilson_when_keys_absent(
+        self, tmp_path: Path,
+    ) -> None:
+        """Confirmed dict without Wilson keys → no CI sentence; the
+        confirmed-branch caveat still renders."""
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                "verdict_flip_rate": {"point": 0.4},
+                "confirmed_verdict_flip_rate": {
+                    "point": 0.3,
+                    "confirmed": 2,
+                    "flaky": 4,
+                    # No wilson_*.
+                },
+                "judge_failure_rate": 0.0,
+            }
+        }
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        assert "Statistical confidence" not in out["subtitle"]
+        # Caveat still there.
+        assert "noise-checked count" in out["subtitle"]
+
+    def test_scalar_legacy_form_still_renders(
+        self, tmp_path: Path,
+    ) -> None:
+        """Forward-compat: if a hypothetical producer emits the legacy
+        scalar form for confirmed_verdict_flip_rate, the count still
+        renders. No CI on this path."""
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                "verdict_flip_rate": {"point": 0.4},
+                "confirmed_verdict_flip_rate": 0.3,
+                "judge_failure_rate": 0.0,
+            }
+        }
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        assert "your AI pipeline changed its mind on 2 of them" in out["title"]
+        assert "Statistical confidence" not in out["subtitle"]
+
+
+class TestBuildHeadlineFinitePointGate:
+    """Audit pass-2 Fuzzer-MAJOR-1: NaN / Inf in `point` would crash
+    `round()` (ValueError on NaN, OverflowError on Inf) and surface as
+    HTTP 500 on the results page. Producer math is finite; this is
+    defence in depth at the rendering boundary on both the raw and the
+    confirmed-rate branches."""
+
+    @staticmethod
+    def _make_run(tmp_path: Path) -> "Run":
+        return TestBuildHeadlineWilson._make_run(tmp_path)
+
+    def test_raw_point_nan_does_not_crash(
+        self, tmp_path: Path,
+    ) -> None:
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                "verdict_flip_rate": {"point": float("nan")},
+                "judge_failure_rate": 0.0,
+            }
+        }
+        # Must not raise.
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        # Falls through to the malformed-summary path because raw_count
+        # stays None and confirmed_count is None.
+        assert out["flip_count"] is None
+
+    def test_raw_point_inf_does_not_crash(
+        self, tmp_path: Path,
+    ) -> None:
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                "verdict_flip_rate": {"point": float("inf")},
+                "judge_failure_rate": 0.0,
+            }
+        }
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        assert out["flip_count"] is None
+
+    def test_confirmed_point_nan_does_not_crash(
+        self, tmp_path: Path,
+    ) -> None:
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                "verdict_flip_rate": {"point": 0.4},
+                "confirmed_verdict_flip_rate": {"point": float("nan")},
+                "judge_failure_rate": 0.0,
+            }
+        }
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        # Confirmed branch skipped (NaN gated), falls to raw branch.
+        assert "your AI pipeline changed its mind on about 2 of them" in out["title"]
+
+    def test_confirmed_point_inf_does_not_crash(
+        self, tmp_path: Path,
+    ) -> None:
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                "verdict_flip_rate": {"point": 0.4},
+                "confirmed_verdict_flip_rate": {"point": float("inf")},
+                "judge_failure_rate": 0.0,
+            }
+        }
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        assert "your AI pipeline changed its mind on about 2 of them" in out["title"]
+
+    def test_legacy_scalar_confirmed_inf_does_not_crash(
+        self, tmp_path: Path,
+    ) -> None:
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                "verdict_flip_rate": {"point": 0.4},
+                "confirmed_verdict_flip_rate": float("inf"),
+                "judge_failure_rate": 0.0,
+            }
+        }
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        # Legacy scalar Inf rejected, falls to raw branch.
+        assert "your AI pipeline changed its mind on about 2 of them" in out["title"]
+
+    def test_judge_failure_rate_nan_does_not_crash(
+        self, tmp_path: Path,
+    ) -> None:
+        """Audit pass-3 Fuzzer-MAJOR-2: same NaN/Inf round() crash class
+        on the judge_failure_rate branch. ``or 0`` does NOT replace NaN
+        (NaN is truthy in Python). The fix is the same finite+bool gate
+        pattern used on the three point sites."""
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                "verdict_flip_rate": {"point": 0.4},
+                "judge_failure_rate": float("nan"),
+            }
+        }
+        # Must not raise. Renders the raw branch with no judge-fail caveat.
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        assert out["flip_count"] == 2  # 0.4 * 5
+
+    def test_judge_failure_rate_inf_does_not_crash(
+        self, tmp_path: Path,
+    ) -> None:
+        from topofuzz.ui.app import _build_headline
+
+        run = self._make_run(tmp_path)
+        wf = WORKFLOWS[DEFAULT_WORKFLOW]
+        summary = {
+            "headline": {
+                "n_evals": 5,
+                "n_variants": 4,
+                "verdict_flip_rate": {"point": 0.4},
+                "judge_failure_rate": float("inf"),
+            }
+        }
+        out = _build_headline(run=run, summary=summary, workflow=wf)
+        assert out["flip_count"] == 2

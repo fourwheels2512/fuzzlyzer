@@ -100,6 +100,9 @@ class SummaryContext:
     verdict_flip_rate: float | None
     flip_rate_ci_lower: float | None
     flip_rate_ci_upper: float | None
+    wilson_ci_lower: float | None
+    wilson_ci_upper: float | None
+    wilson_conf_level: float | None
     primary_driver: str | None
     primary_influence: float | None
     summary_text: str
@@ -115,10 +118,13 @@ def render_summary(
     Args:
         verdict_flip_rate: ``headline.verdict_flip_rate`` from
             ``report.json``. Shape: ``{point, ci_lower, ci_upper,
-            degenerate_flag}`` — but any missing key, ``None`` value, or
+            degenerate_flag, numerator, denominator, wilson_ci_lower,
+            wilson_ci_upper}`` — but any missing key, ``None`` value, or
             non-numeric value degrades gracefully to "unavailable".
             ``None`` (the whole dict missing) is the pre-step-15a run
-            case and is also handled.
+            case and is also handled. The wilson_* keys are pre-step-F1
+            null on older runs; the rendered paragraph drops the Wilson
+            sentence cleanly when missing.
         per_agent_influence: ``findings.per_agent_influence`` list. Each
             row carries ``{node_id, influence, ci_lower, ci_upper,
             degenerate, degenerate_reason}``. Degenerate rows and rows
@@ -132,6 +138,9 @@ def render_summary(
     flip_point = _coerce_float(verdict_flip_rate, "point")
     flip_lower = _coerce_float(verdict_flip_rate, "ci_lower")
     flip_upper = _coerce_float(verdict_flip_rate, "ci_upper")
+    wilson_lower = _coerce_float(verdict_flip_rate, "wilson_ci_lower")
+    wilson_upper = _coerce_float(verdict_flip_rate, "wilson_ci_upper")
+    wilson_conf = _coerce_float(verdict_flip_rate, "wilson_conf_level")
     primary_node, primary_inf = _pick_primary_driver(per_agent_influence)
 
     if flip_point is None:
@@ -146,6 +155,9 @@ def render_summary(
         flip_point=flip_point,
         flip_lower=flip_lower,
         flip_upper=flip_upper,
+        wilson_lower=wilson_lower,
+        wilson_upper=wilson_upper,
+        wilson_conf=wilson_conf,
         primary_node=primary_node,
         primary_inf=primary_inf,
     )
@@ -155,6 +167,9 @@ def render_summary(
         verdict_flip_rate=flip_point,
         flip_rate_ci_lower=flip_lower,
         flip_rate_ci_upper=flip_upper,
+        wilson_ci_lower=wilson_lower,
+        wilson_ci_upper=wilson_upper,
+        wilson_conf_level=wilson_conf,
         primary_driver=primary_node,
         primary_influence=primary_inf,
         summary_text=text,
@@ -171,11 +186,18 @@ def _coerce_float(d: Mapping[str, Any] | None, key: str) -> float | None:
     ``numpy`` and ``json.dumps(allow_nan=True)`` (the stdlib default)
     happily round-trip ``NaN`` through ``report.json``, and a downstream
     ``round(NaN * 100)`` would raise ``ValueError`` mid-render.
+
+    F1 audit pass-1: explicitly reject ``bool`` (``True``/``False`` are
+    ``isinstance(int)`` and ``float(True) == 1.0`` silently), and reject
+    ``str`` so a hand-edited / mis-typed ``"0.20"`` does NOT silently
+    coerce — it must match the UI helper's strict-type contract so the
+    same ``report.json`` does not render two different ways across the
+    §17 paragraph and the UI subtitle.
     """
     if not isinstance(d, Mapping):
         return None
     v = d.get(key)
-    if v is None:
+    if v is None or isinstance(v, (bool, str)):
         return None
     try:
         f = float(v)
@@ -250,6 +272,9 @@ def _render_paragraph(
     flip_point: float | None,
     flip_lower: float | None,
     flip_upper: float | None,
+    wilson_lower: float | None,
+    wilson_upper: float | None,
+    wilson_conf: float | None,
     primary_node: str | None,
     primary_inf: float | None,
 ) -> str:
@@ -269,6 +294,9 @@ def _render_paragraph(
 
     flip_pct = _format_percent(flip_point)
     flip_quote = _format_flip_quote(flip_point, flip_lower, flip_upper)
+    wilson_clause = _format_wilson_clause(
+        wilson_lower, wilson_upper, conf=wilson_conf,
+    )
 
     if verdict == "stable":
         head = (
@@ -283,7 +311,7 @@ def _render_paragraph(
             )
         else:
             tail = " No action recommended."
-        return head + tail
+        return head + wilson_clause + tail
 
     # verdict == "unstable"
     head = (
@@ -302,7 +330,7 @@ def _render_paragraph(
             "(per-agent influence is unavailable or degenerate). "
             "Investigate variance per eval row to localise the instability."
         )
-    return head + tail
+    return head + wilson_clause + tail
 
 
 def _format_percent(p: float | None) -> str:
@@ -335,6 +363,66 @@ def _format_flip_quote(
         f"verdict_flip_rate = {point:.2f} "
         f"[{lower:.2f}, {upper:.2f}] 95% CI"
     )
+
+
+def _format_wilson_clause(
+    lower: float | None,
+    upper: float | None,
+    *,
+    conf: float | None = None,
+) -> str:
+    """Render the Wilson CI clause appended to the head sentence.
+
+    Returns ``" Statistical confidence: 95% confident the true rate is
+    between L% and H% (Wilson interval on the paired-cell count)."``
+    when both bounds are present, valid, and ordered, else ``""``. The
+    leading space is intentional — the caller concatenates without an
+    extra separator.
+
+    Defensive gates (audit pass-1 RT-MAJOR-2 / Fuzzer-MAJOR-1 /
+    Fuzzer-MINOR-1/2):
+
+    * Two-bound gate — showing only one bound would imply a one-sided
+      CI we did not compute.
+    * Range gate — both bounds must be in ``[0, 1]``; pre-F1 producers
+      that emit log-odds or unclamped raw arithmetic must NOT render as
+      "between -10% and 170%".
+    * Monotonicity gate — ``lower <= upper``; a corrupted dict that
+      swaps the keys must NOT render "between 50% and 30%".
+    * Finite gate — NaN/Inf already strip via ``_coerce_float`` upstream,
+      but defending here too costs one line.
+
+    ``conf`` is the confidence level actually used to compute the
+    bounds (persisted as ``headline.verdict_flip_rate.wilson_conf_level``).
+    When ``None`` (pre-F1 runs) we default the rendered percent to 95%
+    — the only value the legacy code path could have produced.
+    """
+    if lower is None or upper is None:
+        return ""
+    if not (math.isfinite(lower) and math.isfinite(upper)):
+        return ""
+    if not (0.0 <= lower <= upper <= 1.0):
+        return ""
+    conf_pct = _format_conf_pct(conf)
+    return (
+        f" Statistical confidence: {conf_pct} confident the true rate "
+        f"is between {_format_percent(lower)} and {_format_percent(upper)} "
+        f"(Wilson interval on the paired-cell count)."
+    )
+
+
+def _format_conf_pct(conf: float | None) -> str:
+    """Render the conf level as ``"95%"``. Falls back to ``"95%"`` when
+    ``conf`` is missing or out of ``(0, 1)`` — every in-tree caller of
+    :func:`wilson_score_interval` uses the 0.95 default, so a missing
+    ``wilson_conf_level`` (pre-F1 dict / corrupted JSON) is the only
+    realistic miss-path."""
+    if conf is None or not isinstance(conf, (int, float)) or isinstance(conf, bool):
+        return "95%"
+    cf = float(conf)
+    if not math.isfinite(cf) or not (0.0 < cf < 1.0):
+        return "95%"
+    return f"{round(cf * 100)}%"
 
 
 # Strict pair-matched alternation: must be **non-greedy-non-empty** and

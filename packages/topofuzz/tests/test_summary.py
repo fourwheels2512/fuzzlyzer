@@ -24,13 +24,31 @@ from topofuzz.summary import (
 # ---------------------------------------------------------------------------
 
 
-def _vf(point, ci_lower=None, ci_upper=None, degenerate_flag=False):
-    """Build a ``headline.verdict_flip_rate`` dict like step 15a emits."""
+def _vf(
+    point,
+    ci_lower=None,
+    ci_upper=None,
+    degenerate_flag=False,
+    wilson_ci_lower=None,
+    wilson_ci_upper=None,
+    numerator=None,
+    denominator=None,
+):
+    """Build a ``headline.verdict_flip_rate`` dict like step 15a emits.
+
+    F1 fields (``wilson_ci_lower``, ``wilson_ci_upper``, ``numerator``,
+    ``denominator``) default to ``None`` so existing tests keep
+    asserting the pre-F1 paragraph shape.
+    """
     return {
         "point": point,
         "ci_lower": ci_lower,
         "ci_upper": ci_upper,
         "degenerate_flag": degenerate_flag,
+        "wilson_ci_lower": wilson_ci_lower,
+        "wilson_ci_upper": wilson_ci_upper,
+        "numerator": numerator,
+        "denominator": denominator,
     }
 
 
@@ -423,3 +441,224 @@ def test_influence_just_below_ceiling_still_renders() -> None:
     ctx = render_summary(_vf(0.31), rows)
     # Below the 10× ceiling => row is kept, primary driver is "real".
     assert ctx.primary_driver == "real"
+
+
+# ---------------------------------------------------------------------------
+# F1: Wilson CI surfacing
+# ---------------------------------------------------------------------------
+
+
+def test_wilson_clause_renders_when_bounds_present_unstable() -> None:
+    """Both bounds present + unstable verdict → Wilson sentence appears."""
+    ctx = render_summary(
+        _vf(0.31, 0.24, 0.38,
+            wilson_ci_lower=0.20, wilson_ci_upper=0.42),
+        [_inf("risk", 0.67, 0.55, 0.78)],
+    )
+    text = ctx.summary_text
+    # Existing cluster-bootstrap quote is preserved (no regression).
+    assert "verdict_flip_rate = 0.31 [0.24, 0.38] 95% CI" in text
+    # New Wilson clause appears between head and tail.
+    assert "Statistical confidence:" in text
+    assert "95% confident the true rate is between 20% and 42%" in text
+    assert "Wilson interval" in text
+    # Structured fields are exposed for downstream consumers.
+    assert ctx.wilson_ci_lower == 0.20
+    assert ctx.wilson_ci_upper == 0.42
+
+
+def test_wilson_clause_renders_when_bounds_present_stable() -> None:
+    """Stable paragraph also gets the Wilson sentence."""
+    ctx = render_summary(
+        _vf(0.02, 0.0, 0.04,
+            wilson_ci_lower=0.001, wilson_ci_upper=0.07),
+        [_inf("risk", 0.08, 0.05, 0.12)],
+    )
+    text = ctx.summary_text
+    assert "**stable**" in text
+    assert "Statistical confidence:" in text
+    # Rounded 0.001 → 0% and 0.07 → 7%.
+    assert "between 0% and 7%" in text
+
+
+def test_wilson_clause_dropped_when_bounds_missing() -> None:
+    """Pre-F1 runs (no Wilson keys) drop the clause cleanly — no crash, no
+    half-rendered sentence."""
+    ctx = render_summary(_vf(0.31, 0.24, 0.38), [_inf("risk", 0.5)])
+    text = ctx.summary_text
+    assert "Statistical confidence" not in text
+    assert "Wilson" not in text
+    assert ctx.wilson_ci_lower is None
+    assert ctx.wilson_ci_upper is None
+
+
+def test_wilson_clause_dropped_when_only_lower_present() -> None:
+    """One bound is structurally meaningless — never render half a CI."""
+    ctx = render_summary(
+        _vf(0.31, 0.24, 0.38, wilson_ci_lower=0.20, wilson_ci_upper=None),
+        [_inf("risk", 0.5)],
+    )
+    assert "Statistical confidence" not in ctx.summary_text
+
+
+def test_wilson_clause_dropped_when_only_upper_present() -> None:
+    ctx = render_summary(
+        _vf(0.31, 0.24, 0.38, wilson_ci_lower=None, wilson_ci_upper=0.42),
+        [_inf("risk", 0.5)],
+    )
+    assert "Statistical confidence" not in ctx.summary_text
+
+
+def test_wilson_clause_dropped_on_nan_bound() -> None:
+    """NaN bounds (numpy / json round-trip) coerce to None and suppress
+    the clause."""
+    ctx = render_summary(
+        _vf(0.31, 0.24, 0.38,
+            wilson_ci_lower=float("nan"), wilson_ci_upper=0.42),
+        [_inf("risk", 0.5)],
+    )
+    assert "Statistical confidence" not in ctx.summary_text
+    assert ctx.wilson_ci_lower is None
+
+
+def test_wilson_clause_suppressed_for_unavailable_verdict() -> None:
+    """An ``unavailable`` paragraph never gets a Wilson clause —
+    there's no head sentence to attach it to."""
+    ctx = render_summary(
+        _vf(None, wilson_ci_lower=0.10, wilson_ci_upper=0.20), [],
+    )
+    assert ctx.verdict_word == "unavailable"
+    assert "Statistical confidence" not in ctx.summary_text
+
+
+def test_wilson_clause_html_escaped_safely() -> None:
+    """The Wilson clause flows through ``_text_to_html``; nothing it
+    introduces should break the strong/code-only invariant."""
+    ctx = render_summary(
+        _vf(0.31, 0.24, 0.38,
+            wilson_ci_lower=0.20, wilson_ci_upper=0.42),
+        [_inf("risk", 0.67)],
+    )
+    html = ctx.summary_html
+    # No new structural HTML tags introduced.
+    other_tags = re.findall(r"<(?!/?(?:strong|code)\b)[^>]+>", html)
+    assert other_tags == []
+    # Wilson sentence text passes through escape.
+    assert "Statistical confidence:" in html
+
+
+def test_wilson_clause_position_between_head_and_tail() -> None:
+    """The Wilson sentence sits AFTER the head (verdict + flip-rate
+    quote) and BEFORE the tail (driver / recommendation). This pins
+    the sentence ordering so a future render refactor can't silently
+    bury the CI between bold tags or after the recommendation."""
+    ctx = render_summary(
+        _vf(0.31, 0.24, 0.38,
+            wilson_ci_lower=0.20, wilson_ci_upper=0.42),
+        [_inf("risk", 0.67, 0.55, 0.78)],
+    )
+    text = ctx.summary_text
+    head_idx = text.index("**unstable**")
+    wilson_idx = text.index("Statistical confidence:")
+    driver_idx = text.index("primary driver")
+    assert head_idx < wilson_idx < driver_idx
+
+
+# ---------------------------------------------------------------------------
+# F1 audit pass-1 hardening — _coerce_float / range / monotonicity / conf
+# ---------------------------------------------------------------------------
+
+
+def test_coerce_float_rejects_bool() -> None:
+    """``True`` / ``False`` must NOT silently coerce to 1.0 / 0.0 (RT-M1).
+
+    Without the bool guard a corrupted producer that emits
+    ``wilson_ci_lower=True`` would render "between 100% and 0%".
+    """
+    ctx = render_summary(
+        _vf(0.31, 0.24, 0.38, wilson_ci_lower=True, wilson_ci_upper=False),
+        [_inf("risk", 0.5)],
+    )
+    assert ctx.wilson_ci_lower is None
+    assert ctx.wilson_ci_upper is None
+    assert "Statistical confidence" not in ctx.summary_text
+
+
+def test_coerce_float_rejects_string() -> None:
+    """A hand-edited ``report.json`` with ``"0.20"`` (string) must be
+    rejected so summary and UI render the same data the same way."""
+    ctx = render_summary(
+        _vf(0.31, 0.24, 0.38, wilson_ci_lower="0.20", wilson_ci_upper="0.42"),
+        [_inf("risk", 0.5)],
+    )
+    assert ctx.wilson_ci_lower is None
+    assert "Statistical confidence" not in ctx.summary_text
+
+
+def test_wilson_clause_dropped_on_lower_greater_than_upper() -> None:
+    """A swapped/corrupted dict (lower > upper) must NOT render
+    "between 50% and 30%" (Fuzzer-MAJOR-1)."""
+    ctx = render_summary(
+        _vf(0.31, 0.24, 0.38, wilson_ci_lower=0.50, wilson_ci_upper=0.30),
+        [_inf("risk", 0.5)],
+    )
+    assert "Statistical confidence" not in ctx.summary_text
+
+
+def test_wilson_clause_dropped_on_out_of_range() -> None:
+    """Lower below 0 or upper above 1 → drop the clause (Fuzzer-MINOR-2)."""
+    ctx_neg = render_summary(
+        _vf(0.31, 0.24, 0.38, wilson_ci_lower=-0.10, wilson_ci_upper=0.30),
+        [_inf("risk", 0.5)],
+    )
+    assert "Statistical confidence" not in ctx_neg.summary_text
+
+    ctx_over = render_summary(
+        _vf(0.31, 0.24, 0.38, wilson_ci_lower=0.30, wilson_ci_upper=1.70),
+        [_inf("risk", 0.5)],
+    )
+    assert "Statistical confidence" not in ctx_over.summary_text
+
+
+def test_wilson_clause_lower_equals_upper_still_renders() -> None:
+    """Boundary: lower == upper is a zero-width but valid CI."""
+    ctx = render_summary(
+        _vf(0.31, 0.24, 0.38, wilson_ci_lower=0.30, wilson_ci_upper=0.30),
+        [_inf("risk", 0.5)],
+    )
+    assert "Statistical confidence" in ctx.summary_text
+    assert "between 30% and 30%" in ctx.summary_text
+
+
+def test_wilson_clause_uses_persisted_conf_level() -> None:
+    """When the dict carries ``wilson_conf_level: 0.99`` the rendered
+    clause says ``99% confident`` — not the hardcoded 95%."""
+    d = _vf(
+        0.31, 0.24, 0.38,
+        wilson_ci_lower=0.20, wilson_ci_upper=0.42,
+    )
+    d["wilson_conf_level"] = 0.99
+    ctx = render_summary(d, [_inf("risk", 0.5)])
+    assert "99% confident" in ctx.summary_text
+    assert "95% confident" not in ctx.summary_text
+
+
+def test_wilson_clause_defaults_to_95_when_conf_level_missing() -> None:
+    """Pre-F1 dict (no ``wilson_conf_level`` key) → ``95%`` placeholder."""
+    ctx = render_summary(
+        _vf(0.31, 0.24, 0.38, wilson_ci_lower=0.20, wilson_ci_upper=0.42),
+        [_inf("risk", 0.5)],
+    )
+    assert "95% confident" in ctx.summary_text
+
+
+def test_wilson_clause_no_apostrophe_in_html_round_trip() -> None:
+    """Wording avoids "we're" so summary_html doesn't carry "we&#x27;re"
+    (Fuzzer-MINOR-5 — HTML-escape leaks an apostrophe entity into the
+    raw JSON mirror of summary_html)."""
+    ctx = render_summary(
+        _vf(0.31, 0.24, 0.38, wilson_ci_lower=0.20, wilson_ci_upper=0.42),
+        [_inf("risk", 0.5)],
+    )
+    assert "we&#x27;re" not in ctx.summary_html
+    assert "we're" not in ctx.summary_text

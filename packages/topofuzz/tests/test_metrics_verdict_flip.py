@@ -19,7 +19,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from topofuzz.metrics import VerdictFlipResult, compute_verdict_flip_rate
+from topofuzz.metrics import (
+    VerdictFlipResult,
+    compute_verdict_flip_rate,
+    wilson_score_interval,
+)
 
 
 def test_zero_on_identical_variants():
@@ -182,3 +186,215 @@ def test_orphan_valid_cells_dont_spoof_non_degenerate():
     result = compute_verdict_flip_rate(scores, original_index=0, seed=0)
     assert result.degenerate_flag is True
     assert result.ci_lower is None and result.ci_upper is None
+
+
+# ---------------------------------------------------------------------------
+# F1: numerator / denominator + Wilson score interval
+# ---------------------------------------------------------------------------
+
+
+def test_numerator_and_denominator_populated_on_clean_run():
+    """A non-degenerate run exposes integer (count, total) for the Wilson
+    CI consumer. 5 flips across 10 paired cells in the balanced fixture."""
+    scores = np.array(
+        [
+            [0.80, 0.90, 0.85, 0.95, 0.78],  # original: 1,1,1,1,1
+            [0.10, 0.05, 0.20, 0.15, 0.08],  # flipper:  0,0,0,0,0  (5 flips)
+            [0.82, 0.91, 0.87, 0.96, 0.79],  # no flips: 1,1,1,1,1  (0 flips)
+        ]
+    )
+    result = compute_verdict_flip_rate(scores, original_index=0, seed=42)
+    assert result.numerator == 5
+    assert result.denominator == 10
+    assert isinstance(result.numerator, int)
+    assert isinstance(result.denominator, int)
+
+
+def test_numerator_zero_when_no_flips_but_pairs_exist():
+    """All-identical fixture → 0 flips, but the paired denominator is
+    still 10 (3 variants → 2 permuted rows × 5 evals)."""
+    scores = np.full((3, 5), 0.72)
+    result = compute_verdict_flip_rate(scores, original_index=0, seed=0)
+    assert result.numerator == 0
+    assert result.denominator == 10
+
+
+def test_numerator_denominator_none_on_structurally_degenerate():
+    """Single-variant fixture: no permuted rows → no paired observations
+    → numerator/denominator are ``None`` (not 0)."""
+    scores = np.array([[0.5, 0.5, 0.5]])  # 1 variant
+    result = compute_verdict_flip_rate(scores, original_index=0, seed=0)
+    assert result.numerator is None
+    assert result.denominator is None
+
+
+def test_numerator_drops_nan_pairs():
+    """NaN pairs drop from BOTH count and total — the paired denominator
+    must equal the number of valid (orig, perm) pairs only."""
+    scores = np.array(
+        [
+            [0.80, 0.90, np.nan, 0.78],  # original valid at 3/4 evals
+            [0.10, 0.92, 0.20, 0.79],    # 1 flip vs orig at eval 0; 0,0,0
+        ]
+    )
+    result = compute_verdict_flip_rate(scores, original_index=0, seed=0)
+    # Paired cells: (e0, e1, e3) since e2 is NaN on original. perm flips
+    # only at e0 (1→0). Denominator=3, numerator=1.
+    assert result.numerator == 1
+    assert result.denominator == 3
+
+
+# ---------------------------------------------------------------------------
+# F1: wilson_score_interval — known-input reference values
+# ---------------------------------------------------------------------------
+
+
+def test_wilson_5_of_10_known_reference():
+    """Wilson 95% CI for k=5, n=10 → ~(0.23659, 0.76341).
+
+    Reference: scipy.stats.proportion_confint(5, 10, 0.05, "wilson") =
+    (0.23658800818179994, 0.7634119918182001).
+    """
+    lo, hi = wilson_score_interval(5, 10)
+    assert lo is not None and hi is not None
+    assert abs(lo - 0.236588) < 1e-5
+    assert abs(hi - 0.763412) < 1e-5
+
+
+def test_wilson_0_of_10_lower_bound_clamped_to_zero():
+    """Wilson at p=0: lower clamps to 0; upper ≈ 0.27753."""
+    lo, hi = wilson_score_interval(0, 10)
+    assert lo == 0.0
+    assert abs(hi - 0.277533) < 1e-4
+
+
+def test_wilson_10_of_10_upper_bound_clamped_to_one():
+    """Wilson at p=1: lower ≈ 0.72247; upper clamps to 1.0."""
+    lo, hi = wilson_score_interval(10, 10)
+    assert abs(lo - 0.722467) < 1e-4
+    assert hi == 1.0
+
+
+def test_wilson_1_of_100_tight_lower_bound():
+    """Wilson at very low rate is much tighter than naive normal —
+    n=100, k=1 → ~(0.00018, 0.05445)."""
+    lo, hi = wilson_score_interval(1, 100)
+    assert 0.0 < lo < 0.005
+    assert 0.05 < hi < 0.06
+
+
+def test_wilson_zero_trials_returns_none_pair():
+    """No data → no defensible CI. Return ``(None, None)`` not (0, 1)."""
+    lo, hi = wilson_score_interval(0, 0)
+    assert lo is None and hi is None
+
+
+def test_wilson_brackets_observed_proportion_under_random_inputs():
+    """Property test: for any (k, n) with n > 0, the CI must bracket k/n.
+
+    This is the defining property of any well-formed CI. A regression
+    that swaps + and - in the formula would surface here on most inputs.
+    """
+    rng = np.random.default_rng(0)
+    for _ in range(50):
+        n = int(rng.integers(2, 500))
+        k = int(rng.integers(0, n + 1))
+        lo, hi = wilson_score_interval(k, n)
+        assert lo is not None and hi is not None
+        p = k / n
+        assert lo <= p <= hi, f"CI [{lo}, {hi}] does not bracket {p} (k={k}, n={n})"
+        assert 0.0 <= lo <= hi <= 1.0
+
+
+def test_wilson_99_percent_wider_than_95_percent():
+    """Conf level monotonicity: a 99% CI must be at least as wide as 95%."""
+    lo95, hi95 = wilson_score_interval(5, 10, conf=0.95)
+    lo99, hi99 = wilson_score_interval(5, 10, conf=0.99)
+    assert lo99 <= lo95
+    assert hi99 >= hi95
+
+
+def test_wilson_rejects_invalid_inputs():
+    """Boundary contract: out-of-range k, negative n, or conf outside
+    (0, 1) raise ValueError rather than returning a silent garbage CI."""
+    with pytest.raises(ValueError):
+        wilson_score_interval(-1, 10)
+    with pytest.raises(ValueError):
+        wilson_score_interval(11, 10)  # k > n
+    with pytest.raises(ValueError):
+        wilson_score_interval(0, -5)
+    with pytest.raises(ValueError):
+        wilson_score_interval(5, 10, conf=0.0)
+    with pytest.raises(ValueError):
+        wilson_score_interval(5, 10, conf=1.0)
+    with pytest.raises(ValueError):
+        wilson_score_interval(5, 10, conf=-0.5)
+    with pytest.raises(ValueError):
+        wilson_score_interval(5, 10, conf=1.5)
+
+
+def test_wilson_rejects_bool_successes_and_trials():
+    """Audit pass-1 Fuzzer-MAJOR-3: ``True`` / ``False`` are
+    ``isinstance(_, int)`` and ``0 <= True <= 10`` evaluates True, so
+    a producer with ``successes=True`` would silently return a CI for
+    ``k=1`` instead of erroring. Reject ``bool`` up front."""
+    with pytest.raises(TypeError):
+        wilson_score_interval(True, 10)
+    with pytest.raises(TypeError):
+        wilson_score_interval(5, True)
+    with pytest.raises(TypeError):
+        wilson_score_interval(False, 10)
+
+
+def test_wilson_rejects_non_int_successes_and_trials():
+    """Docstring says int; a float ``5.0`` slipping through is a
+    contract lie even if the math accepts it."""
+    with pytest.raises(TypeError):
+        wilson_score_interval(5.0, 10)
+    with pytest.raises(TypeError):
+        wilson_score_interval(5, 10.0)
+    with pytest.raises(TypeError):
+        wilson_score_interval("5", 10)  # type: ignore[arg-type]
+
+
+def test_wilson_rejects_bool_conf():
+    """``conf=True`` (i.e. 1.0) would crash ``inv_cdf`` AND silently
+    treat the type as float. Reject explicitly."""
+    with pytest.raises(TypeError):
+        wilson_score_interval(5, 10, conf=True)  # type: ignore[arg-type]
+
+
+def test_wilson_rejects_conf_near_one():
+    """Audit pass-1 RT-MAJOR-3: ``conf = 1.0 - eps`` collapses
+    ``1.0 - alpha/2`` to exactly 1.0 in float, and
+    ``NormalDist().inv_cdf(1.0)`` raises ``StatisticsError``. The
+    tightened gate rejects this before the math runs."""
+    with pytest.raises(ValueError):
+        wilson_score_interval(5, 10, conf=1.0 - 1e-15)
+    with pytest.raises(ValueError):
+        wilson_score_interval(5, 10, conf=1e-15)
+
+
+def test_wilson_accepts_safe_conf_boundaries():
+    """The tightened gate must still accept conf values just inside
+    the new interior ``[1e-9, 1 - 1e-9]`` band."""
+    lo, hi = wilson_score_interval(5, 10, conf=1.0 - 1e-9)
+    assert lo is not None and hi is not None
+    lo2, hi2 = wilson_score_interval(5, 10, conf=1e-9)
+    assert lo2 is not None and hi2 is not None
+
+
+def test_wilson_n_equals_one_does_not_crash():
+    """Smallest non-trivial sample size: must produce a valid CI, not
+    div-by-zero or NaN."""
+    lo, hi = wilson_score_interval(1, 1)
+    assert lo is not None and hi is not None
+    assert 0.0 <= lo <= 1.0 <= 1.0  # noqa
+    assert 0.0 <= lo <= hi <= 1.0
+
+
+def test_wilson_deterministic():
+    """Pure stdlib math — no RNG. Calls must return identical bounds."""
+    a = wilson_score_interval(7, 23)
+    b = wilson_score_interval(7, 23)
+    assert a == b

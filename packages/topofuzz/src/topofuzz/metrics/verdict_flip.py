@@ -23,6 +23,8 @@ PDF: *"swapping agents X and Y flips the verdict on Z% of inputs."*
 
 from __future__ import annotations
 
+import math
+import statistics
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -50,6 +52,13 @@ class VerdictFlipResult:
 
     ``method`` mirrors :class:`fuzzeval.stats.BootstrapResult.method`
     for reporting symmetry — always ``"percentile"`` in v0.5.
+
+    ``numerator`` / ``denominator`` are the integer flip count and the
+    integer count of valid (original, permuted) pairs the point estimate
+    is computed from. They are ``None`` only on the structurally-
+    degenerate paths (no paired cells at all). Exposed so downstream
+    callers can compute alternative confidence intervals (Wilson, etc.)
+    without re-walking the score matrix.
     """
 
     point: float | None
@@ -58,6 +67,113 @@ class VerdictFlipResult:
     n_resamples: int
     method: str
     degenerate_flag: bool
+    numerator: int | None = None
+    denominator: int | None = None
+
+
+def wilson_score_interval(
+    successes: int, trials: int, *, conf: float = 0.95,
+) -> tuple[float | None, float | None]:
+    """95% (default) Wilson score interval for a binomial proportion.
+
+    Wilson (1927) is the standard well-behaved CI for a binomial
+    proportion ``p = k/n``: it stays inside ``[0, 1]``, behaves
+    correctly at the boundaries (``p=0`` and ``p=1``) where the normal
+    approximation collapses, and is tighter than Clopper-Pearson on
+    realistic sample sizes. Used for the ``headline.verdict_flip_rate``
+    user-facing CI alongside the cluster-bootstrap CI already on the
+    same dict — Wilson is the "is the rate non-zero?" question; the
+    bootstrap is the "how much would re-sampling the eval set move
+    it?" question. Both are in scope.
+
+    Args:
+        successes: Integer count of "flips" (or whichever 1-class).
+            Must satisfy ``0 <= successes <= trials``.
+        trials: Integer total of paired observations. ``0`` returns
+            ``(None, None)`` — there is no defensible CI on a zero-
+            sample proportion.
+        conf: Confidence level in ``(0, 1)``. Defaults to 0.95.
+
+    Returns:
+        ``(lower, upper)`` floats clamped to ``[0.0, 1.0]``, or
+        ``(None, None)`` when ``trials == 0``.
+
+    Raises:
+        TypeError: ``successes`` / ``trials`` is ``bool`` or non-int;
+            ``conf`` is ``bool``.
+        ValueError: ``successes`` out of ``[0, trials]``; ``trials``
+            negative; ``conf`` out of the usable range
+            ``[1e-9, 1 - 1e-9]``. The interior tightening defends
+            against ``inv_cdf`` underflow at the float boundary —
+            ``conf = 1.0 - eps`` collapses ``1 - alpha/2`` to exactly
+            ``1.0`` which raises ``StatisticsError`` from
+            :meth:`statistics.NormalDist.inv_cdf`.
+    """
+    # F1 audit pass-1 Fuzzer-MAJOR-3 + RT-MAJOR-3 hardening.
+    # Bool is a subclass of int so ``True`` and ``False`` slip through
+    # ``0 <= True <= 10`` and the docstring's ``successes: int`` claim
+    # silently lies. Same for ``trials``. ``conf`` is a float; only the
+    # bool form is the relevant trap because ``isinstance(True, float)``
+    # is False but ``0.0 < True < 1.0`` evaluates True.
+    if isinstance(successes, bool) or isinstance(trials, bool):
+        raise TypeError(
+            "successes and trials must be int, not bool "
+            f"(got successes={successes!r}, trials={trials!r})"
+        )
+    if not isinstance(successes, int) or not isinstance(trials, int):
+        raise TypeError(
+            "successes and trials must be int "
+            f"(got successes={type(successes).__name__}, "
+            f"trials={type(trials).__name__})"
+        )
+    if isinstance(conf, bool):
+        raise TypeError(f"conf must be float, not bool; got {conf!r}")
+
+    if trials < 0:
+        raise ValueError(f"trials must be >= 0; got {trials!r}")
+    if not (0 <= successes <= trials):
+        raise ValueError(
+            f"successes must be in [0, trials={trials}]; got {successes!r}"
+        )
+    # Tightened interior range: NormalDist.inv_cdf(1.0) raises
+    # StatisticsError; with conf = 1 - eps the formula collapses to that.
+    _CONF_INTERIOR_EPS = 1e-9
+    if not (_CONF_INTERIOR_EPS <= conf <= 1.0 - _CONF_INTERIOR_EPS):
+        raise ValueError(
+            f"conf must be in [{_CONF_INTERIOR_EPS}, "
+            f"{1.0 - _CONF_INTERIOR_EPS}]; got {conf!r}"
+        )
+    if trials == 0:
+        return (None, None)
+
+    alpha = 1.0 - conf
+    # NormalDist.inv_cdf(1 - alpha/2) is the two-sided z-score. For 95%
+    # this is ~1.959963984540054, matching scipy.stats.norm.ppf(0.975).
+    z = statistics.NormalDist().inv_cdf(1.0 - alpha / 2.0)
+    z2 = z * z
+    n = float(trials)
+    p_hat = successes / n
+    denom = 1.0 + z2 / n
+    center = (p_hat + z2 / (2.0 * n)) / denom
+    half = (
+        z * math.sqrt(p_hat * (1.0 - p_hat) / n + z2 / (4.0 * n * n))
+    ) / denom
+    # Clamp to [0, 1] — center ± half can sit a hair outside on
+    # degenerate inputs (p_hat == 0 or 1), and the headline display is
+    # a probability, not a real-line statistic.
+    low = max(0.0, center - half)
+    high = min(1.0, center + half)
+    # Snap residual float-rounding noise at the boundaries: at p_hat=0
+    # the formula gives ``center == half`` in real arithmetic but float
+    # subtraction can leave ~2.8e-17. Without this snap the rendered
+    # "0%" floor is "0.000000000000000028", which leaks through any
+    # equality test against 0.0 and is jarring in raw json.
+    _BOUNDARY_EPS = 1e-12
+    if low < _BOUNDARY_EPS:
+        low = 0.0
+    if high > 1.0 - _BOUNDARY_EPS:
+        high = 1.0
+    return (low, high)
 
 
 def compute_verdict_flip_rate(
@@ -147,6 +263,8 @@ def compute_verdict_flip_rate(
             n_resamples=0,
             method="percentile",
             degenerate_flag=True,
+            numerator=None,
+            denominator=None,
         )
 
     # Track valid cells explicitly. ``arr >= threshold`` returns False
@@ -188,6 +306,8 @@ def compute_verdict_flip_rate(
             n_resamples=0,
             method="percentile",
             degenerate_flag=True,
+            numerator=None,
+            denominator=None,
         )
 
     total_num = float(col_num[finite_cols].sum())
@@ -204,8 +324,16 @@ def compute_verdict_flip_rate(
             n_resamples=0,
             method="percentile",
             degenerate_flag=True,
+            numerator=None,
+            denominator=None,
         )
     point = total_num / total_denom
+    # ``flip`` and ``denom_mask`` are integer counts living inside a
+    # float64 sum for vectorisation; cast back to int for the public
+    # surface so downstream consumers (Wilson CI, JSON mirror, the §17
+    # paragraph) get unambiguous integer arithmetic.
+    num_int = int(round(total_num))
+    denom_int = int(round(total_denom))
 
     # Audit CR-M1: no-flip degenerate path is fully determined by the
     # paired-cell statistic. The previous ``valid_anywhere`` term
@@ -221,6 +349,8 @@ def compute_verdict_flip_rate(
             n_resamples=0,
             method="percentile",
             degenerate_flag=True,
+            numerator=0,
+            denominator=denom_int,
         )
 
     finite_idx = np.flatnonzero(finite_cols)
@@ -233,6 +363,8 @@ def compute_verdict_flip_rate(
             n_resamples=0,
             method="percentile",
             degenerate_flag=True,
+            numerator=num_int,
+            denominator=denom_int,
         )
 
     rng = np.random.default_rng(seed)
@@ -253,4 +385,6 @@ def compute_verdict_flip_rate(
         n_resamples=n_resamples,
         method="percentile",
         degenerate_flag=False,
+        numerator=num_int,
+        denominator=denom_int,
     )

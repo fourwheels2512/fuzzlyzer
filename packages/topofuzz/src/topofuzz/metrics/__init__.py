@@ -58,6 +58,7 @@ from topofuzz.metrics.status import classify_run_status
 from topofuzz.metrics.verdict_flip import (
     VerdictFlipResult,
     compute_verdict_flip_rate,
+    wilson_score_interval,
 )
 from topofuzz.metrics.verdict_stability import (
     VerdictStabilityResult,
@@ -112,4 +113,5 @@ __all__ = [
     "variance_across_orderings",
     "variance_across_orderings_ci",
     "voo_gate_passes",
+    "wilson_score_interval",
 ]
