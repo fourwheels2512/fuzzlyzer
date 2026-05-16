@@ -3,7 +3,7 @@ name = "topofuzz"
 # Soft launch as 0.5.0rc1; promote to 0.5.0 after smoke-test feedback per
 # project_step12b_handoff.md's lockdown decisions (2026-05-13).
 version = "0.6.0"
-description = "Topology Safety Fuzzer for multi-agent LLM systems"
+description = "topofuzz™: Topology Safety Fuzzer for multi-agent LLM systems"
 readme = "README.md"
 license = { text = "BUSL-1.1" }
 license-files = ["LICENSE", "NOTICE"]

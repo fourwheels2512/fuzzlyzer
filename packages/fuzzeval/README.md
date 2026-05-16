@@ -1,6 +1,6 @@
-# fuzzeval
+# fuzzeval™
 
-**Verify-path substrate for `topofuzz` and sibling multi-agent eval tools.**
+**Verify-path substrate for `topofuzz`™ and sibling multi-agent eval tools.**
 
 `fuzzeval` ships the modules a verify-only install needs: DSSE
 attestation, single + jury LLM judges, statistics, on-disk caches,

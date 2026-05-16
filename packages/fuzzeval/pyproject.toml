@@ -4,7 +4,7 @@ name = "fuzzeval"
 # substrate, so its 0.1.0 release covers DSSE primitives + judge
 # (single + jury) + stats + cache + costest + keys API surface.
 version = "0.2.0"
-description = "Shared eval infrastructure for topofuzz and other multi-agent eval tools"
+description = "fuzzeval™: shared eval infrastructure for topofuzz™ and other multi-agent eval tools"
 readme = "README.md"
 license = { text = "BUSL-1.1" }
 license-files = ["LICENSE", "NOTICE"]

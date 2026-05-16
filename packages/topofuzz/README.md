@@ -1,4 +1,4 @@
-# topofuzz
+# topofuzz™
 
 **Topology Safety Fuzzer for multi-agent LLM systems.**
 

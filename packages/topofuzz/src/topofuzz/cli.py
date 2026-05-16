@@ -234,7 +234,10 @@ _UNSUPPORTED_GRAPH_EXIT = 64
 
 app = typer.Typer(
     name="topofuzz",
-    help="Topology Safety Fuzzer for multi-agent LLM systems (TSF v5+).",
+    help=(
+        "topofuzz™ — Topology Safety Fuzzer for multi-agent LLM "
+        "systems (TSF v5+)."
+    ),
     no_args_is_help=True,
     add_completion=False,
 )
