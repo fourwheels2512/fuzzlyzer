@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Kiran Nayudu. All rights reserved.
+# Licensed under the Business Source License 1.1.
+# See LICENSE file in the project root for full terms.
+# <!-- PATENT_PENDING_NOTICE_GOES_HERE -->
+
 """Unit tests for :mod:`topofuzz.summary` (Step 17 — §17 natural-language summary).
 
 The module is pure stats → English so the tests don't touch the

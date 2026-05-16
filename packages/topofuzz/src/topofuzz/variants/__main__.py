@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Kiran Nayudu. All rights reserved.
+# Licensed under the Business Source License 1.1.
+# See LICENSE file in the project root for full terms.
+# <!-- PATENT_PENDING_NOTICE_GOES_HERE -->
+
 """Entrypoint for ``python -m topofuzz.variants`` — the §6 demo print.
 
 Builds the lending_4role IR with realistic LLM configs and emits every

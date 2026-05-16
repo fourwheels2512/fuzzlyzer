@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Kiran Nayudu. All rights reserved.
+# Licensed under the Business Source License 1.1.
+# See LICENSE file in the project root for full terms.
+# <!-- PATENT_PENDING_NOTICE_GOES_HERE -->
+
 """single_agent: 1-node negative-control fixture for BLUEPRINT §14 step 15a.
 
 A provably-stable baseline: one agent, one role, no role overlap, so §6

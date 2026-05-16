@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Kiran Nayudu. All rights reserved.
+# Licensed under the Business Source License 1.1.
+# See LICENSE file in the project root for full terms.
+# <!-- PATENT_PENDING_NOTICE_GOES_HERE -->
+
 """Walk a compiled LangGraph into a Topology IR (BLUEPRINT_v5plus.md §5).
 
 In-scope LangGraph constructs:

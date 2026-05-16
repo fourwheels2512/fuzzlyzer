@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Kiran Nayudu. All rights reserved.
+# Licensed under the Business Source License 1.1.
+# See LICENSE file in the project root for full terms.
+# <!-- PATENT_PENDING_NOTICE_GOES_HERE -->
+
 """F3 MAJOR (2026-05-16): jury-aware VOO over per-vendor continuous scores.
 
 Covers the new public surface in ``topofuzz.metrics.voo``:

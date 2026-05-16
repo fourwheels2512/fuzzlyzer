@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Kiran Nayudu. All rights reserved.
+# Licensed under the Business Source License 1.1.
+# See LICENSE file in the project root for full terms.
+# <!-- PATENT_PENDING_NOTICE_GOES_HERE -->
+
 """lending_4role: 4-agent linear loan-decision chain.
 
 Canonical demo fixture for v0.5: ``intake -> risk -> policy -> decision``.

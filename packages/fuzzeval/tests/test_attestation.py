@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Kiran Nayudu. All rights reserved.
+# Licensed under the Business Source License 1.1.
+# See LICENSE file in the project root for full terms.
+# <!-- PATENT_PENDING_NOTICE_GOES_HERE -->
+
 """DSSE v1.0 PAE byte-exact + envelope round-trip tests.
 
 The hard byte-exact gate against ``secure-systems-lab/dsse`` v1.0.0

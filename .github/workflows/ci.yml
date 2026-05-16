@@ -7,6 +7,26 @@ on:
     branches: [main]
 
 jobs:
+  copyright-headers:
+    # BACKLOG entry "Copyright + (C) notice headers in source files":
+    # every `.py` file in the four watched dirs must carry the
+    # 4-line copyright header. Same script also exposed to local
+    # contributors as `python scripts/add_copyright_headers.py` —
+    # running it without `--check` fixes the missing files.
+    name: copyright-header check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Assert every watched .py has the BSL header
+        run: python scripts/add_copyright_headers.py --check
+
   test:
     name: pytest (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest

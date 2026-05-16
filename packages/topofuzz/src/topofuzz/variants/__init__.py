@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Kiran Nayudu. All rights reserved.
+# Licensed under the Business Source License 1.1.
+# See LICENSE file in the project root for full terms.
+# <!-- PATENT_PENDING_NOTICE_GOES_HERE -->
+
 """Variant generators for Topology IR (BLUEPRINT_v5plus.md §6).
 
 Three generators turn a base Topology into a set of execution variants:

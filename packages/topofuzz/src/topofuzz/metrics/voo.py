@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Kiran Nayudu. All rights reserved.
+# Licensed under the Business Source License 1.1.
+# See LICENSE file in the project root for full terms.
+# <!-- PATENT_PENDING_NOTICE_GOES_HERE -->
+
 """§9 metric #1: variance_across_orderings + cluster-bootstrap CI.
 
 Point estimate: ``np.mean(np.var(scores, axis=0))`` — average per-eval

@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Kiran Nayudu. All rights reserved.
+# Licensed under the Business Source License 1.1.
+# See LICENSE file in the project root for full terms.
+# <!-- PATENT_PENDING_NOTICE_GOES_HERE -->
+
 """Date-prefixed ULID for the step 6 run-id scheme.
 
 Per locked decision (user, 2026-05-12): ``runs/<YYYY-MM-DD>-<ULID>/``.

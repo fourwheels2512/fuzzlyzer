@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Kiran Nayudu. All rights reserved.
+# Licensed under the Business Source License 1.1.
+# See LICENSE file in the project root for full terms.
+# <!-- PATENT_PENDING_NOTICE_GOES_HERE -->
+
 """Step 15a attestation tests: headline-metric persistence + report.json mirror.
 
 Covers BLUEPRINT §14 sub-deliverables (b) through (h):

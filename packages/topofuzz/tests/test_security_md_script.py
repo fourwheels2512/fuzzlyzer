@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Kiran Nayudu. All rights reserved.
+# Licensed under the Business Source License 1.1.
+# See LICENSE file in the project root for full terms.
+# <!-- PATENT_PENDING_NOTICE_GOES_HERE -->
+
 """§11a standalone-verifier proof: the ~30-line ``verify_dsse.py``
 documented in SECURITY.md must verify the committed v0.5 fixture and
 must reject single-byte tampering.

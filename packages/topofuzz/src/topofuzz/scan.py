@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Kiran Nayudu. All rights reserved.
+# Licensed under the Business Source License 1.1.
+# See LICENSE file in the project root for full terms.
+# <!-- PATENT_PENDING_NOTICE_GOES_HERE -->
+
 """Static risk scan (BLUEPRINT_v5plus.md §5a) — the gateway-drug feature.
 
 Walks a :class:`topofuzz.ir.Topology` and emits a ``HIGH`` / ``MEDIUM`` /

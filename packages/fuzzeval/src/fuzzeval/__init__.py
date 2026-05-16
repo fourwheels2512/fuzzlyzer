@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Kiran Nayudu. All rights reserved.
+# Licensed under the Business Source License 1.1.
+# See LICENSE file in the project root for full terms.
+# <!-- PATENT_PENDING_NOTICE_GOES_HERE -->
+
 """fuzzeval — shared eval infrastructure for topofuzz (and siblings).
 
 Public API per BLUEPRINT_v5plus.md §17a. All listed symbols are
