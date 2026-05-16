@@ -954,3 +954,330 @@ def test_jury_votes_view_handles_n1_correctly(tmp_path):
     assert view["deny_count"] == 0
     assert view["total"] == 1
     assert view["majority_label"] == "APPROVE"
+
+
+# ---------------------------------------------------------------------------
+# Step 20a/F6 follow-up — manifest verdict_label_true/false consumer wiring
+# (BACKLOG 2026-05-16: inspect.py consumer not wired)
+# ---------------------------------------------------------------------------
+
+
+# Sentinel for "manifest key omitted entirely" — distinct from None which
+# would write a literal `null` value into the JSON. Pass-2 RT MIN-7: declared
+# BEFORE _patch_manifest_labels so a top-to-bottom read works.
+_MISSING = object()
+
+
+def _patch_manifest_labels(
+    run_dir: Path, *, label_true: object, label_false: object
+) -> None:
+    """Patch manifest.json with the given verdict_label_true/false pair.
+
+    ``object`` rather than ``str`` so tests can plant XOR half-sets
+    (None / missing) and other tamper shapes the producer IR would
+    reject but a hand-edited manifest can carry.
+    """
+    manifest_path = run_dir / "manifest.json"
+    m = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if label_true is not _MISSING:
+        m["verdict_label_true"] = label_true
+    if label_false is not _MISSING:
+        m["verdict_label_false"] = label_false
+    manifest_path.write_text(json.dumps(m), encoding="utf-8")
+
+
+def test_inspect_default_labels_when_manifest_omits_pair(tmp_path):
+    """Backcompat: a v0.5 manifest with no verdict_label_* keys still
+    renders APPROVE/DENY (lending-domain default). Confirms the new
+    helper does not regress the existing lending-only behaviour."""
+    run_dir = _make_run(tmp_path)
+    html, _eid = build_inspect_html(run_dir)
+    assert "APPROVE" in html
+    assert "DENY" in html
+    assert "ESCALATE" not in html
+    assert "DEFER" not in html
+
+
+def test_inspect_renders_custom_manifest_labels(tmp_path):
+    """Adversarial-relay shape: manifest opts into ESCALATE/DEFER and the
+    side-by-side flip HTML renders the new pair instead of APPROVE/DENY.
+    Both panels (binary judge canonical=pass + flipping=fail) must
+    swap."""
+    run_dir = _make_run(tmp_path)
+    _patch_manifest_labels(
+        run_dir, label_true="ESCALATE", label_false="DEFER"
+    )
+    html, _eid = build_inspect_html(run_dir)
+    assert "ESCALATE" in html
+    assert "DEFER" in html
+    # Producer-side wiring strips the old defaults from manifest when
+    # both differ from default — at the HTML level neither lending
+    # label should appear in any verdict pill. (Risk-phrase highlighting
+    # in agent response text can still contain "approve"/"deny"
+    # substrings, so we look for the uppercase pill labels specifically.)
+    assert ">APPROVE<" not in html
+    assert ">DENY<" not in html
+
+
+def test_inspect_custom_labels_are_lowercase_normalized(tmp_path):
+    """Mirrors publish.py: lowercase manifest input gets upper()'d before
+    rendering so the inspect HTML matches the CEO PDF byte-for-byte."""
+    run_dir = _make_run(tmp_path)
+    _patch_manifest_labels(
+        run_dir, label_true="escalate", label_false="defer"
+    )
+    html, _eid = build_inspect_html(run_dir)
+    assert "ESCALATE" in html
+    assert "DEFER" in html
+
+
+def test_inspect_falls_back_to_defaults_on_xor_half_set_true_only(
+    tmp_path, caplog
+):
+    """Red-team check: orchestrator persists the label pair as both-or-
+    neither. A tampered manifest with exactly one key set must log + fall
+    back to BOTH defaults rather than silently defaulting the unset half
+    against an explicit other half.
+
+    This variant covers ``true`` set / ``false`` missing.
+    """
+    import logging
+    run_dir = _make_run(tmp_path)
+    _patch_manifest_labels(
+        run_dir, label_true="ESCALATE", label_false=_MISSING
+    )
+    # Pass-1 RT-specialist MIN-1: caplog default capture is propagation-
+    # dependent; explicit logger= forces propagation under caplog's
+    # handler regardless of test-runner config.
+    with caplog.at_level(logging.WARNING, logger="topofuzz.inspect"):
+        html, _eid = build_inspect_html(run_dir)
+    assert "APPROVE" in html
+    assert "DENY" in html
+    assert "ESCALATE" not in html
+    assert any(
+        "exactly one of verdict_label" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_inspect_falls_back_to_defaults_on_xor_half_set_false_only(
+    tmp_path, caplog
+):
+    """Pass-1 RT-specialist MIN-3: bidirectional XOR coverage. A future
+    code change that branches asymmetrically on ``has_true`` vs
+    ``has_false`` would silently regress one direction; both must be
+    tested."""
+    import logging
+    run_dir = _make_run(tmp_path)
+    _patch_manifest_labels(
+        run_dir, label_true=_MISSING, label_false="DEFER"
+    )
+    with caplog.at_level(logging.WARNING, logger="topofuzz.inspect"):
+        html, _eid = build_inspect_html(run_dir)
+    assert "APPROVE" in html
+    assert "DENY" in html
+    assert "DEFER" not in html
+    assert any(
+        "exactly one of verdict_label" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_inspect_falls_back_to_defaults_on_over_twelve_char_label(
+    tmp_path, caplog
+):
+    """Mirrors publish.py: a tampered manifest with a >12-char label
+    used to silently slice. Now inspect logs and falls back to both
+    defaults so the buyer sees the same default pair rather than a
+    half-custom pair."""
+    import logging
+    run_dir = _make_run(tmp_path)
+    _patch_manifest_labels(
+        run_dir, label_true="PARTIALLY_APPROVED", label_false="REJECTED"
+    )
+    with caplog.at_level(logging.WARNING, logger="topofuzz.inspect"):
+        html, _eid = build_inspect_html(run_dir)
+    assert "APPROVE" in html
+    assert "DENY" in html
+    assert "PARTIALLY_APPROVED" not in html
+    # "REJECTED" is ≤12 chars but the partner label triggers pair-level
+    # fallback — so the partner is discarded too.
+    assert ">REJECTED<" not in html
+    # Pass-1 RT-specialist MIN-4: also assert the WARN message names the
+    # *actually-too-long* key. A regression that swaps the key/value in
+    # the log args would silently rename to "verdict_label_false" and
+    # mislead the operator.
+    assert any(
+        ">12 chars after strip" in rec.message
+        and "verdict_label_true" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_inspect_whitespace_only_label_treated_as_unset(tmp_path, caplog):
+    """Pass-1 RT-specialist MIN-5: a manifest with whitespace-only labels
+    (e.g. accidental hand-edit leaving spaces) must read as "not set"
+    rather than as a non-empty pair. Both `"  "` strings strip to empty
+    → falsy `has_*` → defaults fallback with NO half-set XOR warning
+    (because neither side is "set" post-strip).
+    """
+    import logging
+    run_dir = _make_run(tmp_path)
+    _patch_manifest_labels(
+        run_dir, label_true="   ", label_false="\t\t"
+    )
+    with caplog.at_level(logging.WARNING, logger="topofuzz.inspect"):
+        html, _eid = build_inspect_html(run_dir)
+    assert "APPROVE" in html
+    assert "DENY" in html
+    # Neither side is treated as "set" — no XOR warning fires.
+    assert not any(
+        "exactly one of verdict_label" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_inspect_raises_on_colliding_manifest_labels(tmp_path):
+    """Two labels that collapse to the same string post-normalize destroy
+    the side-by-side story (the inspect view IS the side-by-side flip
+    inspector). Refuse to render — mirrors publish.PublishError on
+    collision."""
+    run_dir = _make_run(tmp_path)
+    _patch_manifest_labels(
+        run_dir, label_true="approve", label_false="Approve"
+    )
+    with pytest.raises(InspectError) as exc_info:
+        build_inspect_html(run_dir)
+    msg = str(exc_info.value)
+    assert "collide after normalization" in msg
+    # Raw values surface in the message so the operator can see which
+    # input pair collided.
+    assert "approve" in msg.lower()
+
+
+def test_inspect_no_flip_error_wins_over_colliding_labels(tmp_path):
+    """Pass-2 RT-specialist MAJ-3 fix: a degenerate run (no flip) is the
+    dominant real-world failure; manifest tampering is a corner case.
+    When BOTH conditions hold, the operator must see the "No verdict
+    flip" message — not the less-actionable collision message — so they
+    investigate the fixture rather than the manifest. Enforced by
+    calling ``find_inspect_pair`` BEFORE ``_resolve_verdict_labels``."""
+    run_dir = _make_run(tmp_path, with_flip=False)
+    _patch_manifest_labels(
+        run_dir, label_true="approve", label_false="Approve"
+    )
+    with pytest.raises(InspectError) as exc_info:
+        build_inspect_html(run_dir)
+    msg = str(exc_info.value)
+    assert "No verdict flip" in msg
+    assert "collide" not in msg.lower()
+
+
+def test_inspect_jury_panel_renders_custom_labels(tmp_path):
+    """Jury panel rows + majority badge honour the manifest pair so a
+    non-lending JuryJudge run reads consistently (per-vendor pills +
+    summary all switch to ESCALATE/DEFER)."""
+    canonical_votes = [
+        {"vendor": "google", "score": 0.85, "rationale": "approve"},
+        {"vendor": "deepseek", "score": 0.80, "rationale": "approve"},
+        {"vendor": "openai", "score": 0.75, "rationale": "approve"},
+    ]
+    flipping_votes = [
+        {"vendor": "google", "score": 0.25, "rationale": "deny"},
+        {"vendor": "deepseek", "score": 0.30, "rationale": "deny"},
+        {"vendor": "openai", "score": 0.20, "rationale": "deny"},
+    ]
+    run_dir = _make_run_with_jury_votes(
+        tmp_path,
+        canonical_votes=canonical_votes,
+        flipping_votes=flipping_votes,
+    )
+    _patch_manifest_labels(
+        run_dir, label_true="ESCALATE", label_false="DEFER"
+    )
+    html, _eid = build_inspect_html(run_dir)
+    # Per-vendor row pills + majority badge both render the new pair.
+    assert "ESCALATE" in html
+    assert "DEFER" in html
+    assert ">APPROVE<" not in html
+    assert ">DENY<" not in html
+
+
+def test_inspect_jury_panel_tie_label_honours_custom_false(tmp_path):
+    """The TIE → <label_false> majority message follows the manifest pair
+    so a deadlocked jury on a non-lending fixture reads as e.g.
+    "TIE → DEFER" not "TIE → DENY"."""
+    canonical_votes = [
+        {"vendor": "google", "score": 0.85, "rationale": "approve"},
+        {"vendor": "deepseek", "score": 0.20, "rationale": "deny"},
+    ]
+    flipping_votes = [
+        {"vendor": "google", "score": 0.85, "rationale": "approve"},
+        {"vendor": "deepseek", "score": 0.80, "rationale": "approve"},
+    ]
+    run_dir = _make_run_with_jury_votes(
+        tmp_path,
+        canonical_votes=canonical_votes,
+        flipping_votes=flipping_votes,
+        canonical_score=0.0,
+        flipping_score=1.0,
+    )
+    _patch_manifest_labels(
+        run_dir, label_true="ESCALATE", label_false="DEFER"
+    )
+    html, _eid = build_inspect_html(run_dir)
+    assert "TIE → DEFER" in html
+    assert "TIE → DENY" not in html
+    # Pass-2 RT MIN-10: structural backstop independent of the arrow
+    # glyph. If a future template refactor switches to HTML-entity
+    # encoding (e.g. `&rarr;` / `&#8594;` / `→`) the substring
+    # assertion above breaks even though the user-visible behaviour is
+    # correct. The CSS class is template-stable; assert it as well.
+    assert "verdict-unknown" in html
+
+
+def test_resolve_verdict_labels_helper_defaults():
+    """Direct unit test on the helper — absent keys produce APPROVE/DENY."""
+    from topofuzz.inspect import _resolve_verdict_labels
+
+    assert _resolve_verdict_labels({}) == ("APPROVE", "DENY")
+
+
+def test_resolve_verdict_labels_helper_custom_pair():
+    """Direct unit test on the helper — explicit pair is upper()'d +
+    trimmed and returned. Bytes match publish's normalize."""
+    from topofuzz.inspect import _resolve_verdict_labels
+
+    assert _resolve_verdict_labels({
+        "verdict_label_true": " escalate ",
+        "verdict_label_false": "defer",
+    }) == ("ESCALATE", "DEFER")
+
+
+def test_resolve_verdict_labels_helper_rejects_collision():
+    """Direct unit test on the helper — collision raises InspectError
+    with the raw values in the message."""
+    from topofuzz.inspect import _resolve_verdict_labels
+
+    with pytest.raises(InspectError) as exc_info:
+        _resolve_verdict_labels({
+            "verdict_label_true": "yes",
+            "verdict_label_false": "YES",
+        })
+    assert "collide after normalization" in str(exc_info.value)
+
+
+def test_verdict_label_helper_threads_custom_labels():
+    """_verdict_label echoes the passed label_true / label_false on the
+    binary-judge path and the score-fallback path alike."""
+    from topofuzz.inspect import _verdict_label
+
+    # Binary path.
+    assert _verdict_label(True, None, 0.5, "ESCALATE", "DEFER") == "ESCALATE"
+    assert _verdict_label(False, None, 0.5, "ESCALATE", "DEFER") == "DEFER"
+    # Score-fallback path keeps the "(score)" suffix and threads the label.
+    assert _verdict_label(None, 0.8, 0.5, "ESCALATE", "DEFER") == "ESCALATE (0.80)"
+    assert _verdict_label(None, 0.2, 0.5, "ESCALATE", "DEFER") == "DEFER (0.20)"
+    # Backcompat: omitting label args falls back to APPROVE/DENY.
+    assert _verdict_label(True, None, 0.5) == "APPROVE"
+    assert _verdict_label(False, None, 0.5) == "DENY"

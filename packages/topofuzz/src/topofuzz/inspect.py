@@ -223,6 +223,80 @@ def _load_manifest(run_dir: Path) -> dict[str, Any]:
         ) from e
 
 
+def _resolve_verdict_labels(manifest: dict[str, Any]) -> tuple[str, str]:
+    """Return ``(label_true, label_false)`` resolved from manifest with
+    defense-in-depth.
+
+    Mirrors ``topofuzz.publish._build_ceo_card_context``'s manifest-label
+    handling so the side-by-side flip HTML renders identical labels to
+    the CEO PDF for the same run (Step 20a/F6 follow-up):
+
+    1. **XOR half-set:** the orchestrator persists labels as a pair
+       (both-or-neither, gated on differs-from-default). A manifest with
+       exactly one key non-empty is an obvious tamper or hand-edit —
+       log + fall back to BOTH defaults rather than silently defaulting
+       the unset half against an explicit other half.
+    2. **>12-char cap:** the producer IR caps labels at 12 chars after
+       normalize. A tampered manifest with a >12-char label would render
+       truncated nonsense — log + fall back to BOTH defaults so the
+       buyer sees the same default pair rather than a half-custom pair.
+    3. **Collision after normalize:** two labels that collapse to the
+       same string destroy the side-by-side story (a buyer would see
+       "APPROVE / APPROVE" with two different excerpts, worse than no
+       inspect view). Raise :class:`InspectError`.
+    4. **Defaults fallback:** absent / empty / wrong-type values resolve
+       to ``("APPROVE", "DENY")``.
+    """
+    label_true_raw = manifest.get("verdict_label_true")
+    label_false_raw = manifest.get("verdict_label_false")
+    has_true = isinstance(label_true_raw, str) and label_true_raw.strip()
+    has_false = isinstance(label_false_raw, str) and label_false_raw.strip()
+    if bool(has_true) != bool(has_false):
+        _log.warning(
+            "inspect: manifest has exactly one of verdict_label_true/false "
+            "set (true=%r, false=%r) — both must be set together or "
+            "neither (orchestrator persists as a pair). Falling back to "
+            "APPROVE/DENY defaults.",
+            label_true_raw, label_false_raw,
+        )
+        label_true_raw = None
+        label_false_raw = None
+    for raw_label, key in (
+        (label_true_raw, "verdict_label_true"),
+        (label_false_raw, "verdict_label_false"),
+    ):
+        if isinstance(raw_label, str) and len(raw_label.strip()) > 12:
+            _log.warning(
+                "inspect: manifest %s=%r is >12 chars after strip — "
+                "exceeds the side-by-side flip-card cap. Falling back "
+                "to APPROVE/DENY for BOTH labels (pair-level fallback; "
+                "the partner label is discarded too so the reader sees "
+                "the same default pair rather than a half-custom pair).",
+                key, raw_label,
+            )
+            label_true_raw = None
+            label_false_raw = None
+            break
+    label_true = (
+        label_true_raw.strip().upper()[:12]
+        if isinstance(label_true_raw, str) and label_true_raw.strip()
+        else "APPROVE"
+    )
+    label_false = (
+        label_false_raw.strip().upper()[:12]
+        if isinstance(label_false_raw, str) and label_false_raw.strip()
+        else "DENY"
+    )
+    if label_true == label_false:
+        raise InspectError(
+            f"manifest verdict_label_true/false collide after "
+            f"normalization (raw: true={label_true_raw!r}, "
+            f"false={label_false_raw!r}; both → {label_true!r}); "
+            f"refuse to render."
+        )
+    return label_true, label_false
+
+
 def _load_cell(
     run_dir: Path, variant_id: str, eval_id: str
 ) -> dict[str, Any]:
@@ -478,7 +552,11 @@ def _agent_view(
 
 
 def _verdict_label(
-    passed: bool | None, score: float | None, threshold: float
+    passed: bool | None,
+    score: float | None,
+    threshold: float,
+    label_true: str = "APPROVE",
+    label_false: str = "DENY",
 ) -> str:
     """Plain-English verdict label for a cell.
 
@@ -486,13 +564,19 @@ def _verdict_label(
     derive from ``score`` vs ``threshold`` — the same §6 binarisation the
     verdict-flip metric uses — so a continuous-judge cell still reads as
     APPROVE/DENY visually instead of a neutral "score N.NN" pill.
+
+    ``label_true`` / ``label_false`` default to the lending-domain
+    APPROVE/DENY pair but accept manifest-driven overrides resolved by
+    :func:`_resolve_verdict_labels` so a non-lending fixture (e.g.
+    adversarial-relay's ESCALATE/DEFER) renders consistent labels in the
+    inspect HTML and the CEO PDF for the same run.
     """
     if passed is True:
-        return "APPROVE"
+        return label_true
     if passed is False:
-        return "DENY"
+        return label_false
     if score is not None:
-        verdict = "APPROVE" if score >= threshold else "DENY"
+        verdict = label_true if score >= threshold else label_false
         return f"{verdict} ({score:.2f})"
     return "(no verdict)"
 
@@ -502,6 +586,8 @@ def _jury_votes_view(
     threshold: float,
     escape: Any,
     Markup: Any,
+    label_true: str = "APPROVE",
+    label_false: str = "DENY",
 ) -> dict[str, Any] | None:
     """Template-ready breakdown of a JuryJudge's per-vendor votes.
 
@@ -512,22 +598,31 @@ def _jury_votes_view(
             "approve_count": int,
             "deny_count": int,
             "total": int,                 # surviving vendor count
-            "majority_label": "APPROVE" | "DENY" | "TIE",
+            "majority_label": label_true | label_false | "TIE → <false>",
             "majority_class": str,         # CSS class for the badge
             "rows": [{"vendor", "score_pct", "verdict_label",
                       "verdict_class", "rationale_html"}, ...],
         }
 
     Per-vendor verdicts use the same ``score >= threshold`` binarisation
-    that drives the overall verdict pill, so the count of APPROVEs in
+    that drives the overall verdict pill, so the count of approves in
     the rows matches the count the user sees in the panel header.
+
+    ``label_true`` / ``label_false`` default to APPROVE/DENY but accept
+    manifest-driven overrides resolved by
+    :func:`_resolve_verdict_labels` so a non-lending fixture (e.g.
+    adversarial-relay's ESCALATE/DEFER) renders consistent labels in the
+    inspect HTML and the CEO PDF for the same run. The
+    ``approve_count``/``deny_count`` field names stay stable (they're
+    template contracts) — the labels are user-facing, the field names
+    are internal.
 
     Fuzzer M2 audit fix: a deadlocked jury (``approve_count * 2 ==
     total``, e.g. one vendor failed and the surviving 1/1 split) gets
     a dedicated TIE label so the panel doesn't silently look like a
     consensus. The headline `value` already resolved the tie to 0.0
-    (DENY) per the compliance-conservative convention; the panel just
-    spells out that the jury was deadlocked.
+    (the false-side label) per the compliance-conservative convention;
+    the panel just spells out that the jury was deadlocked.
 
     Rationales are escaped + risk-phrase-highlighted exactly like the
     aggregate rationale block above so the same legend covers both.
@@ -543,11 +638,11 @@ def _jury_votes_view(
         if approved:
             approve_count += 1
             verdict_class = "verdict-approve"
-            verdict_label = "APPROVE"
+            verdict_label = label_true
         else:
             deny_count += 1
             verdict_class = "verdict-deny"
-            verdict_label = "DENY"
+            verdict_label = label_false
         rationale_text = str(v.get("rationale", ""))
         rationale_html = _render_rationale(
             rationale_text or None, escape, Markup
@@ -562,17 +657,18 @@ def _jury_votes_view(
         })
     total = len(rows)
     if approve_count * 2 > total:
-        majority_label = "APPROVE"
+        majority_label = label_true
         majority_class = "verdict-approve"
     elif approve_count * 2 == total:
         # Deadlocked jury: 1/1 (one vendor failed), 1/2 (one failed),
-        # any even-total split. Resolves to DENY at the score level
-        # but the panel labels it explicitly so the user understands
-        # the headline pill came from the conservative-tie default.
-        majority_label = "TIE → DENY"
+        # any even-total split. Resolves to the false-side label at the
+        # score level but the panel labels it explicitly so the user
+        # understands the headline pill came from the conservative-tie
+        # default.
+        majority_label = f"TIE → {label_false}"
         majority_class = "verdict-unknown"
     else:
-        majority_label = "DENY"
+        majority_label = label_false
         majority_class = "verdict-deny"
     return {
         "approve_count": approve_count,
@@ -763,9 +859,23 @@ def build_inspect_html(
     """
     run_dir = Path(run_dir)
     manifest = _load_manifest(run_dir)
+    # Pass-2 RT-specialist MAJ-3 fix: find_inspect_pair MUST run before
+    # _resolve_verdict_labels. A degenerate run (no flip) is the dominant
+    # real-world failure; manifest tampering is a corner case. Without
+    # this ordering, a colliding-labels manifest on a no-flip run would
+    # raise the less-useful "collide after normalization" error instead
+    # of "No verdict flip" — operator-confusing. Labels are only used
+    # after pair resolution, so the swap is free.
     eid, canonical_idx, flipping_idx = find_inspect_pair(
         run_dir, eval_id=eval_id, threshold=threshold
     )
+    # Step 20a/F6 follow-up: resolve manifest-driven verdict labels with
+    # the same defense-in-depth posture as ``publish._build_ceo_card_context``
+    # so the side-by-side flip HTML renders the same label pair as the
+    # CEO PDF for the same run (BACKLOG 2026-05-16 — inspect consumer
+    # wiring). Defaults to ("APPROVE", "DENY") when manifest is absent
+    # / opted-out / tampered.
+    label_true, label_false = _resolve_verdict_labels(manifest)
     hashes = manifest["variant_canonical_hashes"]
     orderings = manifest.get("variant_orderings", [])
     # Audit RT-pass-1 MAJOR-2: a manifest with fewer variant_orderings than
@@ -827,6 +937,8 @@ def build_inspect_html(
             canonical_cell["judge_passed"],
             canonical_cell["judge_score"],
             threshold,
+            label_true,
+            label_false,
         ),
         "verdict_class": _verdict_css_class(
             canonical_cell["judge_passed"],
@@ -837,7 +949,12 @@ def build_inspect_html(
             canonical_cell["judge_rationale"], escape, Markup
         ),
         "jury_votes": _jury_votes_view(
-            canonical_cell["jury_votes"], threshold, escape, Markup
+            canonical_cell["jury_votes"],
+            threshold,
+            escape,
+            Markup,
+            label_true,
+            label_false,
         ),
         "agents": [
             {**a, "response_html": Markup(a["response_html"])}
@@ -853,6 +970,8 @@ def build_inspect_html(
             flipping_cell["judge_passed"],
             flipping_cell["judge_score"],
             threshold,
+            label_true,
+            label_false,
         ),
         "verdict_class": _verdict_css_class(
             flipping_cell["judge_passed"],
@@ -863,7 +982,12 @@ def build_inspect_html(
             flipping_cell["judge_rationale"], escape, Markup
         ),
         "jury_votes": _jury_votes_view(
-            flipping_cell["jury_votes"], threshold, escape, Markup
+            flipping_cell["jury_votes"],
+            threshold,
+            escape,
+            Markup,
+            label_true,
+            label_false,
         ),
         "agents": [
             {**a, "response_html": Markup(a["response_html"])}
