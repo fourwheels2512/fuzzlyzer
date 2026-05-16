@@ -609,20 +609,70 @@ def test_repro_emits_explicit_verdict_node_when_manifest_sets_it(tmp_path):
     assert "run_chain(ORDERING_NEG, LLM_CONFIGS, VERDICT_NODE)" in text
 
 
-def test_repro_falls_back_to_lex_first_terminal_node(tmp_path):
-    """v0.5.5 transitional path — only ``terminal_nodes`` set (no
-    ``verdict_node``). Must mirror ``runner._run_judge``'s lex-first
-    dispatch so the script and the runner score the same node.
+def test_repro_uses_single_terminal_node_when_verdict_node_unset(tmp_path):
+    """v0.5.5 transitional path — only a SINGLE-element ``terminal_nodes``
+    list set (no ``verdict_node``). Must use that node so the script and
+    the runner score the same node.
 
-    The synthetic orderings are ``["n1", "n2"]`` and ``["n2", "n1"]``; the
-    terminal_nodes list ``["n2", "n1"]`` lex-sorts to ``"n1"`` so the test
-    distinguishes the lex-first behaviour from "list-first" or "ordering
-    last".
+    Multi-terminal manifests without ``verdict_node`` are refused by
+    L1028 — see ``test_repro_refuses_multi_terminal_without_verdict_node``
+    for the refusal contract. This test pins the single-terminal happy
+    path that survives the L1028 fix.
     """
     run_dir = _make_synthetic_run(tmp_path, with_flip=True)
-    _patch_manifest(run_dir, terminal_nodes=["n2", "n1"])
+    _patch_manifest(run_dir, terminal_nodes=["n1"])
     text, _ = build_repro_script(run_dir)
     assert 'VERDICT_NODE = "n1"' in text
+
+
+def test_repro_refuses_multi_terminal_without_verdict_node(tmp_path):
+    """L1028 — multi-terminal manifest without ``verdict_node`` must
+    raise ``ReproError`` at render time with remediation guidance.
+
+    Why this is the right shape:
+      * On multi-terminal topologies, ``publish._excerpt_terminal_output``
+        picks the first sorted terminal that ALSO produced output for
+        each cell (the output-level survival filter on ``by_node``).
+      * ``repro`` has no per-cell access at render time — it operates
+        only on the manifest's field-level state.
+      * If both functions returned ``sorted(terminal_nodes)[0]``
+        unconditionally, they would silently name DIFFERENT nodes
+        whenever the lex-first terminal was cancelled in some cells.
+        That divergence breaks the "re-run the bundle yourself" claim
+        on the CEO card.
+      * Refusing in repro forces the operator to declare
+        ``verdict_node`` explicitly, eliminating the ambiguity.
+
+    Single-terminal manifests are unaffected — see
+    ``test_repro_uses_single_terminal_node_when_verdict_node_unset``.
+    """
+    from topofuzz.repro import ReproError
+
+    run_dir = _make_synthetic_run(tmp_path, with_flip=True)
+    _patch_manifest(run_dir, terminal_nodes=["n2", "n1"])
+    with pytest.raises(ReproError) as exc_info:
+        build_repro_script(run_dir)
+    msg = str(exc_info.value)
+    assert "multi-terminal" in msg.lower()
+    assert "verdict_node" in msg
+    # Operator must see what was rejected and how to fix.
+    assert "n2" in msg or "n1" in msg
+    assert "topofuzz run" in msg
+    assert "L1028" in msg
+
+
+def test_repro_accepts_multi_terminal_with_explicit_verdict_node(tmp_path):
+    """L1028 contract — multi-terminal manifest WITH ``verdict_node`` set
+    works unchanged. The refusal applies only when ``verdict_node`` is
+    unresolved and the manifest carries 2+ terminals."""
+    run_dir = _make_synthetic_run(tmp_path, with_flip=True)
+    _patch_manifest(
+        run_dir,
+        verdict_node="n2",
+        terminal_nodes=["n1", "n2"],
+    )
+    text, _ = build_repro_script(run_dir)
+    assert 'VERDICT_NODE = "n2"' in text
 
 
 def test_repro_no_verdict_fields_emits_none(tmp_path):
@@ -860,11 +910,15 @@ def test_resolve_verdict_node_field_level_parity_with_publish():
     """
     from topofuzz.repro import _resolve_verdict_node
 
+    # Cases where repro and publish must agree byte-for-byte.
+    # L1028 closed 2026-05-16: multi-terminal-without-verdict_node is
+    # NOT in this list — repro now raises ReproError there while
+    # publish picks lex-first (and then filters by_node at the cell
+    # level). See ``test_resolve_verdict_node_diverges_from_publish_on_multi_terminal``
+    # for the deliberate-divergence contract.
     cases = [
         ("explicit verdict_node wins",
          {"verdict_node": "explicit", "terminal_nodes": ["other"]}),
-        ("terminal_nodes lex-first when verdict_node unset",
-         {"terminal_nodes": ["zebra", "alpha", "mango"]}),
         ("empty-string verdict_node falls through",
          {"verdict_node": "", "terminal_nodes": ["fallback"]}),
         ("whitespace verdict_node falls through",
@@ -896,6 +950,42 @@ def test_resolve_verdict_node_field_level_parity_with_publish():
             f"resolver drift on case '{label}' ({fields}): "
             f"repro picked {repro_pick!r}, publish picked {publish_pick!r}"
         )
+
+
+def test_resolve_verdict_node_diverges_from_publish_on_multi_terminal():
+    """L1028 contract — repro and publish DELIBERATELY diverge on
+    multi-terminal-without-verdict_node, by design.
+
+    publish's field-level pick is ``sorted(terminal_nodes)[0]`` (then
+    filtered by the cell's ``by_node`` at the output level). repro has
+    no per-cell access at render time, so it cannot replicate the
+    output-level filter — and returning lex-first regardless would
+    silently name a different node than the CEO card on any cell where
+    the lex-first terminal was cancelled. Refusing here is the only
+    safe option: ``publish`` keeps working (its by_node filter is
+    intact), ``repro`` raises with remediation guidance, and the buyer
+    is forced to set ``verdict_node`` explicitly — which removes the
+    ambiguity at the source.
+
+    This test pins the divergence so a future PR that "fixes" the
+    parity canary by relaxing repro's refusal trips this test first.
+    """
+    from topofuzz.repro import _resolve_verdict_node, ReproError
+
+    multi_terminal_no_verdict = {"terminal_nodes": ["zebra", "alpha", "mango"]}
+
+    # publish (field-level canary) picks lex-first.
+    publish_pick = _publish_pick_verdict_node_field(multi_terminal_no_verdict)
+    assert publish_pick == "alpha"
+
+    # repro REFUSES — output-level by_node filter not replicable at
+    # render time.
+    with pytest.raises(ReproError) as exc_info:
+        _resolve_verdict_node(multi_terminal_no_verdict)
+    msg = str(exc_info.value)
+    assert "multi-terminal" in msg.lower()
+    assert "verdict_node" in msg
+    assert "L1028" in msg
 
 
 def test_repro_runtime_failure_uses_banner_exit_not_assertion(tmp_path):

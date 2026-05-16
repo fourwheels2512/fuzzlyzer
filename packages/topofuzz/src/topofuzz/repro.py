@@ -364,17 +364,31 @@ def _resolve_verdict_node(manifest: dict) -> str | None:
        non-empty trimmed ``str``. A present-but-malformed value (empty
        string, non-string type) is rejected with a one-line warning so an
        operator can grep the log; resolution falls through to (2).
-    2. The lex-first entry of ``manifest.terminal_nodes`` (v0.5.5 transitional
-       shape) when every entry is a non-empty ``str``. A list with even one
-       blank / non-string entry is rejected wholesale rather than skip-and-
-       continue: a malformed manifest is a bug, and silently picking
-       "alpha" out of ``["", "alpha"]`` would hide the bug from the operator
-       without preventing the runner from making a different choice.
+    2. The lex-first entry of a SINGLE-element ``manifest.terminal_nodes``
+       list (v0.5.5 transitional shape). A list with two or more entries
+       is REFUSED on multi-terminal manifests without an explicit
+       ``verdict_node``: see L1028 below.
     3. ``None`` — for v0.5 manifests with neither field. The rendered script
        falls back to ``history[-1][1]`` (legacy behaviour preserved bit-for-
        bit for existing gallery runs).
 
     Returns the resolved node id or ``None`` for the v0.5 fallback path.
+    Raises :class:`ReproError` on a multi-terminal manifest where
+    ``verdict_node`` was not resolved in step (1).
+
+    **L1028 multi-terminal refusal (closed 2026-05-16).** On a
+    multi-terminal manifest without ``verdict_node``, this function
+    used to return ``sorted(terminal_nodes)[0]`` unconditionally — but
+    :func:`publish._excerpt_terminal_output` picks the first sorted
+    node that is *also present in the cell's* ``by_node`` (the
+    output-level survival filter). repro has no per-cell access at
+    render time, so it cannot replicate that filter. Returning
+    lex-first regardless meant the repro script could name a different
+    node than the CEO PDF for any cell where the lex-first terminal
+    was cancelled / silently dropped. We refuse multi-terminal here so
+    the buyer hits a clear ``ReproError`` with remediation guidance,
+    not a silent disagreement between two buyer-facing artifacts on
+    the same run.
     """
     raw_verdict = manifest.get("verdict_node")
     if raw_verdict is not None:
@@ -411,9 +425,28 @@ def _resolve_verdict_node(manifest: dict) -> str | None:
             raw_terminals,
         )
         return None
+    # Length dispatch after content validation:
+    #   len == 0 → return None (line below; v0.5 fallback)
+    #   len == 1 → return raw_terminals[0] (single-terminal v0.5.5 happy path)
+    #   len >= 2 → raise ReproError (L1028 multi-terminal refusal)
     if not raw_terminals:
         return None
-    return sorted(raw_terminals)[0]
+    if len(raw_terminals) >= 2:
+        raise ReproError(
+            "topofuzz repro cannot disambiguate a multi-terminal manifest "
+            f"({raw_terminals!r}) without an explicit ``verdict_node``. "
+            "On multi-terminal topologies, ``publish``'s CEO card picks "
+            "the first sorted terminal that ALSO produced output for each "
+            "cell (the output-level survival filter on ``by_node``); "
+            "repro has no per-cell access at render time and would have "
+            "to fall back to lex-first unconditionally — silently naming "
+            "a different node than the CEO PDF whenever the lex-first "
+            "terminal was cancelled. Set ``Topology(..., verdict_node=...)``"
+            " on the fixture and re-run ``topofuzz run`` to regenerate "
+            "the manifest, then re-run ``topofuzz repro``. "
+            "(L1028 closed 2026-05-16, option (c).)"
+        )
+    return raw_terminals[0]
 
 
 def _load_manifest(run_dir: Path) -> dict:
