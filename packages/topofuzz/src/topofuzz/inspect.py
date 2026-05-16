@@ -579,6 +579,169 @@ def _jury_votes_view(
     }
 
 
+def _ablation_view(
+    sidecar: dict[str, Any] | None,
+    *,
+    canonical_hash: str,
+    flipping_hash: str,
+    eval_id: str,
+    escape: Any,
+    Markup: Any,
+) -> dict[str, Any] | None:
+    """Template-ready per-flip attribution panel from ``ablation.json``.
+
+    Returns ``None`` when:
+
+    * The sidecar is absent (``topofuzz ablate`` has not been run on
+      this run dir yet) — the template's ``{% if %}`` guard then hides
+      the panel.
+    * The sidecar has no ``results`` entries matching this specific
+      (canonical, flipping, eval) triple — every ablation point was
+      for a different flip. Hiding the panel here means a single
+      F4 sidecar can land alongside an `inspect` view chosen for a
+      *different* flipping pair without producing a misleading
+      empty-panel render.
+
+    Per-flip filter shape (Fuzzer-style measurement-integrity check):
+    the attribution rendered MUST be the attribution computed against
+    THIS exact ``(canonical_hash, flipping_hash, eval_id)`` triple —
+    not the run-level aggregate. The run-level ``by_node`` lives in
+    the sidecar for the CLI summary, but the per-flip panel re-computes
+    locally so the buyer cannot read the wrong number off the wrong
+    flip.
+    """
+    if not sidecar:
+        return None
+    results = sidecar.get("results")
+    if not isinstance(results, list) or not results:
+        return None
+    relevant = [
+        r for r in results
+        if isinstance(r, dict)
+        and r.get("canonical_variant_id") == canonical_hash
+        and r.get("flipping_variant_id") == flipping_hash
+        and r.get("eval_id") == eval_id
+    ]
+    if not relevant:
+        return None
+    # Aggregate by node_id (the panel iterates V's nodes — ordering
+    # comes from the order the entries appear in the sidecar, which
+    # mirrors V's execution order).
+    by_node: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for r in relevant:
+        nid = str(r.get("ablated_node_id", ""))
+        if not nid:
+            continue
+        if nid not in by_node:
+            order.append(nid)
+            by_node[nid] = {
+                "flips_closed": 0,
+                "total_meaningful": 0,
+                "is_terminal": False,
+                "kind": str(r.get("kind", "")),
+                "new_terminal_response_html": Markup(""),
+            }
+        slot = by_node[nid]
+        kind = str(r.get("kind", ""))
+        if kind == "substitute_terminal":
+            slot["is_terminal"] = True
+        if kind in ("substitute_terminal", "reexecute_terminal"):
+            slot["total_meaningful"] += 1
+            if r.get("flip_closed") is True:
+                slot["flips_closed"] += 1
+        slot["kind"] = kind
+        # Pass-1 Fuzzer MINOR m3 fix: a `failed` row's
+        # ``new_terminal_response_text`` is whatever was set before the
+        # error (often empty, but never a measured output). Render
+        # explicit fail text so the buyer doesn't infer the leftover
+        # is "the post-ablation output".
+        if kind == "failed":
+            slot["new_terminal_response_html"] = Markup(
+                "[re-execution failed — no terminal output recorded]"
+            )
+        elif r.get("new_terminal_response_text"):
+            slot["new_terminal_response_html"] = Markup(
+                _highlight_risk_phrases(
+                    str(escape(_truncate_for_render(
+                        str(r["new_terminal_response_text"])
+                    )))
+                )
+            )
+    rows: list[dict[str, Any]] = []
+    # Pass-1 Fuzzer BLOCKER B2 fix: skip kinds produce
+    # ``total_meaningful=0`` and ``attribution_pct=0.0``. The template
+    # MUST distinguish "0% (measured, no flip closed)" from
+    # "(skipped, no measurement)" so a buyer doesn't read the 0% pill
+    # as "this agent contributes nothing". The `has_measurement` flag
+    # gates the template's bar+pct vs em-dash render.
+    SKIP_KINDS = {
+        "skip_downstream",
+        "skip_no_canonical_output",
+        "skip_no_v_output",
+        "failed",
+    }
+    for nid in order:
+        slot = by_node[nid]
+        total = slot["total_meaningful"]
+        pct = (
+            round(100.0 * slot["flips_closed"] / total, 2) if total > 0 else 0.0
+        )
+        kind = slot["kind"]
+        has_measurement = kind not in SKIP_KINDS and total > 0
+        rows.append({
+            "node_id": nid,
+            "flips_closed": slot["flips_closed"],
+            "total_meaningful": total,
+            "attribution_pct": pct,
+            "is_terminal": slot["is_terminal"],
+            "kind": kind,
+            "has_measurement": has_measurement,
+            "new_terminal_response_html": slot["new_terminal_response_html"],
+        })
+    # Headline summary: the strongest non-terminal attribution AMONG
+    # MEASURED rows only. The buyer-actionable answer is "the upstream
+    # agent that, when set to canonical, closes this flip". The terminal
+    # substitution is the always-100% baseline (excluded). Pass-1 Fuzzer
+    # BLOCKER B1 fix: when every upstream agent was structurally
+    # skip_downstream / skip_no_canonical_output, surface the structural
+    # cause rather than a bland "no upstream" — the buyer needs to know
+    # the verdict node ran first in this permutation.
+    measured_non_terminal = [
+        r for r in rows if not r["is_terminal"] and r["has_measurement"]
+    ]
+    skipped_non_terminal = [
+        r for r in rows if not r["is_terminal"] and not r["has_measurement"]
+    ]
+    if measured_non_terminal:
+        top = max(measured_non_terminal, key=lambda r: r["attribution_pct"])
+        headline = (
+            f"{top['node_id']} — {top['attribution_pct']:.0f}% of this flip "
+            f"closes when it matches canonical"
+        )
+    elif skipped_non_terminal:
+        # All upstream nodes were structurally excluded — most often
+        # because the terminal ran early in V's permutation.
+        headline = (
+            "No upstream attribution measurable for this flip: every "
+            "upstream agent ran AFTER the terminal in V's execution "
+            "order (or had no canonical output to swap in). The verdict "
+            "node was decided before any upstream context arrived."
+        )
+    else:
+        headline = "(no upstream agents in V's prior slice for this flip)"
+    return {
+        "headline": headline,
+        "rows": rows,
+        "scope_note": (
+            "Attribution shown for THIS flip only "
+            "(canonical vs. flipping variant, single eval row). The "
+            "CLI's `topofuzz ablate` summary aggregates across every "
+            "flipping triple in the run; numbers may differ."
+        ),
+    }
+
+
 def build_inspect_html(
     run_dir: Path,
     *,
@@ -704,6 +867,47 @@ def build_inspect_html(
         "error": flipping_cell["error"],
     }
 
+    # Optional F4 attribution panel. Pass-1 RT MAJOR M6 fix: distinguish
+    # "absent" (sidecar never written — render nothing, no log) from
+    # "corrupt" (sidecar present but malformed — log at WARNING AND
+    # surface a visible banner inside the rendered HTML so the buyer
+    # knows the ablation IS computed somewhere, the renderer just
+    # couldn't read it). The previous code silently swallowed the
+    # AblationError at DEBUG level — the buyer would think no ablation
+    # pass had been run and pay twice.
+    ablation_panel = None
+    ablation_corrupt_msg: str | None = None
+    try:
+        from topofuzz.ablation import AblationError as _AblationError
+        from topofuzz.ablation import read_ablation_sidecar
+
+        sidecar = read_ablation_sidecar(run_dir)
+        ablation_panel = _ablation_view(
+            sidecar,
+            canonical_hash=canonical_hash,
+            flipping_hash=flipping_hash,
+            eval_id=eid,
+            escape=escape,
+            Markup=Markup,
+        )
+    except _AblationError as e:
+        _log.warning(
+            "inspect: ablation.json in %s is unreadable: %s. The panel "
+            "will render a visible warning rather than render-silent.",
+            run_dir.name, e,
+        )
+        ablation_corrupt_msg = str(e)
+        ablation_panel = None
+    except (ImportError, OSError) as e:
+        # ImportError = packaging bug; OSError = filesystem; both are
+        # rare and bubble below; but treat them as "no panel" with a
+        # WARNING log so the operator sees it.
+        _log.warning(
+            "inspect: ablation panel unavailable (%s: %s).",
+            type(e).__name__, e,
+        )
+        ablation_panel = None
+
     env = Environment(
         loader=PackageLoader("topofuzz", "templates"),
         autoescape=True,
@@ -718,6 +922,8 @@ def build_inspect_html(
         threshold=threshold,
         canonical=canonical_panel,
         flipping=flipping_panel,
+        ablation=ablation_panel,
+        ablation_corrupt_msg=ablation_corrupt_msg,
     )
     return text, eid
 

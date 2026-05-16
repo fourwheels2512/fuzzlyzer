@@ -409,6 +409,102 @@
     font-size: 12.5px;
   }
 
+  /* F4 attribution panel — per-flip leave-one-out summary. */
+  .ablation {
+    margin-top: 32px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .ablation header {
+    padding: 18px 22px 14px;
+    background: var(--surface-warm);
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .ablation .panel-eyebrow {
+    color: var(--accent);
+    margin-bottom: 4px;
+  }
+  .ablation h2 {
+    font-family: var(--font-serif);
+    font-size: 22px;
+    font-weight: 500;
+    color: var(--ink-strong);
+    margin: 0 0 8px;
+    letter-spacing: -0.005em;
+  }
+  .ablation .headline {
+    font-family: var(--font-serif);
+    font-style: italic;
+    font-size: 15px;
+    color: var(--ink);
+    margin: 0;
+  }
+  .ablation .scope-note {
+    margin: 6px 0 0;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--muted);
+    line-height: 1.45;
+  }
+  .ablation-corrupt header { background: var(--deny-bg); }
+  .ablation-corrupt h2 { color: var(--deny); }
+  .ablation-corrupt code {
+    font-family: var(--font-mono);
+    background: var(--border-soft);
+    padding: 1px 4px;
+    border-radius: 3px;
+  }
+  .ablation .body {
+    padding: 18px 22px 22px;
+  }
+  .ablation table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+  }
+  .ablation th {
+    text-align: left;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .ablation th.num { text-align: right; }
+  .ablation td {
+    padding: 10px;
+    border-bottom: 1px solid var(--border-soft);
+    color: var(--ink-strong);
+    vertical-align: middle;
+  }
+  .ablation td.num { text-align: right; }
+  .ablation tr.is-terminal td {
+    background: var(--border-soft);
+    color: var(--muted-soft);
+  }
+  .ablation tr.is-terminal .baseline-tag {
+    font-family: var(--font-serif);
+    font-style: italic;
+    color: var(--muted);
+    margin-left: 6px;
+  }
+  .ablation .bar {
+    display: inline-block;
+    height: 8px;
+    border-radius: 4px;
+    background: var(--accent);
+    margin-right: 8px;
+    vertical-align: middle;
+    min-width: 1px;
+  }
+  .ablation tr.is-terminal .bar { background: var(--muted); }
+
   @media (max-width: 1000px) {
     .grid { grid-template-columns: 1fr; }
   }
@@ -506,6 +602,81 @@
     </section>
     {% endfor %}
   </div>
+  {% if ablation %}
+  <section class="ablation">
+    <header>
+      <div class="panel-eyebrow">Counterfactual attribution &middot; F4</div>
+      <h2>Which agent caused this flip?</h2>
+      <p class="headline">{{ ablation.headline }}</p>
+      <p class="scope-note">{{ ablation.scope_note }}</p>
+    </header>
+    <div class="body">
+      <table>
+        <thead>
+          <tr>
+            <th>Ablated agent</th>
+            <th>Experiment kind</th>
+            <th class="num">Flips closed</th>
+            <th class="num">Attribution</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for row in ablation.rows %}
+          <tr class="{{ 'is-terminal' if row.is_terminal else '' }}">
+            <td>{{ row.node_id }}</td>
+            <td>
+              {%- if row.kind == "substitute_terminal" -%}
+                terminal substitution
+              {%- elif row.kind == "reexecute_terminal" -%}
+                terminal re-execution (hybrid prior)
+              {%- elif row.kind == "skip_downstream" -%}
+                ran after terminal in this variant &mdash; skipped
+              {%- elif row.kind == "skip_no_canonical_output" -%}
+                no canonical output &mdash; skipped
+              {%- elif row.kind == "skip_no_v_output" -%}
+                no variant output &mdash; skipped
+              {%- elif row.kind == "failed" -%}
+                re-execution failed
+              {%- else -%}
+                {{ row.kind }}
+              {%- endif -%}
+            </td>
+            {% if row.has_measurement %}
+            <td class="num">{{ row.flips_closed }} / {{ row.total_meaningful }}</td>
+            <td class="num">
+              <span class="bar" style="width:{{ row.attribution_pct|round(0, 'floor')|int }}px"></span>
+              {{ "%.0f"|format(row.attribution_pct) }}%
+              {% if row.is_terminal %}<span class="baseline-tag">baseline</span>{% endif %}
+            </td>
+            {% else %}
+            {# Pass-1 Fuzzer BLOCKER B2: skip / failed rows show em-dash,
+               NOT a 0% bar that reads as "this agent contributes nothing". #}
+            <td class="num">&mdash;</td>
+            <td class="num"><span class="baseline-tag">no measurement</span></td>
+            {% endif %}
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% endif %}
+  {% if ablation_corrupt_msg %}
+  {# Pass-1 RT MAJOR M6: an ablation sidecar is present but unreadable.
+     Surface visibly so the buyer doesn't conclude "no ablation has been
+     run" and pay twice. #}
+  <section class="ablation ablation-corrupt">
+    <header>
+      <div class="panel-eyebrow">Counterfactual attribution &middot; F4</div>
+      <h2>Attribution data unavailable</h2>
+      <p class="headline">
+        An ablation pass HAS been run on this run dir, but its
+        <code>ablation.json</code> sidecar is corrupt: {{ ablation_corrupt_msg }}
+      </p>
+      <p class="scope-note">Re-run <code>topofuzz ablate &lt;run_dir&gt;</code> to repair.</p>
+    </header>
+  </section>
+  {% endif %}
   <div class="legend">
     <span class="legend-label">Highlighted phrases</span>
     <span class="phrase-deny">deny &middot; decline &middot; reject</span>

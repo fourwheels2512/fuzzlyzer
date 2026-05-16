@@ -27,6 +27,7 @@ ENV/
 # Environment / secrets
 .env
 .env.*
+_load_env.ps1
 
 # Tooling caches
 .pytest_cache/

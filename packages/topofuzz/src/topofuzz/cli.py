@@ -1766,6 +1766,219 @@ def confirm(
 
 @app.command(
     context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+def ablate(
+    ctx: typer.Context,
+    run_dir: str = typer.Argument(
+        ...,
+        help="Run directory (contains manifest.json + run.sqlite).",
+    ),
+    max_cost_usd: float | None = typer.Option(
+        None,
+        "--max-cost-usd",
+        min=0.0,
+        help=(
+            "Soft-warn at 80%%, hard-stop at 100%%. None = uncapped. "
+            "A cap of 0 is rejected — it would trip before the first "
+            "ablation point ran."
+        ),
+    ),
+    fixture: str | None = typer.Option(
+        None,
+        "--fixture",
+        help=(
+            "Override the manifest's recorded fixture spec (use when the "
+            "fixture file has moved on disk since the source run)."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "Short-circuit every terminal re-execution AND every jury "
+            "re-judgment into deterministic stubs. Exercises the full "
+            "pass with $0 LLM spend. Useful for plumbing-validation in "
+            "CI; the attribution numbers it produces are not meaningful."
+        ),
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the confirmation prompt (the ablate pass bills real LLM calls).",
+    ),
+) -> None:
+    """Run counterfactual leave-one-out attribution on a source run's flips.
+
+    For each flipping ``(canonical_variant, flipping_variant, eval)``
+    triple in the source run, walk every node in the flipping
+    variant's topology and ablate it: substitute the node's response
+    with the canonical variant's, re-execute the terminal node with
+    that hybrid prior, and re-judge under the source run's jury-of-3.
+    Whichever node's swap most often *closes the flip* is the
+    load-bearing agent — the buyer-actionable "which agent caused
+    this?" answer.
+
+    The source run MUST have used ``--jury-of-3``; SingleJudge runs are
+    rejected at the gate so the leave-one-out re-judgments don't inherit
+    the source's ~26 % per-judgment verdict noise (see BLUEPRINT §F4).
+
+    Writes ``<run_dir>/ablation.json``. ``topofuzz inspect`` consumes
+    the sidecar to render a per-flip attribution panel next to the
+    existing jury-vote panel.
+
+    Exit codes:
+
+    * 0 — pass completed (possibly with partial results when the cost
+      cap tripped; partial state is surfaced in the summary, not the
+      exit code).
+    * 2 — usage error (run_dir not a directory; missing / malformed
+      manifest; non-jury-of-3 source; fixture can't be loaded).
+    """
+    _reject_reserved_flags(list(ctx.args))
+    _reject_unknown_extras(list(ctx.args))
+
+    run_dir_path = Path(run_dir)
+    if not run_dir_path.is_dir():
+        typer.echo(
+            f"topofuzz ablate: run_dir is not a directory: {run_dir}",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT)
+
+    if max_cost_usd is not None and max_cost_usd <= 0.0:
+        typer.echo(
+            "topofuzz ablate: --max-cost-usd must be a positive amount. "
+            "Omit the flag for an uncapped pass.",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT)
+
+    if not dry_run:
+        typer.echo(
+            "topofuzz: research tool, no warranty. The ablate pass re-"
+            "executes the terminal node and re-judges under the jury — "
+            "this bills real LLM calls. See LICENSE.",
+            err=True,
+        )
+
+    from topofuzz.ablation import AblationError, run_ablation_pass
+
+    if not yes and not dry_run:
+        if not typer.confirm(
+            "Run counterfactual ablation on every flipping scenario "
+            "(bills real LLM calls)?",
+            default=False,
+        ):
+            typer.echo("Aborted.")
+            raise typer.Exit(code=0)
+
+    try:
+        summary = run_ablation_pass(
+            run_dir_path,
+            max_cost_usd=max_cost_usd,
+            fixture_override=fixture,
+            dry_run=dry_run,
+        )
+    except AblationError as e:
+        typer.echo(f"topofuzz ablate: {e}", err=True)
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+
+    typer.echo("")
+    typer.echo(
+        f"Flipping triples: {summary.n_flipping_pairs} | "
+        f"Ablation points: {summary.n_ablation_points} "
+        f"({summary.n_ablation_points_meaningful} meaningful)"
+    )
+    typer.echo(f"Cost (priced cells only): ${summary.total_cost_usd:.4f}")
+    # Pass-1 Fuzzer MAJOR M5 fix: print partial banner BEFORE the
+    # attribution table, not after. A buyer copy-pasting the table can
+    # easily miss a footer line; a header banner is harder to miss.
+    if summary.partial:
+        typer.echo(
+            "WARNING: cost cap tripped mid-pass; results are PARTIAL. "
+            "Per-node rows below may have an incomplete denominator "
+            "(some flipping triples weren't reached). Re-run "
+            "`topofuzz ablate` to complete the remaining ablation points."
+        )
+    # Pass-1 Fuzzer BLOCKER B3 fix: dry-run produces stub jury scores
+    # (every vendor votes 0.5 → majority APPROVE → score 1.0 — see
+    # ablation.py dry_run docstring). Banner says so unmistakably.
+    if dry_run:
+        typer.echo(
+            "DRY-RUN: every jury vote was stubbed to APPROVE. The "
+            "percentages below exercise the pass plumbing only; do not "
+            "interpret them as attribution. Re-run without --dry-run "
+            "for measured percentages."
+        )
+    # Pass-1 Fuzzer BLOCKER B1 fix: if every upstream agent in V's
+    # execution order ran AFTER the terminal node, by_node will contain
+    # ONLY the terminal-baseline entry at 100%. A buyer reading the
+    # one-line table would conclude "the verdict agent caused 100% of
+    # flips" — circular by construction. Surface the structural cause.
+    by_node_non_terminal = {
+        nid: slot for nid, slot in summary.by_node.items()
+        if not slot.get("is_terminal")
+    }
+    if (
+        summary.n_flipping_pairs > 0
+        and not by_node_non_terminal
+        and summary.by_node
+    ):
+        typer.echo("")
+        typer.echo(
+            "WARNING: every upstream agent in V's execution order ran "
+            "AFTER the terminal node; no causal attribution is possible "
+            "for this flip-set. The 100% row below is the terminal-"
+            "substitution baseline (control column), not an attribution "
+            "signal. Try a different flipping triple in this run, or a "
+            "topology that puts the terminal last in every permutation."
+        )
+    if summary.by_node:
+        typer.echo("")
+        typer.echo(
+            "Per-node attribution "
+            f"(aggregate across all {summary.n_flipping_pairs} flipping "
+            "triple(s); inspect view shows per-flip breakdown):"
+        )
+        # Sort: non-terminal first (the load-bearing signal), then
+        # the terminal baseline last. Within each group sort by
+        # attribution_pct descending so the strongest signal lands at
+        # the top.
+        rows = sorted(
+            summary.by_node.items(),
+            key=lambda kv: (
+                kv[1].get("is_terminal", False),
+                -kv[1].get("attribution_pct", 0.0),
+            ),
+        )
+        for node_id, slot in rows:
+            label = "(terminal — baseline)" if slot.get("is_terminal") else ""
+            # Pass-1 Fuzzer MAJOR M5 fix: when partial, annotate per-
+            # node samples / n_flipping_pairs so a buyer knows whether
+            # the row was fully measured or only partially.
+            sample_annot = ""
+            if summary.partial and summary.n_flipping_pairs > 0:
+                sample_annot = (
+                    f"  [{slot['total_meaningful']}/"
+                    f"{summary.n_flipping_pairs} triples sampled]"
+                )
+            typer.echo(
+                f"  {node_id:<32s} "
+                f"{slot['flips_closed']}/{slot['total_meaningful']}  "
+                f"{slot['attribution_pct']:6.2f}%  {label}{sample_annot}"
+            )
+    typer.echo("")
+    typer.echo(
+        f"Wrote sidecar: {run_dir_path / 'ablation.json'!s}"
+    )
+
+
+@app.command(
+    context_settings={
         # Reserved-flag rejection (§16 #2) is a universal policy across
         # every subcommand — keygen opts in for the same reason scan /
         # report / run / verify do: a user typing `topofuzz keygen --kms`
