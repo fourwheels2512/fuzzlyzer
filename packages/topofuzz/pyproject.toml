@@ -44,6 +44,19 @@ dependencies = [
 # Kept as an extras name for forward-compat and documentation.
 verify = []
 
+# topofuzz[pdf]: `topofuzz publish --pdf` artifact for buyer pitch / email.
+# Playwright + Chromium are heavy (~250MB after `playwright install chromium`);
+# kept off the base install so verify-only callers never pay for it.
+pdf = [
+    # Upper bound: Playwright 2.x may change ``page.pdf()`` kwarg
+    # semantics (margin / display_header_footer / footer_template). Bump
+    # deliberately and re-render the gallery PDFs together.
+    "playwright>=1.40,<2",
+    # pypdf merges the report.pdf + per-flip inspect_<eid>.pdf pages into
+    # a single artifact. ~1 MB pure-Python; no native deps.
+    "pypdf>=4",
+]
+
 # topofuzz[ui]: the 5th-grader-runnable web UI (python -m topofuzz ui).
 # Pulled separately from `full` so users who only want the CLI don't drag
 # in a web framework.

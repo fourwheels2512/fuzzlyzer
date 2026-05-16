@@ -1632,6 +1632,90 @@ def inspect(
         "allow_extra_args": True,
     }
 )
+def publish(
+    ctx: typer.Context,
+    run_dir: str = typer.Argument(
+        ...,
+        help="Run directory (contains manifest.json + run.sqlite).",
+    ),
+    pdf: Path = typer.Option(
+        ...,
+        "--pdf",
+        help=(
+            "Destination PDF path. Overwritten atomically if it exists."
+        ),
+    ),
+    max_flips: int = typer.Option(
+        # Hardcoded 5 here mirrors topofuzz.publish.DEFAULT_MAX_FLIPS;
+        # the constant isn't reachable at decorator-eval time without
+        # pulling the module into cli.py's import surface, which would
+        # break the lazy-import contract for verify-only installs.
+        # ``test_cli_publish_default_max_flips_matches_module_constant``
+        # pins them together.
+        5,
+        "--max-flips",
+        min=0,
+        max=50,
+        help=(
+            "Include up to this many inspect_<eid>.html pages — the "
+            "evals with the most variant-disagreements. Default 5; "
+            "hard limit 50."
+        ),
+    ),
+) -> None:
+    """Bundle report.html + top flipping inspect pages into one PDF.
+
+    Produces a single share-by-email artifact for buyer pitches. The
+    HTML files in ``run_dir`` remain canonical — the PDF loses
+    interactivity (hover rationales, expand panels) and exists so a CTO
+    reader can re-attest the bundle by copy-pasting the footer's
+    ``run_id`` into ``topofuzz verify``.
+
+    Side effects: ``report.html`` and ``inspect_<eid>.html`` are
+    rendered into ``run_dir`` if absent.
+
+    Exit codes:
+
+    * 0 — PDF written; path printed to stdout.
+    * 1 — publish failed (missing optional deps, missing files, render
+      failure).
+    * 2 — usage error (run_dir is not a directory).
+
+    Requires the ``[pdf]`` install extra::
+
+        pip install 'topofuzz[pdf]'
+        playwright install chromium
+    """
+    _reject_reserved_flags(list(ctx.args))
+    _reject_unknown_extras(list(ctx.args))
+
+    run_dir_path = Path(run_dir)
+    if not run_dir_path.is_dir():
+        typer.echo(
+            f"topofuzz publish: run_dir is not a directory: {run_dir}",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT)
+
+    from topofuzz.publish import PublishError, build_publish_pdf
+
+    try:
+        target = build_publish_pdf(
+            run_dir_path, out_path=pdf, max_flips=max_flips
+        )
+    except PublishError as e:
+        typer.echo(f"topofuzz publish: {e}", err=True)
+        raise typer.Exit(code=_VERIFY_FAIL_EXIT) from e
+
+    typer.echo(str(target))
+
+
+@app.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
 def confirm(
     ctx: typer.Context,
     run_dir: str = typer.Argument(
