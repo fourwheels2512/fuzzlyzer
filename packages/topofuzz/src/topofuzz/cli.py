@@ -50,6 +50,11 @@ from fuzzeval.keys import (
 
 from topofuzz import __version__
 from topofuzz.attest import load_and_verify_attestation
+from topofuzz.key_inspector import (
+    at_least_one_present,
+    format_table,
+    inspect_keys,
+)
 from topofuzz.license_check import (
     LICENSE_REFUSED_EXIT_CODE,
     HomeUnresolvableError,
@@ -2596,6 +2601,52 @@ def ui(
     )
     server = uvicorn.Server(config)
     server.run()
+
+
+@app.command(
+    context_settings={
+        # Reserved-flag rejection (§16 #2) is universal — `keys` opts
+        # in the same way every other subcommand does so a user who
+        # types `topofuzz keys --kms-region` gets the v1.0-reserved
+        # message instead of a generic "no such option".
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+def keys(ctx: typer.Context) -> None:
+    """Pre-flight: list which vendor API keys are visible in the env.
+
+    Prints one row per known vendor (google, openai, anthropic,
+    deepseek) showing the env var name, status, and a masked preview
+    of the value. The full key is NEVER printed — only the first 4 and
+    last 4 chars, with an ASCII ``..`` between. Keys shorter than 12
+    chars are flagged ``too_short`` and printed with no value at all
+    (the entire short string could BE the key). Whitespace-only
+    values are treated as ``missing``.
+
+    Status taxonomy:
+
+    * ``present`` — variable set, stripped value length ≥ 12.
+    * ``missing`` — variable unset, empty, or whitespace-only.
+    * ``too_short`` — variable set, stripped value length < 12
+      (likely a placeholder or typo).
+
+    Exit codes:
+
+    * 0 — at least one key is present.
+    * 1 — no keys present at all; the operator hasn't configured
+      anything yet. Re-export at least one of ``GEMINI_API_KEY``,
+      ``OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``, ``DEEPSEEK_API_KEY``
+      and re-run.
+    * 2 — usage error (e.g. reserved flag passed).
+    """
+    _reject_reserved_flags(list(ctx.args))
+    _reject_unknown_extras(list(ctx.args))
+
+    rows = inspect_keys()
+    typer.echo(format_table(rows))
+    if not at_least_one_present(rows):
+        raise typer.Exit(code=1)
 
 
 def main() -> None:
