@@ -519,6 +519,176 @@ class TestVerdictLabels:
             t.verdict_label_true = "ESCALATE"  # type: ignore[misc]
 
 
+class TestVerdictLabelsHomoglyphAllowlist:
+    """L949 closed 2026-05-16. Positive ASCII allowlist defends against
+    two homoglyph attack classes that the prior C/M filter let through:
+
+    * **Invisible Lo letters** (e.g. U+3164 HANGUL FILLER): NFKC-stable,
+      category Lo (Letter, Other), renders zero-width in most fonts.
+      Tampered manifest carrying ``"APㅤPROVE"`` (U+3164 spliced inside)
+      renders as ``"APPROVE"`` to the eye but mismatches buyer-side
+      ASCII ``grep "APPROVE"``.
+    * **Latin-lookalike Lu letters** (e.g. U+0410 Cyrillic А, U+0391
+      Greek Alpha, U+13AA Cherokee A): NFKC-self-stable, category Lu,
+      pixel-identical to ASCII Latin A in any full-Unicode font.
+
+    Both classes survive NFKC + C/M strip + ``.strip().upper()`` and
+    were the L949 procurement-integrity gap on the CEO PDF. The fix:
+    a positive ASCII allowlist applied after upper() — ``A-Z``, ``0-9``,
+    space, hyphen, underscore, slash. Producer RAISES on a single
+    disallowed character; consumer normalize returns empty (caller
+    falls back to default pair).
+    """
+
+    def _two_node_topo(self, **labels) -> Topology:
+        return Topology(
+            name="t",
+            nodes=[Node(id="a", role="r"), Node(id="b", role="r")],
+            edges=[Edge(from_id="a", to_id="b")],
+            entrypoint="a",
+            terminal=["b"],
+            **labels,
+        )
+
+    def test_rejects_hangul_filler_u3164_lo_invisible(self):
+        """U+3164 HANGUL FILLER (Lo): invisible, NFKC-stable. Without
+        the allowlist a tampered fixture carrying ``"APㅤPROVE"`` would
+        write that exact byte sequence into the manifest. The buyer's
+        grep for ``"APPROVE"`` misses; the CEO PDF reads as approval.
+        Producer raises here so the bug is caught at fixture authoring,
+        not at the buyer's grep."""
+        with pytest.raises(ValidationError, match="ASCII printable"):
+            self._two_node_topo(verdict_label_true="APㅤPROVE")
+
+    def test_rejects_hangul_jungseong_filler_u1160_lo_invisible(self):
+        """U+1160 HANGUL JUNGSEONG FILLER (Lo): NFKC-decomposed form
+        that U+3164 maps to. Tests the post-NFKC byte directly so the
+        filter still catches the attack even if NFKC normalization is
+        bypassed or upstream-applied (e.g. a paste from an editor that
+        normalized in-place)."""
+        with pytest.raises(ValidationError, match="ASCII printable"):
+            self._two_node_topo(verdict_label_true="APᅠPROVE")
+
+    def test_rejects_cyrillic_a_u0410_lu_homoglyph(self):
+        """U+0410 CYRILLIC CAPITAL LETTER A (Lu): NFKC-self-stable,
+        pixel-identical to U+0041 Latin A in any full-Unicode font.
+        Tampered ``"АPPROVE"`` renders identical to ``"APPROVE"``
+        but mismatches ASCII grep — the canonical procurement-integrity
+        attack on the CEO PDF text layer."""
+        with pytest.raises(ValidationError, match="ASCII printable"):
+            self._two_node_topo(verdict_label_true="АPPROVE")
+
+    def test_rejects_greek_alpha_u0391_lu_homoglyph(self):
+        """U+0391 GREEK CAPITAL LETTER ALPHA (Lu): NFKC-self-stable,
+        pixel-identical to Latin A. Same attack class as Cyrillic А
+        but a different codepoint range a defender's blocklist might
+        miss — positive allowlist catches both with one rule."""
+        with pytest.raises(ValidationError, match="ASCII printable"):
+            self._two_node_topo(verdict_label_true="ΑPPROVE")
+
+    def test_rejects_cherokee_a_u13aa_lu_homoglyph(self):
+        """U+13AA CHEROKEE LETTER GO (Lu, sometimes called Cherokee A):
+        another NFKC-stable Latin-lookalike. Cited in the L949 triage
+        as a defender-overlooked homoglyph class."""
+        with pytest.raises(ValidationError, match="ASCII printable"):
+            self._two_node_topo(verdict_label_true="ᎪPPROVE")
+
+    def test_rejects_emoji_so_symbol_class(self):
+        """U+1F44D THUMBS UP SIGN (So, Symbol Other): pre-allowlist
+        passed because So is in L/N/P/S/Z. Allowlist rejects symbols
+        outside the documented set — defense-in-depth against a buyer-
+        confusing label like ``"APPROVED 👍"``."""
+        with pytest.raises(ValidationError, match="ASCII printable"):
+            self._two_node_topo(verdict_label_true="APPROV\U0001F44D")
+
+    def test_error_message_names_offending_codepoint(self):
+        """Producer error must surface U+XXXX hex + Unicode name so
+        the fixture author can grep their source for the bad codepoint
+        without binary-eyeballing the bytes."""
+        try:
+            self._two_node_topo(verdict_label_true="АPPROVE")
+        except ValidationError as e:
+            msg = str(e)
+            assert "U+0410" in msg
+            assert "CYRILLIC" in msg.upper()
+            # Remediation hint must point at the canonical labels.
+            assert "APPROVE" in msg or "DENY" in msg
+        else:
+            pytest.fail("expected ValidationError on Cyrillic А")
+
+    def test_accepts_canonical_labels(self):
+        """Defaults APPROVE/DENY survive the allowlist; non-default
+        canonical pairs (ESCALATE/DEFER, URGENT/ROUTINE) survive too.
+        Pinned so a future allowlist tightening doesn't accidentally
+        break the documented BLUEPRINT §5b examples."""
+        for true_label, false_label in (
+            ("APPROVE", "DENY"),
+            ("ESCALATE", "DEFER"),
+            ("URGENT", "ROUTINE"),
+        ):
+            t = self._two_node_topo(
+                verdict_label_true=true_label,
+                verdict_label_false=false_label,
+            )
+            assert t.verdict_label_true == true_label
+            assert t.verdict_label_false == false_label
+
+    def test_accepts_digits_and_punctuation_in_allowlist(self):
+        """The allowlist intentionally includes 0-9, hyphen, underscore,
+        space, slash for compliance-style labels like ``"ESCALATE-L2"``,
+        ``"MANUAL REVIEW"``, ``"REVIEW_QUEUE"``. Verify each survives."""
+        for label in (
+            "ESCALATE-L2",
+            "PEND REVIEW",  # 11 chars, space, mixed
+            "REVIEW_QUEUE",  # 12 chars (cap), underscore
+            "ACTION/HOLD",  # forward slash
+            "DENY 1A",  # digit + space
+        ):
+            t = self._two_node_topo(
+                verdict_label_true=label, verdict_label_false="DEFER"
+            )
+            assert t.verdict_label_true == label
+
+    def test_consumer_helper_returns_empty_on_homoglyph(self):
+        """Consumer-side mirror: where producer RAISES, the consumer
+        normalize returns "" so the caller (inspect/publish) falls back
+        to the default pair. Tested separately because the producer
+        path is the strict gate; the consumer path is the lenient
+        defense-in-depth that ships defaults when the manifest is
+        tampered post-orchestrator."""
+        from topofuzz._verdict_labels import _normalize_verdict_label_for_consumer
+
+        for tampered in (
+            "АPPROVE",  # Cyrillic А
+            "APㅤPROVE",  # HANGUL FILLER
+            "ΑPPROVE",  # Greek Alpha
+            "ᎪPPROVE",  # Cherokee A
+            "APPROV\U0001F44D",  # thumbs-up emoji
+        ):
+            result = _normalize_verdict_label_for_consumer(tampered)
+            assert result == "", (
+                f"consumer normalize must drop tampered {tampered!r} "
+                f"to empty (caller falls back to default); got {result!r}"
+            )
+
+    def test_consumer_helper_preserves_clean_labels(self):
+        """Round-trip property: clean ASCII labels survive the consumer
+        normalize unchanged (case fold + strip apply). Pinned so a
+        future allowlist tightening doesn't accidentally drop legit
+        labels en route to the CEO PDF."""
+        from topofuzz._verdict_labels import _normalize_verdict_label_for_consumer
+
+        cases = [
+            ("APPROVE", "APPROVE"),
+            ("approve", "APPROVE"),  # case fold
+            ("  APPROVE  ", "APPROVE"),  # strip
+            ("ESCALATE-L2", "ESCALATE-L2"),
+            ("MANUAL REVIEW", "MANUAL REVIEW"),
+        ]
+        for raw, expected in cases:
+            assert _normalize_verdict_label_for_consumer(raw) == expected
+
+
 class TestTdsVersionDerivation:
     """Step 20a/F6 follow-up (L849): ``tds_version`` is auto-derived in
     the after-validator — "0.5.0" iff v0.5-shape (no verdict_node,

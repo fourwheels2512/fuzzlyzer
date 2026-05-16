@@ -1490,6 +1490,81 @@ def test_ceo_card_collapses_fullwidth_latin_in_manifest_labels(tmp_path):
     assert "Ｄ" not in combined
 
 
+def test_ceo_card_falls_back_to_defaults_on_hangul_filler_label(tmp_path):
+    """L949 closed 2026-05-16. Tampered manifest with U+3164 HANGUL
+    FILLER (Lo, invisible) inside the label survives NFKC + C/M filter
+    (Lo is in category L, not C/M) and would have rendered as the eye
+    sees "APPROVE" on the CEO PDF while mismatching ASCII grep on the
+    manifest bytes. Positive ASCII allowlist drops both labels to
+    empty → pair-level fallback → buyer sees the safe defaults."""
+    from topofuzz.publish import (
+        _build_ceo_card_context, _load_manifest, load_publish_metadata,
+    )
+    run_dir = _make_run_with_report_json(tmp_path)
+    manifest_path = run_dir / "manifest.json"
+    m = json.loads(manifest_path.read_text())
+    m["verdict_label_true"] = "APㅤPROVE"  # U+3164 HANGUL FILLER
+    m["verdict_label_false"] = "DEFER"
+    manifest_path.write_text(json.dumps(m), encoding="utf-8")
+    metadata = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    ctx = _build_ceo_card_context(
+        metadata=metadata, manifest=manifest,
+        verdict_flip_rate=report["headline"]["verdict_flip_rate"],
+        wilson_addenda=report["wilson_addenda"],
+        target_company=None,
+        run_dir=run_dir, threshold=0.5,
+    )
+    fc = ctx["flip_card"]
+    assert fc is not None
+    # Pair-level fallback: BOTH labels resolve to defaults, NOT
+    # half-custom (custom-false + default-true).
+    assert {fc["canonical_verdict"], fc["variant_verdict"]} == {
+        "APPROVE", "DENY"
+    }
+    combined = fc["canonical_verdict"] + fc["variant_verdict"]
+    assert "ㅤ" not in combined
+    assert "DEFER" not in combined
+
+
+def test_ceo_card_falls_back_to_defaults_on_cyrillic_homoglyph_label(tmp_path):
+    """L949 closed 2026-05-16. The canonical procurement-integrity
+    attack: tampered manifest with U+0410 CYRILLIC А (Lu) renders
+    pixel-identical to ASCII Latin A on every full-Unicode font.
+    ``"АPPROVE"`` (Cyrillic) on the CEO PDF text layer reads identical
+    to ``"APPROVE"`` (ASCII) but mismatches the buyer's deterministic
+    grep. Allowlist drops; defaults render."""
+    from topofuzz.publish import (
+        _build_ceo_card_context, _load_manifest, load_publish_metadata,
+    )
+    run_dir = _make_run_with_report_json(tmp_path)
+    manifest_path = run_dir / "manifest.json"
+    m = json.loads(manifest_path.read_text())
+    m["verdict_label_true"] = "АPPROVE"  # leading U+0410, not U+0041
+    m["verdict_label_false"] = "DEFER"
+    manifest_path.write_text(json.dumps(m), encoding="utf-8")
+    metadata = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    ctx = _build_ceo_card_context(
+        metadata=metadata, manifest=manifest,
+        verdict_flip_rate=report["headline"]["verdict_flip_rate"],
+        wilson_addenda=report["wilson_addenda"],
+        target_company=None,
+        run_dir=run_dir, threshold=0.5,
+    )
+    fc = ctx["flip_card"]
+    assert fc is not None
+    assert {fc["canonical_verdict"], fc["variant_verdict"]} == {
+        "APPROVE", "DENY"
+    }
+    # The Cyrillic byte must not leak into the rendered fields.
+    combined = fc["canonical_verdict"] + fc["variant_verdict"]
+    assert "А" not in combined
+    assert "DEFER" not in combined
+
+
 def test_ceo_card_rejects_post_normalize_collision_via_variation_selector(
     tmp_path,
 ):

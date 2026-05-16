@@ -1370,6 +1370,66 @@ def test_reconstruct_variants_rejects_zwsp_label(tmp_path):
         assert "​" not in v.verdict_label_true
 
 
+def test_reconstruct_variants_rejects_cyrillic_homoglyph_label(tmp_path):
+    """L949 closed 2026-05-16. Tampered manifest with U+0410 CYRILLIC А
+    (Lu, pixel-identical Latin-lookalike) is the canonical procurement-
+    integrity attack on the CEO PDF surface. confirm-pass reconstructs
+    the topology through ``Topology(...)`` (not ``model_copy(update=...)``)
+    so the IR's L949 allowlist fires and the reconstruction raises
+    ``ValidationError`` rather than smuggling the homoglyph past the
+    buyer's reproduction check.
+
+    Buyer-side defense flow: a competitor's tampered bundle that ships
+    ``"АPPROVE"`` (Cyrillic) in the manifest looks valid on inspect /
+    publish (those consumers DROP to default), but a buyer running
+    ``topofuzz confirm`` to validate the bundle gets a hard failure
+    pointing at the exact codepoint."""
+    pytest.importorskip("langgraph")
+    from topofuzz.confirm import _reconstruct_variants, ConfirmError
+
+    fixture = tmp_path / "fx_cyrillic.py"
+    fixture.write_text(_FIXTURE_SRC, encoding="utf-8")
+    manifest = {
+        "run_id": "cyrillic-homoglyph-tamper",
+        "variant_canonical_hashes": ["a" * 64],
+        "verdict_label_true": "АPPROVE",  # leading U+0410 not U+0041
+        "verdict_label_false": "DEFER",
+        "cli_args": {
+            "fixture": f"{fixture}:build_graph",
+            "rng_seed": 0,
+            "variants": 4,
+        },
+    }
+    with pytest.raises(ConfirmError, match="ASCII printable"):
+        _reconstruct_variants(manifest)
+
+
+def test_reconstruct_variants_rejects_hangul_filler_label(tmp_path):
+    """L949 closed 2026-05-16. Companion to the Cyrillic test:
+    U+3164 HANGUL FILLER (Lo, invisible) is the second homoglyph
+    attack class. NFKC-stable, renders zero-width in most fonts. The
+    IR validator's ASCII allowlist catches it at the Topology(...)
+    re-construction boundary."""
+    pytest.importorskip("langgraph")
+    from topofuzz.confirm import _reconstruct_variants, ConfirmError
+
+    fixture = tmp_path / "fx_hangul.py"
+    fixture.write_text(_FIXTURE_SRC, encoding="utf-8")
+    manifest = {
+        "run_id": "hangul-filler-tamper",
+        "variant_canonical_hashes": ["a" * 64],
+        "verdict_label_true": "APㅤPROVE",  # U+3164 between AP and PROVE
+        "verdict_label_false": "DEFER",
+        "cli_args": {
+            "fixture": f"{fixture}:build_graph",
+            "rng_seed": 0,
+            "variants": 4,
+        },
+    }
+    with pytest.raises(ConfirmError, match="ASCII printable"):
+        _reconstruct_variants(manifest)
+
+
 def test_reconstruct_variants_normalizes_fullwidth_label(tmp_path):
     """L910 dual-audit fold (RT pass-1 N4): fullwidth Latin in the
     manifest's label must NFKC-collapse to ASCII via the re-construction

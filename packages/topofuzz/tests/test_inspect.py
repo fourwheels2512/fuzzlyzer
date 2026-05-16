@@ -1426,3 +1426,51 @@ def test_inspect_falls_back_when_zwsp_only_label_creates_half_custom_pair(
         and "after NFKC" in rec.message
         for rec in caplog.records
     )
+
+
+def test_inspect_falls_back_to_defaults_on_hangul_filler_label(tmp_path):
+    """L949 closed 2026-05-16. Tampered manifest with U+3164 HANGUL
+    FILLER (Lo, invisible) inside the label survives NFKC + C/M filter
+    (Lo is in category L, not C/M) and would have rendered as the eye
+    sees "APPROVE" on the inspect HTML while mismatching ASCII grep
+    on the manifest bytes. Positive ASCII allowlist drops both labels
+    to empty → pair-level fallback → buyer sees the safe defaults.
+
+    Why fall back to BOTH defaults: dropping ONLY the tampered label
+    would yield a half-custom pair (custom-false + default-true) which
+    the buyer would have to manually reconcile. Symmetric fallback
+    matches the established XOR-pair invariant."""
+    run_dir = _make_run(tmp_path)
+    _patch_manifest_labels(
+        run_dir,
+        label_true="APㅤPROVE",  # U+3164 HANGUL FILLER between AP and PROVE
+        label_false="DEFER",
+    )
+    html, _eid = build_inspect_html(run_dir)
+    assert ">APPROVE<" in html
+    assert ">DENY<" in html
+    # Buyer must NOT see the tampered string anywhere in the HTML.
+    assert "ㅤ" not in html
+    # The non-tampered partner label DEFER also gets discarded
+    # (pair-level fallback: half-custom is worse than full-default).
+    assert ">DEFER<" not in html
+
+
+def test_inspect_falls_back_to_defaults_on_cyrillic_homoglyph_label(tmp_path):
+    """L949 closed 2026-05-16. Tampered manifest with U+0410 CYRILLIC
+    А (Lu, pixel-identical Latin-lookalike) is the canonical
+    procurement-integrity attack: ``"АPPROVE"`` reads as approval to
+    the buyer's eye AND to a fuzzy-match auditor, but breaks any
+    deterministic ASCII grep on the manifest. Allowlist rejects."""
+    run_dir = _make_run(tmp_path)
+    _patch_manifest_labels(
+        run_dir,
+        label_true="АPPROVE",  # leading char is U+0410 not U+0041
+        label_false="DEFER",
+    )
+    html, _eid = build_inspect_html(run_dir)
+    assert ">APPROVE<" in html
+    assert ">DENY<" in html
+    # The Cyrillic А byte must not leak into the HTML.
+    assert "А" not in html
+    assert ">DEFER<" not in html

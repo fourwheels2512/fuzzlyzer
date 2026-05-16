@@ -222,9 +222,15 @@ class Topology(BaseModel):
         #     bytewise differs, breaking the "v0.5 byte-identical hash"
         #     invariant and bypassing the "differs from default → persist
         #     labels in manifest" gate.
-        # AFTER the filter the string is restricted to L/N/P/S/Z
-        # (letters/numbers/punctuation/symbols/separators) — printable
-        # only, no homoglyph or zero-width tricks.
+        # AFTER the filter the string is L/N/P/S/Z (letters/numbers/
+        # punctuation/symbols/separators). The L949 hardening below
+        # additionally restricts the result to a positive ASCII
+        # allowlist so Lo invisibles (post-NFKC U+1160 HANGUL JUNGSEONG
+        # FILLER — what U+3164 HANGUL FILLER decomposes to) and Lu/Ll
+        # Latin-lookalikes (U+0410 CYRILLIC CAPITAL LETTER A, U+0391
+        # GREEK CAPITAL LETTER ALPHA, U+13AA CHEROKEE LETTER GO — all
+        # NFKC-self-stable and pixel-identical to Latin A in full-
+        # Unicode fonts) cannot survive into the manifest.
         normalized_nfkc = unicodedata.normalize("NFKC", v)
         normalized = "".join(
             ch
@@ -241,6 +247,31 @@ class Topology(BaseModel):
                 f"verdict label must be ≤12 chars after normalize; got "
                 f"{len(normalized)} chars in {normalized!r}. Side-by-side "
                 "flip card overflows above this limit."
+            )
+        # L949 closed 2026-05-16. Positive ASCII allowlist:
+        # ``LABEL_ASCII_ALLOWLIST`` is the single source of truth shared
+        # with ``_verdict_labels._normalize_verdict_label_for_consumer``.
+        # Producer RAISES on bad input (authoring-time bug — developer
+        # fixes their fixture now); the consumer-side mirror DROPS the
+        # label to empty (render-time tamper — buyer sees safer default).
+        from topofuzz._verdict_labels import LABEL_ASCII_ALLOWLIST
+        bad = [ch for ch in normalized if ch not in LABEL_ASCII_ALLOWLIST]
+        if bad:
+            offending = ", ".join(
+                f"U+{ord(ch):04X} ({unicodedata.name(ch, 'UNNAMED')!r})"
+                for ch in dict.fromkeys(bad)  # de-dupe, preserve order
+            )
+            raise ValueError(
+                f"verdict label must be ASCII printable after normalize "
+                f"(allowlist: A-Z, 0-9, space, dash, underscore, slash). "
+                f"Got {normalized!r} with disallowed characters: "
+                f"{offending}. Homoglyph defense: U+0410 Cyrillic А, "
+                f"U+3164 HANGUL FILLER, U+13AA Cherokee A and similar "
+                f"render pixel-identical to ASCII letters in some fonts "
+                f"but mismatch buyer-side ASCII grep on the manifest. "
+                f"Use the canonical English label (APPROVE / DENY / "
+                f"ESCALATE / DEFER / URGENT / ROUTINE / PEND REVIEW — "
+                f"all ≤12 chars). i18n labels are a v0.7 BACKLOG item."
             )
         return normalized
 
