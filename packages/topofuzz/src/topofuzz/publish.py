@@ -378,6 +378,719 @@ def build_publish_pdf(
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# F6 — CEO card PDF (1-page cold-email-shaped derivative of F5).
+# ---------------------------------------------------------------------------
+
+
+# Cap on excerpt length so a verbose agent does not blow past the
+# single-page budget. Tuned visually: ~520 chars renders to ~10 lines of
+# the serif body font at 10pt and still leaves room for the eval prompt.
+_CEO_CARD_VERDICT_EXCERPT_LIMIT = 520
+_CEO_CARD_PROMPT_EXCERPT_LIMIT = 320
+
+
+def build_ceo_card_pdf(
+    run_dir: Path,
+    *,
+    out_path: Path,
+    target_company: str | None = None,
+    threshold: float = DEFAULT_VERDICT_THRESHOLD,
+) -> Path:
+    """Render a single-page cold-email-shaped CEO card to ``out_path``.
+
+    A condensed derivative of the F5 publish PDF (BACKLOG F6 entry).
+    Surfaces the verdict-flip headline + Wilson 95 percent CI + one
+    concrete flipped verdict + the attestation breadcrumb on a single
+    Letter page. Designed for an opening cold-email attachment that
+    reads on a phone; the full 19-page F5 is the linked follow-up.
+
+    ``target_company`` substitutes into the "what this means for $TARGET"
+    paragraph. When ``None`` we render a generic "your stack" copy. The
+    PDF metadata does NOT bake the company name (deliverability beats
+    recipient-specific personalisation here per the F6 spec).
+
+    Reuses :func:`load_publish_metadata`, :func:`select_top_flipping_evals`,
+    :func:`_format_footer`, and :func:`_render_html_pages_to_pdfs` so the
+    attestation footer / safe-eid guard / Chromium sandbox / atomic write
+    contracts are inherited byte-identically from F5.
+
+    Raises :class:`PublishError` on any failure. The caller's CLI prints
+    the message and exits non-zero.
+    """
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        raise PublishError(
+            f"run_dir is not a directory: {run_dir}"
+        )
+    out_path = Path(out_path)
+    if out_path.is_dir():
+        raise PublishError(
+            f"out_path is an existing directory: {out_path}"
+        )
+    if target_company is not None:
+        # Length bound prevents a malicious or sloppy operator from
+        # injecting a multi-paragraph "company name" that breaks the
+        # single-page layout (and prevents pathological wrapping in
+        # PDF metadata if we ever decide to set it later).
+        if not isinstance(target_company, str):
+            raise PublishError(
+                f"target_company must be str, got "
+                f"{type(target_company).__name__}"
+            )
+        if not target_company.strip():
+            raise PublishError("target_company must be non-empty / non-whitespace")
+        # F6 pass-1 RT M3: NFC-normalise before the length cap so a
+        # decomposed-form ZWJ/combining-mark/fullwidth-digit input cannot
+        # bypass the visual-width budget. Then reject bidi-override
+        # codepoints (‪-‮, ⁦-⁩) and zero-width
+        # joiners (​-‏) outright — they survive autoescape
+        # but cosmetically poison the rendered PDF (e.g. RIGHT-TO-LEFT
+        # OVERRIDE reverses subsequent text). C0/C1 controls are
+        # blocked because they break Chromium text shaping in
+        # undefined ways.
+        import unicodedata
+        target_company = unicodedata.normalize("NFC", target_company)
+        for ch in target_company:
+            cp = ord(ch)
+            if cp < 0x20 and ch not in ("\t", "\n"):
+                raise PublishError(
+                    "target_company contains a C0 control character "
+                    f"(U+{cp:04X}); reject."
+                )
+            if 0x7f <= cp <= 0x9f:
+                raise PublishError(
+                    "target_company contains a C1 control character "
+                    f"(U+{cp:04X}); reject."
+                )
+            if (
+                # zero-width + bidi-format
+                0x200b <= cp <= 0x200f
+                or 0x202a <= cp <= 0x202e
+                or 0x2066 <= cp <= 0x2069
+                # soft hyphen (invisible word break)
+                or cp == 0x00ad
+                # variation selectors (font-shaping bypass)
+                or 0xfe00 <= cp <= 0xfe0f
+                or 0xe0100 <= cp <= 0xe01ef
+                # tag chars (Unicode tag attack payload-smuggling)
+                or 0xe0000 <= cp <= 0xe007f
+                # mathematical alphanumeric symbols (homoglyph
+                # bypassing the visual-width budget; NFC does NOT
+                # fold these — they're distinct codepoints)
+                or 0x1d400 <= cp <= 0x1d7ff
+            ):
+                raise PublishError(
+                    "target_company contains an invisible / formatting "
+                    f"/ homoglyph codepoint (U+{cp:04X}); reject — "
+                    "would cosmetically poison the rendered PDF or "
+                    "bypass the visual-width budget."
+                )
+        if len(target_company) > 80:
+            raise PublishError(
+                f"target_company exceeds 80 chars ({len(target_company)}); "
+                "trim before render."
+            )
+
+    metadata = load_publish_metadata(run_dir)
+    footer_text = _format_footer(metadata)
+
+    # Pull live numbers from the source-of-truth files: report.json for
+    # the headline + Wilson CI, manifest.json for variant/eval counts +
+    # cost. report.html is intentionally NOT re-rendered here (the CEO
+    # card is a standalone artifact; if the operator wants the full PDF
+    # too they run `topofuzz publish` separately).
+    manifest = _load_manifest(run_dir)
+    report_json_path = run_dir / "report.json"
+    if not report_json_path.is_file():
+        raise PublishError(
+            "report.json is missing in run_dir — run "
+            "`topofuzz publish` once (or `topofuzz report`) so the "
+            "headline metric is available."
+        )
+    try:
+        report_payload = json.loads(report_json_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise PublishError(f"could not read report.json: {e}") from e
+    if not isinstance(report_payload, dict):
+        raise PublishError(
+            "report.json root is not an object — refuse to render."
+        )
+
+    headline = (
+        report_payload.get("headline")
+        if isinstance(report_payload.get("headline"), dict)
+        else {}
+    )
+    vfr = headline.get("verdict_flip_rate") if isinstance(headline, dict) else None
+    wilson = report_payload.get("wilson_addenda") if isinstance(report_payload, dict) else None
+
+    ctx = _build_ceo_card_context(
+        metadata=metadata,
+        manifest=manifest,
+        verdict_flip_rate=vfr if isinstance(vfr, dict) else None,
+        wilson_addenda=wilson if isinstance(wilson, dict) else None,
+        target_company=target_company,
+        run_dir=run_dir,
+        threshold=threshold,
+    )
+
+    html = _render_ceo_card_html(ctx)
+    # F6 pass-1 CR N2 + pass-2 CR I1: sweep stale debris on entry. A
+    # prior Chromium handle-hold (Windows) can leave the tempfile
+    # unlinked; without the sweep an automation loop accumulates one
+    # orphan per failed-unlink. The prefix is narrowed to
+    # ``ceo_card_tmp_*`` (not ``ceo_card_*``) so a legitimate operator
+    # file like ``topofuzz inspect --out ceo_card_demo.html`` doesn't
+    # get silently unlinked.
+    for stale in run_dir.glob("ceo_card_tmp_*.html"):
+        try:
+            stale.unlink()
+        except OSError:
+            _log.debug("publish: could not sweep stale ceo card %s", stale)
+    # Render the single HTML page through the shared Chromium path so
+    # the page-footer breadcrumb is identical to F5's. We write a
+    # transient .html into run_dir so Playwright's file:// resolution
+    # matches the F5 flow (some templates rely on relative asset paths,
+    # though ceo_card.html.j2 deliberately inlines everything).
+    with tempfile.NamedTemporaryFile(
+        prefix="ceo_card_tmp_",
+        suffix=".html",
+        dir=run_dir,
+        delete=False,
+        mode="w",
+        encoding="utf-8",
+    ) as fh:
+        fh.write(html)
+        tmp_html_path = Path(fh.name)
+    try:
+        pdf_bytes_list = _render_html_pages_to_pdfs([tmp_html_path], footer_text)
+    finally:
+        try:
+            tmp_html_path.unlink()
+        except OSError:
+            # The Chromium renderer may still hold an open handle for a
+            # tick on Windows; leave the temp file rather than crash the
+            # publish call. Next invocation's sweep will clean it up.
+            _log.warning(
+                "publish: could not unlink ceo_card scratch file %s",
+                tmp_html_path,
+            )
+    if len(pdf_bytes_list) != 1:
+        raise PublishError(
+            f"ceo card render produced {len(pdf_bytes_list)} PDFs; "
+            "expected exactly 1 page."
+        )
+    # F6 pass-1 CR M2: enforce the "1-2 page" claim. The HTML-file count
+    # above only catches a 0/2-file split; an HTML rendered to 3 paper
+    # pages still slips through. Count via pypdf before atomic-writing.
+    pdf_bytes = pdf_bytes_list[0]
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        n_pages = len(reader.pages)
+    except ImportError:
+        # pypdf is part of the [pdf] extra; if it's missing here we
+        # already failed during F5's _render_html_pages_to_pdfs import.
+        # Defensive only.
+        n_pages = 1
+    except Exception as e:  # noqa: BLE001 — refuse the artifact, not crash
+        raise PublishError(
+            f"could not validate ceo card page count: {e}"
+        ) from e
+    if n_pages > 2:
+        raise PublishError(
+            f"ceo card rendered to {n_pages} pages; the F6 spec is "
+            "1-2 pages. Inspect the source HTML for runaway content "
+            "(usually a long topology_name or eval prompt)."
+        )
+    _atomic_write_bytes(out_path, pdf_bytes)
+    return out_path
+
+
+def _build_ceo_card_context(
+    *,
+    metadata: dict[str, str],
+    manifest: dict[str, Any],
+    verdict_flip_rate: dict[str, Any] | None,
+    wilson_addenda: dict[str, Any] | None,
+    target_company: str | None,
+    run_dir: Path,
+    threshold: float,
+) -> dict[str, Any]:
+    """Assemble the Jinja context for ceo_card.html.j2.
+
+    Pulled out for testability — the template render is byte-deterministic
+    given this dict, so tests can pin headline text / CI strings without
+    spinning up Chromium.
+    """
+    topology_name = str(manifest.get("topology_name") or "(unknown)")
+    n_variants = manifest.get("n_variants")
+    n_evals = manifest.get("n_evals")
+    cost_actual = manifest.get("cost_actual_usd")
+
+    flip_rate, n_pairs, n_flips = _extract_flip_counts(verdict_flip_rate)
+    wilson_lo, wilson_hi = _extract_wilson_bounds(wilson_addenda, flip_rate, n_pairs, n_flips)
+
+    if flip_rate is not None and n_pairs and n_pairs > 0 and n_flips and n_flips > 0:
+        flip_pct_str = f"{flip_rate * 100:.0f}%"
+        flip_label = (
+            f"of variant re-orderings flipped the verdict on this "
+            f"pipeline ({n_flips}/{n_pairs} pairs)"
+        )
+        if wilson_lo is not None and wilson_hi is not None:
+            ci_str = (
+                f"Wilson 95% CI [{wilson_lo * 100:.1f}%, "
+                f"{wilson_hi * 100:.1f}%] — distinguishable from "
+                f"zero at p<0.05."
+            )
+        else:
+            ci_str = (
+                f"Headline computed from {n_pairs} variant pairs. "
+                "Wilson CI unavailable in this run."
+            )
+    else:
+        flip_pct_str = ""
+        flip_label = ""
+        ci_str = ""
+
+    target_phrase = target_company.strip() if target_company else None
+    if target_phrase:
+        what_para = _format_what_paragraph(
+            target_phrase, topology_name, flip_rate
+        )
+        cta_line = (
+            f"Want this run reproduced on {target_phrase}'s own "
+            "agent topology? Reply to this email — repro is free."
+        )
+    else:
+        what_para = _format_what_paragraph(
+            "your stack", topology_name, flip_rate
+        )
+        cta_line = (
+            "Want this run reproduced on your own agent topology? "
+            "Reply to this email — repro is free."
+        )
+
+    headline_title, headline_lede = _format_headline(topology_name, flip_rate, n_flips)
+
+    flip_card = _build_flip_card(run_dir, manifest, threshold)
+
+    cost_str = (
+        f"${float(cost_actual):.2f}"
+        if isinstance(cost_actual, (int, float)) and not isinstance(cost_actual, bool)
+        else "—"
+    )
+    n_pairs_str = str(n_pairs) if n_pairs else "0"
+
+    def _safe_int(v: Any) -> int | str:
+        # F6 pass-1 CR N1: bool is a subclass of int; reject so the
+        # template never renders True/False as a "count."
+        if isinstance(v, bool) or not isinstance(v, int):
+            return "—"
+        return v
+
+    return {
+        "headline_title": headline_title,
+        "headline_lede": headline_lede,
+        "flip_pct_str": flip_pct_str,
+        "flip_label": flip_label,
+        "ci_str": ci_str,
+        "what_paragraph": what_para,
+        "cta_line": cta_line,
+        "topology_name": topology_name,
+        "n_variants": _safe_int(n_variants),
+        "n_evals": _safe_int(n_evals),
+        "cost_str": cost_str,
+        "n_pairs_str": n_pairs_str,
+        "flip_card": flip_card,
+        "run_id": metadata.get("run_id") or "(unknown)",
+        "tds_version": metadata.get("tds_version") or "(unknown)",
+        "signed_at": metadata.get("signed_at") or "(unsigned)",
+    }
+
+
+def _extract_flip_counts(
+    verdict_flip_rate: dict[str, Any] | None,
+) -> tuple[float | None, int | None, int | None]:
+    """Pull (point, n_pairs, n_flips) from headline.verdict_flip_rate.
+
+    Defensive: handles missing keys, non-numeric values, and the bool-as-
+    int trap. Returns ``(None, None, None)`` on any unusable shape so
+    the template's "stable run" branch fires.
+    """
+    if not isinstance(verdict_flip_rate, dict):
+        return None, None, None
+    point_raw = verdict_flip_rate.get("point")
+    n_pairs_raw = verdict_flip_rate.get("n_pairs")
+    n_flips_raw = verdict_flip_rate.get("n_flips")
+
+    def _to_float(v: Any) -> float | None:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        if v != v:  # NaN
+            return None
+        return float(v)
+
+    def _to_int(v: Any) -> int | None:
+        if isinstance(v, bool) or not isinstance(v, int):
+            return None
+        return v
+
+    return _to_float(point_raw), _to_int(n_pairs_raw), _to_int(n_flips_raw)
+
+
+def _extract_wilson_bounds(
+    wilson_addenda: dict[str, Any] | None,
+    flip_rate: float | None,
+    n_pairs: int | None,
+    n_flips: int | None,
+) -> tuple[float | None, float | None]:
+    """Pull Wilson 95% CI lo/hi.
+
+    Prefers the persisted ``wilson_addenda`` block (computed by report.py
+    at render time). Falls back to recomputing from the counts when the
+    block is absent (e.g. a v0.5 run.sqlite that predates Wilson).
+    """
+    if isinstance(wilson_addenda, dict):
+        lo = wilson_addenda.get("ci_lower")
+        hi = wilson_addenda.get("ci_upper")
+        if (
+            isinstance(lo, (int, float))
+            and not isinstance(lo, bool)
+            and isinstance(hi, (int, float))
+            and not isinstance(hi, bool)
+        ):
+            return float(lo), float(hi)
+    # Fallback: recompute if we have the counts.
+    if (
+        flip_rate is not None
+        and n_pairs is not None
+        and n_flips is not None
+        and n_pairs > 0
+        and 0 <= n_flips <= n_pairs
+    ):
+        try:
+            from topofuzz.metrics import wilson_score_interval
+
+            lo, hi = wilson_score_interval(n_flips, n_pairs, conf=0.95)
+            if lo is not None and hi is not None:
+                return float(lo), float(hi)
+        except Exception:  # noqa: BLE001 — fallback path; refuse to crash
+            pass
+    return None, None
+
+
+def _format_headline(
+    topology_name: str, flip_rate: float | None, n_flips: int | None
+) -> tuple[str, str]:
+    """Headline + lede tuned to the run shape."""
+    pretty_name = topology_name.replace("_", " ").replace("-", " ")
+    if flip_rate is not None and n_flips and n_flips > 0:
+        title = f"This {pretty_name} pipeline flips its verdict under re-ordering."
+        lede = (
+            "Same model, same prompts, same eval. Reorder the agents and "
+            "the answer changes — measured under a jury-of-3, not a "
+            "single judge."
+        )
+    else:
+        title = f"This {pretty_name} pipeline held its verdict."
+        lede = (
+            "Re-ordering the agents did not flip the answer across the "
+            "tested variants — a publishable claim, not a luck of the draw."
+        )
+    return title, lede
+
+
+def _format_what_paragraph(
+    target: str, topology_name: str, flip_rate: float | None
+) -> str:
+    """The "what this means for $TARGET" body paragraph.
+
+    Template per F6 spec — handcrafted (no LLM, no per-target brief),
+    references the topology shape so the reader recognises themselves.
+    """
+    pretty_name = topology_name.replace("_", " ").replace("-", " ")
+    if flip_rate is not None and flip_rate > 0:
+        return (
+            f"If {target} runs a multi-agent pipeline that looks like "
+            f"this {pretty_name} shape — intake then risk then policy "
+            "then a decision agent, or any analogous chain — the "
+            "auditable claim 'the model decided X' is conditional on an "
+            "implementation detail (the agent order) that nobody "
+            "documents. Compliance reviewers will not catch this. "
+            "topofuzz does."
+        )
+    return (
+        f"If {target} runs a multi-agent pipeline that looks like this "
+        f"{pretty_name} shape, this run is the kind of stability claim "
+        "you can put in a SOC 2 or model-risk-management report. "
+        "topofuzz produced the bundle; the attestation footer below "
+        "lets any reviewer re-run the test bit-for-bit."
+    )
+
+
+def _build_flip_card(
+    run_dir: Path, manifest: dict[str, Any], threshold: float
+) -> dict[str, Any] | None:
+    """Pick the single most-flipped eval and assemble a side-by-side card.
+
+    Re-uses :func:`select_top_flipping_evals` so the eid safety check
+    runs. Returns ``None`` on any data-shape failure (no flips, missing
+    columns, malformed JSON) — the template silently omits the section,
+    matching the "stable run" branch of the headline.
+    """
+    try:
+        top = select_top_flipping_evals(
+            run_dir, max_flips=1, threshold=threshold
+        )
+    except PublishError:
+        return None
+    if not top:
+        return None
+    eid = top[0]
+    sqlite_path = run_dir / "run.sqlite"
+    if not sqlite_path.is_file():
+        return None
+    hashes = manifest.get("variant_canonical_hashes")
+    if not isinstance(hashes, list) or not hashes:
+        return None
+    canonical_hash = hashes[0]
+    hash_to_idx = {h: i for i, h in enumerate(hashes)}
+    con = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+    try:
+        # Eval prompt for the excerpt.
+        try:
+            row = con.execute(
+                "SELECT input FROM evals WHERE id = ?", (eid,)
+            ).fetchone()
+            eval_prompt = row[0] if row and isinstance(row[0], str) else ""
+        except sqlite3.DatabaseError:
+            eval_prompt = ""
+        # All rows for this eval, then pick canonical + first variant
+        # that flipped against it.
+        rows = list(
+            con.execute(
+                "SELECT variant_id, score_value, passed FROM judge_results "
+                "WHERE eval_id = ? ORDER BY variant_id",
+                (eid,),
+            )
+        )
+        canonical_verdict = None
+        flipping_vid = None
+        for vid, score, passed in rows:
+            idx = hash_to_idx.get(vid)
+            if idx is None:
+                continue
+            if passed is not None:
+                v = bool(passed)
+            elif score is not None:
+                v = bool(score >= threshold)
+            else:
+                continue
+            if idx == 0:
+                canonical_verdict = v
+            elif canonical_verdict is not None and v != canonical_verdict:
+                flipping_vid = vid
+                break
+        if canonical_verdict is None or flipping_vid is None:
+            return None
+        # Pull node_outputs_json for both variants for excerpt + ordering.
+        try:
+            canonical_row = con.execute(
+                "SELECT node_outputs_json FROM cells "
+                "WHERE eval_id = ? AND variant_id = ?",
+                (eid, canonical_hash),
+            ).fetchone()
+            variant_row = con.execute(
+                "SELECT node_outputs_json FROM cells "
+                "WHERE eval_id = ? AND variant_id = ?",
+                (eid, flipping_vid),
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            return None
+    finally:
+        con.close()
+
+    # F6 pass-1 RT M1: mirror runner._run_judge dispatch so the
+    # buyer-facing excerpt comes from the SAME node the judge scored.
+    # ``verdict_node`` (v0.6) wins; ``terminal`` (v0.5) is the fallback.
+    # F6 pass-2 RT m1: an empty / whitespace verdict_node in a
+    # malformed manifest silently fell back to outputs[-1] — surface
+    # the malformed manifest so the operator sees it instead of
+    # shipping a degraded card.
+    verdict_node_id = manifest.get("verdict_node")
+    if isinstance(verdict_node_id, str) and not verdict_node_id.strip():
+        _log.warning(
+            "publish: manifest.verdict_node is empty/whitespace — "
+            "treating as unset and falling back to terminal[0]."
+        )
+        verdict_node_id = None
+    if not isinstance(verdict_node_id, str):
+        verdict_node_id = None
+    terminal_nodes_raw = manifest.get("terminal_nodes")
+    if isinstance(terminal_nodes_raw, list) and all(
+        isinstance(t, str) and t.strip() for t in terminal_nodes_raw
+    ):
+        terminal_nodes = tuple(terminal_nodes_raw)
+    else:
+        terminal_nodes = None
+    canonical_excerpt, canonical_ordering = _excerpt_terminal_output(
+        canonical_row[0] if canonical_row else None,
+        verdict_node=verdict_node_id,
+        terminal_nodes=terminal_nodes,
+    )
+    variant_excerpt, variant_ordering = _excerpt_terminal_output(
+        variant_row[0] if variant_row else None,
+        verdict_node=verdict_node_id,
+        terminal_nodes=terminal_nodes,
+    )
+    if not canonical_excerpt or not variant_excerpt:
+        return None
+
+    # F6 pass-1 CR M1 + pass-2 RT B1: APPROVE/DENY is lending-domain-
+    # specific, but the ONLY gallery today (lending-4role) IS approval
+    # semantics — and there is no producer-side wiring yet for
+    # `verdict_label_true/false` (BACKLOG follow-up). Defaulting to
+    # neutral "VERDICT A/B" today regresses the working lending demo
+    # to fix a future hypothetical adversarial-relay demo. Keep
+    # APPROVE/DENY as the default and honor the manifest opt-in as the
+    # forward-compat path; flip the default to neutral once a
+    # non-lending gallery + producer-side IR field ship together.
+    label_true_raw = manifest.get("verdict_label_true")
+    label_false_raw = manifest.get("verdict_label_false")
+    label_true = (
+        label_true_raw.strip().upper()[:12]
+        if isinstance(label_true_raw, str) and label_true_raw.strip()
+        else "APPROVE"
+    )
+    label_false = (
+        label_false_raw.strip().upper()[:12]
+        if isinstance(label_false_raw, str) and label_false_raw.strip()
+        else "DENY"
+    )
+    # F6 pass-2 RT M1: same-after-normalize labels destroy the
+    # side-by-side story. Refuse the card if a manifest opt-in
+    # collapses the pair.
+    if label_true == label_false:
+        raise PublishError(
+            f"manifest verdict_label_true/false collide after "
+            f"normalization (both → {label_true!r}); refuse to render."
+        )
+    return {
+        "eval_prompt_excerpt": _truncate(
+            eval_prompt or "(eval prompt unavailable)",
+            _CEO_CARD_PROMPT_EXCERPT_LIMIT,
+        ),
+        "canonical_verdict": label_true if canonical_verdict else label_false,
+        "variant_verdict": label_false if canonical_verdict else label_true,
+        "canonical_class": "approve" if canonical_verdict else "deny",
+        "variant_class": "deny" if canonical_verdict else "approve",
+        "canonical_ordering": canonical_ordering,
+        "variant_ordering": variant_ordering,
+        "canonical_excerpt": _truncate(
+            canonical_excerpt, _CEO_CARD_VERDICT_EXCERPT_LIMIT
+        ),
+        "variant_excerpt": _truncate(
+            variant_excerpt, _CEO_CARD_VERDICT_EXCERPT_LIMIT
+        ),
+    }
+
+
+def _excerpt_terminal_output(
+    node_outputs_json: str | None,
+    *,
+    verdict_node: str | None = None,
+    terminal_nodes: tuple[str, ...] | None = None,
+) -> tuple[str, str]:
+    """Return ``(verdict_text, ordering_str)`` for a cell's node_outputs.
+
+    The CEO-card buyer reads the excerpt next to a verdict badge
+    (APPROVE / DENY) — so the excerpt MUST come from the same node the
+    judge scored, otherwise a buyer who later runs ``topofuzz inspect``
+    sees a different excerpt next to the same verdict and loses trust.
+    Mirrors :func:`topofuzz.runner._run_judge` dispatch (Step 20a):
+
+    1. ``verdict_node`` if supplied — the v0.6 first-class field.
+    2. The lex-first entry of ``terminal_nodes`` otherwise.
+    3. ``outputs[-1]`` as the last-resort fallback when neither is
+       provided (e.g. a v0.5 manifest predating the verdict_node-aware
+       publish path); a one-line ``_log.debug`` records the fallback so
+       an operator can grep for it.
+    """
+    if not isinstance(node_outputs_json, str) or not node_outputs_json:
+        return "", ""
+    try:
+        outputs = json.loads(node_outputs_json)
+    except ValueError:
+        return "", ""
+    if not isinstance(outputs, list) or not outputs:
+        return "", ""
+    ordering = " → ".join(
+        str(o.get("node_id") or "?")
+        for o in outputs
+        if isinstance(o, dict)
+    )
+    by_node = {
+        o.get("node_id"): o for o in outputs if isinstance(o, dict)
+    }
+    target_output: dict | None = None
+    if verdict_node is not None:
+        target_output = by_node.get(verdict_node)
+    elif terminal_nodes:
+        for tid in sorted(terminal_nodes):
+            cand = by_node.get(tid)
+            if isinstance(cand, dict):
+                target_output = cand
+                break
+    if target_output is None:
+        # Last-resort fallback for v0.5 manifests with neither field.
+        _log.debug(
+            "ceo card: falling back to outputs[-1] excerpt (no "
+            "verdict_node or terminal_nodes supplied; v0.5 manifest)"
+        )
+        cand = outputs[-1]
+        target_output = cand if isinstance(cand, dict) else None
+    if target_output is None:
+        return "", ordering
+    text = target_output.get("response_text")
+    if not isinstance(text, str):
+        return "", ordering
+    return text, ordering
+
+
+def _truncate(text: str, limit: int) -> str:
+    """Whitespace-collapse + ellipsis-truncate for layout safety."""
+    cleaned = " ".join(text.split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 1].rstrip() + "…"
+
+
+def _render_ceo_card_html(ctx: dict[str, Any]) -> str:
+    """Render ceo_card.html.j2 with the assembled context."""
+    try:
+        import jinja2
+    except ImportError as e:
+        raise PublishError(
+            "topofuzz publish --ceo-card requires the 'full' install "
+            "extra — jinja2 not found. Install with "
+            "`pip install topofuzz[full]`."
+        ) from e
+
+    template_dir = Path(__file__).parent / "templates"
+    # F6 pass-1 CR N3: pass `autoescape=True` explicitly rather than
+    # rely on filename-suffix matching — a future rename or a template
+    # that drops the .j2 suffix should not silently turn escaping off.
+    env = jinja2.Environment(
+        loader=jinja2.FileSystemLoader(str(template_dir)),
+        autoescape=True,
+        undefined=jinja2.StrictUndefined,
+    )
+    template = env.get_template("ceo_card.html.j2")
+    return template.render(**ctx)
+
+
 def _format_footer(metadata: dict[str, str]) -> str:
     """Footer string injected on every PDF page.
 

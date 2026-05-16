@@ -134,6 +134,47 @@ def test_orchestrator_writes_manifest(tmp_path):
     assert payload["n_eval_rows"] == 2
     assert payload["cli_args"]["flag"] == "value"
     assert payload["max_cost_usd"] is None
+    # Step 20a / F6: terminal_nodes always persisted; verdict_node
+    # only when the IR sets it (v0.5 fixtures omit the key entirely
+    # for byte-identical manifest shape).
+    assert payload["terminal_nodes"] == list(plan.topology.terminal)
+    assert "verdict_node" not in payload  # v0.5 fixture in _plan(...)
+
+
+def test_orchestrator_persists_verdict_node_when_set(tmp_path):
+    """Step 20a / F6 BLOCKER: orchestrator MUST write verdict_node into
+    manifest.json when the Topology sets it, otherwise downstream
+    publish (CEO card), inspect, and repro cannot mirror the runner's
+    verdict-node dispatch and silently fall back to outputs[-1]."""
+    from topofuzz.ir import Edge, LLMConfig, Node, Topology
+    plan = _plan(tmp_path, n_rows=1)
+    # Rebuild plan.topology with verdict_node set.
+    cfg = LLMConfig(model="m", temperature=0.0)
+    new_topo = Topology(
+        name=plan.topology.name,
+        nodes=tuple(
+            Node(id=n.id, role=n.role, kind=n.kind, llm_config=cfg, pinned=n.pinned)
+            for n in plan.topology.nodes
+        ),
+        edges=plan.topology.edges,
+        entrypoint=plan.topology.entrypoint,
+        terminal=plan.topology.terminal,
+        verdict_node=plan.topology.terminal[0],
+    )
+    plan = plan.__class__(
+        **{**plan.__dict__, "topology": new_topo}
+    ) if hasattr(plan, "__dict__") else plan
+    # Easier path: write a freshly-constructed plan via the existing
+    # builder. Re-use _plan(...)'s structure but with our new topology.
+    # If RunPlan is frozen, fall through to a direct write_manifest
+    # using the new topology bound to the same plan attributes.
+    import dataclasses
+    if dataclasses.is_dataclass(plan):
+        plan = dataclasses.replace(plan, topology=new_topo)
+    path = write_manifest(plan, cli_args={})
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["verdict_node"] == plan.topology.terminal[0]
+    assert payload["terminal_nodes"] == list(plan.topology.terminal)
 
 
 def test_orchestrator_writes_traces_jsonl(tmp_path):

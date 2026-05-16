@@ -1638,11 +1638,33 @@ def publish(
         ...,
         help="Run directory (contains manifest.json + run.sqlite).",
     ),
-    pdf: Path = typer.Option(
-        ...,
+    pdf: Path | None = typer.Option(
+        None,
         "--pdf",
         help=(
-            "Destination PDF path. Overwritten atomically if it exists."
+            "Destination PDF path for the full buyer-pitch PDF "
+            "(report.html + top flipping inspect pages). Overwritten "
+            "atomically if it exists. At least one of --pdf or "
+            "--ceo-card is required."
+        ),
+    ),
+    ceo_card: Path | None = typer.Option(
+        None,
+        "--ceo-card",
+        help=(
+            "Destination PDF path for the single-page CEO-card "
+            "derivative — cold-email-shaped, 1-2 pages, headline "
+            "metric + Wilson CI + one flipped verdict + attestation "
+            "footer. At least one of --pdf or --ceo-card is required."
+        ),
+    ),
+    target: str | None = typer.Option(
+        None,
+        "--target",
+        help=(
+            "Optional company name to substitute into the CEO-card's "
+            "'what this means for $TARGET' paragraph. Only meaningful "
+            "with --ceo-card. Max 80 chars."
         ),
     ),
     max_flips: int = typer.Option(
@@ -1659,7 +1681,7 @@ def publish(
         help=(
             "Include up to this many inspect_<eid>.html pages — the "
             "evals with the most variant-disagreements. Default 5; "
-            "hard limit 50."
+            "hard limit 50. Only meaningful with --pdf."
         ),
     ),
 ) -> None:
@@ -1671,15 +1693,20 @@ def publish(
     reader can re-attest the bundle by copy-pasting the footer's
     ``run_id`` into ``topofuzz verify``.
 
+    With ``--ceo-card OUT.pdf`` the command also (or instead) emits a
+    single-page CEO-card derivative — designed for the opening cold-
+    email attachment. The full F5 PDF is the follow-up audit link.
+
     Side effects: ``report.html`` and ``inspect_<eid>.html`` are
-    rendered into ``run_dir`` if absent.
+    rendered into ``run_dir`` if absent (only when ``--pdf`` is set).
 
     Exit codes:
 
-    * 0 — PDF written; path printed to stdout.
+    * 0 — PDF(s) written; paths printed to stdout (one per line).
     * 1 — publish failed (missing optional deps, missing files, render
       failure).
-    * 2 — usage error (run_dir is not a directory).
+    * 2 — usage error (run_dir is not a directory, or neither --pdf nor
+      --ceo-card supplied).
 
     Requires the ``[pdf]`` install extra::
 
@@ -1689,6 +1716,24 @@ def publish(
     _reject_reserved_flags(list(ctx.args))
     _reject_unknown_extras(list(ctx.args))
 
+    if pdf is None and ceo_card is None:
+        typer.echo(
+            "topofuzz publish: at least one of --pdf or --ceo-card "
+            "must be supplied.",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT)
+    # F6 pass-1 RT M2: ``--target ""`` slips past `is not None`. Treat
+    # any truthy target as "supplied" so the --pdf-only path doesn't
+    # silently ignore an empty string the operator intended as a value.
+    if target and ceo_card is None:
+        typer.echo(
+            "topofuzz publish: --target is only meaningful with "
+            "--ceo-card.",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT)
+
     run_dir_path = Path(run_dir)
     if not run_dir_path.is_dir():
         typer.echo(
@@ -1697,17 +1742,28 @@ def publish(
         )
         raise typer.Exit(code=_BAD_USAGE_EXIT)
 
-    from topofuzz.publish import PublishError, build_publish_pdf
+    from topofuzz.publish import (
+        PublishError,
+        build_ceo_card_pdf,
+        build_publish_pdf,
+    )
 
     try:
-        target = build_publish_pdf(
-            run_dir_path, out_path=pdf, max_flips=max_flips
-        )
+        if pdf is not None:
+            full_target = build_publish_pdf(
+                run_dir_path, out_path=pdf, max_flips=max_flips
+            )
+            typer.echo(str(full_target))
+        if ceo_card is not None:
+            card_target = build_ceo_card_pdf(
+                run_dir_path,
+                out_path=ceo_card,
+                target_company=target,
+            )
+            typer.echo(str(card_target))
     except PublishError as e:
         typer.echo(f"topofuzz publish: {e}", err=True)
         raise typer.Exit(code=_VERIFY_FAIL_EXIT) from e
-
-    typer.echo(str(target))
 
 
 @app.command(

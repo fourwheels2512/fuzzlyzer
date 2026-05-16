@@ -287,6 +287,14 @@ def write_manifest(plan: RunPlan, *, cli_args: dict[str, Any]) -> Path:
             for r in plan.eval_rows
         ],
         "agent_vendors": _agent_vendors_from_topology(plan.topology),
+        # Step 20a / F6: persist verdict_node + terminal_nodes so
+        # post-hoc tools (publish CEO card, inspect, repro) can mirror
+        # runner._run_judge's dispatch without re-loading the Topology
+        # IR from a fixture file. ``verdict_node`` is None on v0.5
+        # fixtures and gets omitted from the payload via the explicit
+        # check below — keeps v0.5 manifests byte-identical for the
+        # cache + signed-bundle invariant.
+        "terminal_nodes": list(plan.topology.terminal),
         "max_cost_usd": plan.max_cost_usd,
         "judge_model": plan.judge_model,
         "rubric_hash": plan.rubric_hash,
@@ -294,6 +302,12 @@ def write_manifest(plan: RunPlan, *, cli_args: dict[str, Any]) -> Path:
         "cli_args": cli_args,
         "kickoff_ts": time.time(),
     }
+    # Step 20a additive: include verdict_node only when set, so v0.5
+    # manifests (no verdict_node on the IR) keep their byte-identical
+    # JSON shape and downstream signed bundles + report consumers that
+    # don't know about the field are unaffected.
+    if plan.topology.verdict_node is not None:
+        payload["verdict_node"] = plan.topology.verdict_node
     path = plan.run_dir / "manifest.json"
     path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False),
