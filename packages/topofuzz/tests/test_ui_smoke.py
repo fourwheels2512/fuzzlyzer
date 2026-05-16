@@ -1028,3 +1028,394 @@ class TestBuildHeadlineFinitePointGate:
         }
         out = _build_headline(run=run, summary=summary, workflow=wf)
         assert out["flip_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Bug B: §A ``degraded-high`` (exit code 1) runs must NOT be mislabelled
+# as cancelled, and must NOT show "couldn't read summary file".
+# ---------------------------------------------------------------------------
+
+
+def _find_registry(app, registry_cls):  # type: ignore[no-untyped-def]
+    """Walk an app's route-handler closures for a captured RunRegistry.
+
+    ``build_app`` constructs one ``RunRegistry`` and closes over it in
+    every endpoint. Tests that need to inject pre-fabricated ``Run``
+    objects (to exercise a results page in a known state) have to find
+    that registry from outside the app — there is no public accessor.
+    We walk ``app.routes[*].endpoint.__closure__`` and return the first
+    matching ``RunRegistry`` cell. The walk picks the first match;
+    today every closed-over ``RunRegistry`` IS the same instance.
+    """
+    for route in app.routes:
+        ep = getattr(route, "endpoint", None)
+        if ep is None or ep.__closure__ is None:
+            continue
+        for cell in ep.__closure__:
+            try:
+                val = cell.cell_contents
+            except ValueError:
+                continue
+            if isinstance(val, registry_cls):
+                return val
+    return None
+
+
+class TestDegradedRunResultsBanners:
+    """Regression coverage: a completed degraded run with a valid
+    report.json must show neither the "cancelled" banner nor the
+    "couldn't read summary file" headline.
+
+    Bug B root cause was twofold: (1) ``_was_cancelled(1) is True`` on
+    Windows colliding with §A's degraded-high exit code, AND (2) bare
+    exit-code dispatch couldn't tell §A degraded-high apart from a
+    Python uncaught-exception crash (both exit 1). The fix gates on
+    report.json validity (``_has_completed_report``) so degraded runs
+    classify as ``succeeded`` while crashes still classify as
+    ``failed``.
+    """
+
+    @staticmethod
+    def _write_run_artifacts(
+        run_dir: Path, *, headline_status: str = "degraded"
+    ) -> Path:
+        """Lay out a fake completed run on disk: out_dir/<inner>/report.json.
+
+        Mirrors the on-disk shape produced by ``topofuzz run`` —
+        :pyattr:`Run.inner_run_dir` scans one level deep for the
+        topofuzz-stamped subdir.
+        """
+        import json as _json
+
+        inner = run_dir / "2026-05-16-FAKEINNER"
+        inner.mkdir(parents=True)
+        report = {
+            "headline": {
+                "n_evals": 3,
+                "n_variants": 2,
+                "n_total_cells": 6,
+                "n_successful_cells": 6,
+                "verdict_flip_rate": {"point": 0.5},
+                "judge_failure_rate": 0.3333,
+                "status": headline_status,
+            }
+        }
+        (inner / "report.json").write_text(
+            _json.dumps(report), encoding="utf-8"
+        )
+        return inner
+
+    def test_drain_thread_assigns_succeeded_on_exit_one(
+        self, tmp_path: Path
+    ) -> None:
+        """The drain-thread branch on exit_code=1 must dispatch to
+        ``succeeded`` (NOT to ``cancelled`` via the old
+        ``_was_cancelled(1)`` Windows-terminate heuristic, and NOT to
+        ``failed`` via the fallthrough branch).
+        """
+        import time as _time
+
+        from topofuzz.ui.runs import _drain_subprocess
+
+        out_dir = tmp_path / "ui-runs" / "fake-run-1"
+        out_dir.mkdir(parents=True)
+        self._write_run_artifacts(out_dir)
+
+        class FakeProc:
+            """Subprocess that emits one line, exits with code 1."""
+
+            stdout = iter(["topofuzz: degraded, judge_failure_rate=33.3%\n"])
+            returncode = 1
+
+            def wait(self) -> int:
+                return 1
+
+        run = Run(
+            run_id="fake-run-1",
+            workflow_key="loan-approval",
+            thoroughness_key="quick",
+            out_dir=out_dir,
+            fixture_path=tmp_path / "f.py",
+            eval_csv_path=tmp_path / "e.csv",
+            rubric_path=tmp_path / "r.txt",
+            raw_cost_cap_usd=8.0,
+            started_at=_time.time(),
+            process=FakeProc(),  # type: ignore[arg-type]
+        )
+        _drain_subprocess(run)
+        assert run.status == "succeeded", (
+            "exit_code=1 (degraded-high) with a valid report.json must "
+            "classify as succeeded (the results page surfaces the warn "
+            "banner from headline.status, not a cancelled/failed banner)."
+        )
+        assert run.cancel_requested is False
+
+    def test_drain_thread_assigns_failed_on_exit_one_without_report(
+        self, tmp_path: Path
+    ) -> None:
+        """B1 regression: a crash that exits 1 with NO report.json
+        must NOT be relabelled "succeeded" by the exit-code-1 branch.
+
+        Python's default uncaught-exception handler exits 1 — a Gemini
+        SDK rate-limit, an OOM, or a version-mismatched ``langgraph``
+        import inside ``topofuzz run`` all hit this path. The original
+        Bug-B fix's bare ``elif exit_code == 1`` would have masked
+        those as "Completed with warnings" with a fabricated headline.
+        The ``_has_completed_report`` probe makes the fix surgical:
+        only exit-1 runs that wrote a valid report.json classify as
+        succeeded; the rest fall through to ``failed``.
+        """
+        import time as _time
+
+        from topofuzz.ui.runs import _drain_subprocess
+
+        out_dir = tmp_path / "ui-runs" / "fake-crash-1"
+        out_dir.mkdir(parents=True)
+        # Deliberately do NOT call _write_run_artifacts — this run
+        # crashed mid-flight, so there is no report.json on disk.
+
+        class FakeProc:
+            """Subprocess that crashed and exited with code 1."""
+
+            stdout = iter(["Traceback (most recent call last):\n"])
+            returncode = 1
+
+            def wait(self) -> int:
+                return 1
+
+        run = Run(
+            run_id="fake-crash-1",
+            workflow_key="loan-approval",
+            thoroughness_key="quick",
+            out_dir=out_dir,
+            fixture_path=tmp_path / "f.py",
+            eval_csv_path=tmp_path / "e.csv",
+            rubric_path=tmp_path / "r.txt",
+            raw_cost_cap_usd=8.0,
+            started_at=_time.time(),
+            process=FakeProc(),  # type: ignore[arg-type]
+        )
+        _drain_subprocess(run)
+        assert run.status == "failed", (
+            "exit_code=1 with NO report.json must classify as failed "
+            "(uncaught-exception crash) — not silently relabelled as "
+            "succeeded/degraded."
+        )
+        assert run.failure_reason is not None and (
+            "exit code 1" in run.failure_reason
+            or "stopped" in run.failure_reason.lower()
+        ), "failed runs must populate failure_reason for the danger banner."
+
+    def test_has_completed_report_helper(self, tmp_path: Path) -> None:
+        """``_has_completed_report`` is the load-bearing dispatch probe.
+        Cover the three branches: valid report, missing report, malformed
+        report.
+        """
+        import json as _json
+        import time as _time
+
+        from topofuzz.ui.runs import _has_completed_report
+
+        # 1. Valid report.json → True.
+        good_dir = tmp_path / "good"
+        good_dir.mkdir()
+        inner = good_dir / "2026-05-16-INNER"
+        inner.mkdir()
+        (inner / "report.json").write_text(
+            _json.dumps({"headline": {"status": "degraded"}}),
+            encoding="utf-8",
+        )
+        good_run = Run(
+            run_id="good",
+            workflow_key="loan-approval",
+            thoroughness_key="quick",
+            out_dir=good_dir,
+            fixture_path=tmp_path / "f.py",
+            eval_csv_path=tmp_path / "e.csv",
+            rubric_path=tmp_path / "r.txt",
+            raw_cost_cap_usd=8.0,
+            started_at=_time.time(),
+        )
+        assert _has_completed_report(good_run) is True
+
+        # 2. Missing report.json → False (uncaught-exception crash).
+        missing_dir = tmp_path / "missing"
+        missing_dir.mkdir()
+        missing_run = Run(
+            run_id="missing",
+            workflow_key="loan-approval",
+            thoroughness_key="quick",
+            out_dir=missing_dir,
+            fixture_path=tmp_path / "f.py",
+            eval_csv_path=tmp_path / "e.csv",
+            rubric_path=tmp_path / "r.txt",
+            raw_cost_cap_usd=8.0,
+            started_at=_time.time(),
+        )
+        assert _has_completed_report(missing_run) is False
+
+        # 3. report.json present but headline.status unknown → False
+        # (defensive against future writer drift).
+        weird_dir = tmp_path / "weird"
+        weird_dir.mkdir()
+        weird_inner = weird_dir / "2026-05-16-INNER"
+        weird_inner.mkdir()
+        (weird_inner / "report.json").write_text(
+            _json.dumps({"headline": {"status": "wat"}}),
+            encoding="utf-8",
+        )
+        weird_run = Run(
+            run_id="weird",
+            workflow_key="loan-approval",
+            thoroughness_key="quick",
+            out_dir=weird_dir,
+            fixture_path=tmp_path / "f.py",
+            eval_csv_path=tmp_path / "e.csv",
+            rubric_path=tmp_path / "r.txt",
+            raw_cost_cap_usd=8.0,
+            started_at=_time.time(),
+        )
+        assert _has_completed_report(weird_run) is False
+
+    def test_was_cancelled_no_longer_swallows_exit_one(self) -> None:
+        """``_was_cancelled(1)`` used to be True (Windows terminate
+        heuristic). That collided with §A's degraded-high exit code
+        (the SUCCESSFUL case from
+        :func:`topofuzz.metrics.classify_run_status` when
+        25% < cell_failure_rate <= 50%). The heuristic now only fires
+        on POSIX negative signal codes."""
+        from topofuzz.ui.runs import _was_cancelled
+
+        assert _was_cancelled(1) is False
+        assert _was_cancelled(2) is False  # §A failed — that's "failed" not "cancelled"
+        assert _was_cancelled(-15) is True  # SIGTERM
+        assert _was_cancelled(-2) is True   # SIGINT
+
+    def test_results_page_no_cancelled_banner_on_degraded_run(
+        self, tmp_path: Path
+    ) -> None:
+        """End-to-end via TestClient: a completed degraded run renders
+        the warn banner with "Completed with warnings" — NOT the
+        "cancelled" banner and NOT the "couldn't read summary file"
+        headline."""
+        import time as _time
+
+        from topofuzz.ui.app import build_app
+        from topofuzz.ui.runs import RunRegistry
+
+        ui_runs_root = tmp_path / "explicit-ui-runs"
+        ui_runs_root.mkdir(parents=True)
+        out_dir = ui_runs_root / "fake-run-degraded"
+        out_dir.mkdir()
+        self._write_run_artifacts(out_dir)
+
+        app2 = build_app(runs_root=ui_runs_root)
+        c = TestClient(app2)
+        c.headers["Origin"] = "http://testserver"
+
+        target_registry = _find_registry(app2, RunRegistry)
+        assert target_registry is not None, (
+            "could not locate RunRegistry in app2's route closures"
+        )
+
+        run = Run(
+            run_id="fake-run-degraded",
+            workflow_key="loan-approval",
+            thoroughness_key="quick",
+            out_dir=out_dir,
+            fixture_path=tmp_path / "f.py",
+            eval_csv_path=tmp_path / "e.csv",
+            rubric_path=tmp_path / "r.txt",
+            raw_cost_cap_usd=8.0,
+            started_at=_time.time(),
+        )
+        run.status = "succeeded"  # post-Bug-B-fix classification
+        run.exit_code = 1
+        run.finished_at = _time.time()
+        target_registry._runs["fake-run-degraded"] = run  # noqa: SLF001
+
+        r = c.get("/runs/fake-run-degraded")
+        assert r.status_code == 200, r.text
+
+        # Bug B fix assertions: the two false banners are GONE.
+        assert "This run was cancelled before it finished" not in r.text, (
+            "Bug B regression: a successful-but-degraded run is being "
+            "mislabelled as cancelled."
+        )
+        assert "we couldn't read its summary file" not in r.text, (
+            "Bug B regression: a run with a valid report.json on disk "
+            "is being reported as having an unreadable summary."
+        )
+        # And the new warn banner IS shown.
+        assert "Completed with warnings" in r.text, (
+            "Bug B fix: a degraded run must surface a warn banner "
+            "explaining the judge-failure caveat."
+        )
+        # The real headline rendered. ``_build_headline`` scales the
+        # verdict_flip_rate against n_evals (= 3 here), so 0.5 → 2
+        # flips on the headline (matches existing _build_headline
+        # tests above). The phrasing "changed its mind on about N" is
+        # the load-bearing copy; the exact N is asserted separately by
+        # the unit tests on _build_headline itself.
+        assert "changed its mind on about" in r.text
+
+    def test_results_page_cancelled_wins_over_degraded_summary(
+        self, tmp_path: Path
+    ) -> None:
+        """The "cancelled" banner is still correct when the run was
+        actually cancelled (user clicked Cancel), AND it must take
+        precedence over the new degraded banner even when a partial
+        ``report.json`` with ``headline.status == "degraded"`` is on
+        disk. The cancel_requested signal is authoritative — a user who
+        clicked Cancel deserves the cancelled banner regardless of how
+        much of the run made it to the metrics layer.
+        """
+        import time as _time
+
+        from topofuzz.ui.app import build_app
+        from topofuzz.ui.runs import RunRegistry
+
+        ui_runs_root = tmp_path / "ui-runs-cancel-case"
+        ui_runs_root.mkdir(parents=True)
+        out_dir = ui_runs_root / "fake-run-cancelled"
+        out_dir.mkdir()
+        # CR M3 precedence test: write a degraded report.json so the
+        # results template's `elif summary.headline.status=="degraded"`
+        # branch is reachable. The cancelled branch comes FIRST in the
+        # template and must win.
+        self._write_run_artifacts(out_dir)
+
+        app2 = build_app(runs_root=ui_runs_root)
+        c = TestClient(app2)
+        c.headers["Origin"] = "http://testserver"
+
+        target_registry = _find_registry(app2, RunRegistry)
+        assert target_registry is not None
+
+        run = Run(
+            run_id="fake-run-cancelled",
+            workflow_key="loan-approval",
+            thoroughness_key="quick",
+            out_dir=out_dir,
+            fixture_path=tmp_path / "f.py",
+            eval_csv_path=tmp_path / "e.csv",
+            rubric_path=tmp_path / "r.txt",
+            raw_cost_cap_usd=8.0,
+            started_at=_time.time(),
+        )
+        run.status = "cancelled"
+        run.cancel_requested = True
+        run.finished_at = _time.time()
+        target_registry._runs["fake-run-cancelled"] = run  # noqa: SLF001
+
+        r = c.get("/runs/fake-run-cancelled")
+        assert r.status_code == 200, r.text
+        assert "This run was cancelled before it finished" in r.text, (
+            "user-driven cancel must surface the cancelled banner."
+        )
+        assert "Completed with warnings" not in r.text, (
+            "CR M3 precedence: cancelled banner must take precedence "
+            "over the degraded banner — a cancelled run with a partial "
+            "degraded report.json should NOT show 'Completed with "
+            "warnings'."
+        )

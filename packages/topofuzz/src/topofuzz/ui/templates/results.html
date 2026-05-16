@@ -16,6 +16,13 @@
   This run was cancelled before it finished. The numbers below are
   partial.
 </div>
+{% elif summary and summary.get("headline", {}).get("status") == "degraded" %}
+<div class="banner warn">
+  <strong>Completed with warnings.</strong>
+  Some judge calls failed during the run — see the
+  <em>judge_failure_rate</em> in the full report for the exact share.
+  The numbers below are based on the cells that did succeed.
+</div>
 {% endif %}
 
 <h1 class="headline">{{ headline.title }}</h1>

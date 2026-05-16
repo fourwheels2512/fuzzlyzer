@@ -16,6 +16,32 @@
          hx-swap="innerHTML">
       {% include "fragments/live_status.html" %}
     </div>
+    {# Bug A: HTMX innerHTML swap on #live-status replaces the
+       <details id="bts-disclosure"> wholesale every 2 s, so user-opened
+       disclosure snaps closed on the next poll. Persist the open state
+       in localStorage (the fragment writes it on `toggle`) and re-apply
+       it after every successful swap. We do NOT preserve the node
+       itself — the inner <pre class="log"> MUST keep updating with each
+       poll, so we only restore the open attribute, not the content. #}
+    <script>
+      (function () {
+        function restoreBtsOpen() {
+          var d = document.getElementById('bts-disclosure');
+          if (!d) return;
+          var v;
+          try { v = localStorage.getItem('btsOpen'); } catch (e) { v = null; }
+          if (v === '1') d.open = true;
+        }
+        document.body.addEventListener('htmx:afterSwap', function (e) {
+          if (e.target && e.target.id === 'live-status') restoreBtsOpen();
+        });
+        // Initial paint already includes the fragment (Jinja-rendered),
+        // but the load-time poll's swap fires before any user click — so
+        // we still need a first-paint restore for the case where the user
+        // opened the disclosure on a PRIOR visit to this page.
+        restoreBtsOpen();
+      })();
+    </script>
   </div>
   <div class="card-body" style="border-top: 1px solid var(--border);">
     <form method="post" action="/runs/{{ run.run_id }}/cancel">

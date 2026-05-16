@@ -46,7 +46,14 @@
     </div>
   {% endif %}
 
-  <details class="disclosure mt-16">
+  {# Disclosure persistence across HTMX swaps: the parent `#live-status`
+     polls every 2s with `hx-swap="innerHTML"`, which replaces this
+     entire <details> element. Without state restoration the open/close
+     toggle resets on every poll. Strategy: persist the open state in
+     localStorage on the `toggle` event, then re-apply it in `live.html`
+     after each `htmx:afterSwap`. The `id` is the cross-swap handle. #}
+  <details class="disclosure mt-16" id="bts-disclosure"
+           ontoggle="try{localStorage.setItem('btsOpen', this.open ? '1' : '0');}catch(e){}">
     <summary>What's happening behind the scenes</summary>
     <pre class="log">{% for line in snap.log_tail %}{{ line }}
 {% endfor %}</pre>

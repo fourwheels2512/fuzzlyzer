@@ -585,6 +585,29 @@ def _drain_subprocess(run: Run) -> None:
                     run.status = "cancelled"
                 elif exit_code == 0:
                     run.status = "succeeded"
+                elif exit_code == 1 and _has_completed_report(run):
+                    # §A degraded-high: the CLI exits with code 1 when
+                    # 25% < cell_failure_rate <= 50% (per
+                    # ``topofuzz.metrics.status``). The run COMPLETED and
+                    # wrote a valid report.json — we surface a
+                    # "completed with warnings" banner driven by
+                    # report.json.headline.status.
+                    #
+                    # RT-audit B1: probe for a valid report.json rather
+                    # than trusting the bare exit code. Python's default
+                    # uncaught-exception handler ALSO exits 1, so a
+                    # Gemini SDK rate-limit, an OOM, or a
+                    # version-mismatched ``langgraph`` import inside
+                    # ``topofuzz run`` lands here with no report. Those
+                    # cases fall through to the ``failed`` branch below
+                    # — the user sees the honest "stopped before it
+                    # finished" banner instead of a fabricated headline.
+                    #
+                    # The prior ``_was_cancelled(1)`` Windows-terminate
+                    # heuristic would also have collided with this code
+                    # path; removing 1 from that heuristic + this
+                    # report-validity probe together fix both halves.
+                    run.status = "succeeded"
                 elif _was_cancelled(exit_code):
                     # Negative exit (POSIX SIGTERM) without an explicit
                     # cancel request — still treat as cancelled (e.g. OS
@@ -594,10 +617,13 @@ def _drain_subprocess(run: Run) -> None:
                     run.status = "failed"
                     run.failure_reason = _summarize_failure(run)
         # Render the HTML report from the run dir if the subprocess
-        # finished cleanly. ``topofuzz run`` writes sqlite+json+manifest;
+        # wrote one. ``topofuzz run`` writes sqlite+json+manifest;
         # ``topofuzz.report.render_report`` turns those into report.html
-        # which the results page iframes.
-        if exit_code == 0 and run.inner_run_dir is not None:
+        # which the results page iframes. We gate on report.json
+        # validity (not exit code) so degraded-high (exit 1) runs still
+        # render, and crashes that happened to exit 0/1 but wrote no
+        # report don't trigger a spurious render attempt.
+        if _has_completed_report(run) and run.inner_run_dir is not None:
             try:
                 from topofuzz.report import render_report
 
@@ -653,12 +679,43 @@ def _hydrate_cost_from_report_json(run: Run) -> None:
 def _was_cancelled(exit_code: int) -> bool:
     """Heuristic: subprocess.terminate() exit codes vary by OS.
 
-    On POSIX the exit code is ``-SIGTERM`` (negative). On Windows
-    ``terminate()`` returns 1. The UI's ``cancel`` always sets status to
-    ``cancelled`` explicitly, but if a parent process killed the run via
-    an external signal we still want the right label.
+    On POSIX the exit code is ``-SIGTERM`` (negative). The UI's
+    ``cancel`` always sets ``cancel_requested`` explicitly BEFORE
+    terminate (the authoritative signal) — this heuristic only catches
+    OS-level external kills where the flag was never set.
+
+    On Windows ``terminate()`` also returns 1, but the ``topofuzz`` CLI
+    uses exit 1 for §A ``degraded-high`` (a SUCCESSFUL run with
+    judge-failure rate 25–50%). The collision used to mislabel
+    honest-degraded runs as "cancelled"; that branch is gone — the
+    caller dispatches exit-code 1 to ``succeeded`` BEFORE consulting
+    this heuristic. A Windows external kill without ``cancel_requested``
+    is rare, ambiguous with degraded-high, and falls through to
+    ``failed`` — which is honest: the run was killed and did not write
+    its report cleanly.
     """
-    return exit_code in (-15, -2, 1)  # SIGTERM, SIGINT, Windows terminate
+    return exit_code in (-15, -2)  # SIGTERM, SIGINT
+
+
+def _has_completed_report(run: Run) -> bool:
+    """True iff the run wrote a parseable ``report.json`` with a known
+    ``headline.status``.
+
+    The drain-thread treats this as the load-bearing "completed
+    cleanly" signal — exit-code alone is ambiguous (Python's default
+    uncaught-exception handler exits 1, colliding with §A
+    ``degraded-high``; Windows' ``terminate()`` also returns 1). A
+    valid report.json is the orchestrator's authoritative "I finished
+    classifying" stamp, which the metrics layer writes regardless of
+    final status.
+    """
+    summary = run.read_summary()
+    if not isinstance(summary, dict):
+        return False
+    headline = summary.get("headline")
+    if not isinstance(headline, dict):
+        return False
+    return headline.get("status") in {"succeeded", "degraded", "failed"}
 
 
 def _summarize_failure(run: Run) -> str:
