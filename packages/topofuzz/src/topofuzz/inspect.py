@@ -38,6 +38,7 @@ from typing import Any
 from topofuzz.metrics.verdict_flip import (
     DEFAULT_FLIP_THRESHOLD as DEFAULT_VERDICT_THRESHOLD,
 )
+from topofuzz._verdict_labels import _normalize_verdict_label_for_consumer
 
 _log = logging.getLogger(__name__)
 
@@ -236,57 +237,78 @@ def _resolve_verdict_labels(manifest: dict[str, Any]) -> tuple[str, str]:
        exactly one key non-empty is an obvious tamper or hand-edit —
        log + fall back to BOTH defaults rather than silently defaulting
        the unset half against an explicit other half.
-    2. **>12-char cap:** the producer IR caps labels at 12 chars after
-       normalize. A tampered manifest with a >12-char label would render
-       truncated nonsense — log + fall back to BOTH defaults so the
-       buyer sees the same default pair rather than a half-custom pair.
-    3. **Collision after normalize:** two labels that collapse to the
+    2. **Producer-faithful normalize:** apply NFKC + Cc/Cf/M strip +
+       ``.strip().upper()`` via :func:`_normalize_verdict_label_for_consumer`.
+       Without this, a hand-edited manifest with ZWSP / combining marks /
+       fullwidth Latin / NBSP padding survives the consumer normalize
+       and renders visually-as-default with bytewise-tampered content.
+       The shared helper is byte-faithful to the producer IR validator
+       so a well-formed manifest round-trips identically and a tampered
+       one collapses to the same bytes the IR would have produced.
+    3. **>12-char cap (POST-normalize):** the producer IR caps labels at
+       12 chars after the full normalize chain. A tampered manifest with
+       a label that normalizes to >12 chars would render truncated
+       nonsense — log + fall back to BOTH defaults so the buyer sees the
+       same default pair rather than a half-custom pair. Measured on the
+       normalized string (not the raw) to mirror producer policy: a
+       ZWSP-padded 15-char raw that collapses to 7 chars post-normalize
+       is fine, a 14-char fullwidth raw that collapses to 14 ASCII chars
+       is not.
+    4. **Collision after normalize:** two labels that collapse to the
        same string destroy the side-by-side story (a buyer would see
        "APPROVE / APPROVE" with two different excerpts, worse than no
-       inspect view). Raise :class:`InspectError`.
-    4. **Defaults fallback:** absent / empty / wrong-type values resolve
-       to ``("APPROVE", "DENY")``.
+       inspect view). Raise :class:`InspectError`. Producer rejects this
+       at IR construction; consumer is last line of defense.
+    5. **Defaults fallback:** absent / empty / wrong-type / empty-after-
+       normalize values resolve to ``("APPROVE", "DENY")``.
     """
     label_true_raw = manifest.get("verdict_label_true")
     label_false_raw = manifest.get("verdict_label_false")
-    has_true = isinstance(label_true_raw, str) and label_true_raw.strip()
-    has_false = isinstance(label_false_raw, str) and label_false_raw.strip()
-    if bool(has_true) != bool(has_false):
+    # Normalize first so the XOR check below operates on POST-normalize
+    # results. Without this, a label like `"​"` (ZWSP only) is
+    # truthy under `.strip()` (which does NOT strip Cf characters),
+    # passes the XOR as "set", then collapses to empty in the helper
+    # and falls back to the default partner — yielding a half-custom
+    # pair (custom-true + default-false) that defeats the pair-level
+    # fallback the consumer claims to enforce. Pass-1 dual-audit BLOCKER
+    # equivalent (CR M-1 + RT M1, 2026-05-16).
+    norm_true = (
+        _normalize_verdict_label_for_consumer(label_true_raw)
+        if isinstance(label_true_raw, str) else ""
+    )
+    norm_false = (
+        _normalize_verdict_label_for_consumer(label_false_raw)
+        if isinstance(label_false_raw, str) else ""
+    )
+    if bool(norm_true) != bool(norm_false):
         _log.warning(
             "inspect: manifest has exactly one of verdict_label_true/false "
-            "set (true=%r, false=%r) — both must be set together or "
-            "neither (orchestrator persists as a pair). Falling back to "
-            "APPROVE/DENY defaults.",
+            "non-empty after NFKC + Cc/Cf/M strip (true=%r, false=%r) — "
+            "both must resolve to a non-empty pair or neither (orchestrator "
+            "persists as a pair). Falling back to APPROVE/DENY defaults.",
             label_true_raw, label_false_raw,
         )
-        label_true_raw = None
-        label_false_raw = None
-    for raw_label, key in (
-        (label_true_raw, "verdict_label_true"),
-        (label_false_raw, "verdict_label_false"),
+        norm_true = ""
+        norm_false = ""
+    for raw_label, norm, key in (
+        (label_true_raw, norm_true, "verdict_label_true"),
+        (label_false_raw, norm_false, "verdict_label_false"),
     ):
-        if isinstance(raw_label, str) and len(raw_label.strip()) > 12:
+        if len(norm) > 12:
             _log.warning(
-                "inspect: manifest %s=%r is >12 chars after strip — "
-                "exceeds the side-by-side flip-card cap. Falling back "
-                "to APPROVE/DENY for BOTH labels (pair-level fallback; "
-                "the partner label is discarded too so the reader sees "
-                "the same default pair rather than a half-custom pair).",
+                "inspect: manifest %s=%r normalizes to >12 chars after "
+                "NFKC + Cc/Cf/M strip — exceeds the side-by-side flip-"
+                "card cap. Falling back to APPROVE/DENY for BOTH labels "
+                "(pair-level fallback; the partner label is discarded "
+                "too so the reader sees the same default pair rather "
+                "than a half-custom pair).",
                 key, raw_label,
             )
-            label_true_raw = None
-            label_false_raw = None
+            norm_true = ""
+            norm_false = ""
             break
-    label_true = (
-        label_true_raw.strip().upper()[:12]
-        if isinstance(label_true_raw, str) and label_true_raw.strip()
-        else "APPROVE"
-    )
-    label_false = (
-        label_false_raw.strip().upper()[:12]
-        if isinstance(label_false_raw, str) and label_false_raw.strip()
-        else "DENY"
-    )
+    label_true = norm_true if norm_true else "APPROVE"
+    label_false = norm_false if norm_false else "DENY"
     if label_true == label_false:
         raise InspectError(
             f"manifest verdict_label_true/false collide after "

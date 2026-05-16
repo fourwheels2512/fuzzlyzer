@@ -1108,7 +1108,7 @@ def test_inspect_falls_back_to_defaults_on_over_twelve_char_label(
     # the log args would silently rename to "verdict_label_false" and
     # mislead the operator.
     assert any(
-        ">12 chars after strip" in rec.message
+        "normalizes to >12 chars" in rec.message
         and "verdict_label_true" in rec.message
         for rec in caplog.records
     )
@@ -1281,3 +1281,148 @@ def test_verdict_label_helper_threads_custom_labels():
     # Backcompat: omitting label args falls back to APPROVE/DENY.
     assert _verdict_label(True, None, 0.5) == "APPROVE"
     assert _verdict_label(False, None, 0.5) == "DENY"
+
+
+# ---------------------------------------------------------------------------
+# Cross-consumer NFKC + Cc/Cf/M normalize red-team tests
+# (BACKLOG 2026-05-16 MAJOR: shared verdict-label normalize helper)
+# ---------------------------------------------------------------------------
+#
+# The producer IR validator (`ir._normalize_verdict_label`) applies NFKC +
+# Cc/Cf/M strip + .strip().upper() + 12-char cap before a manifest is ever
+# written. These tests cover the scenario where a hand-edited or supply-
+# chain-tampered manifest carries Unicode-tamper labels the IR validator
+# would have rejected -- the shared helper
+# `_normalize_verdict_label_for_consumer` is the last line of defense.
+#
+# Non-ASCII codepoints in label inputs use \u escape sequences in Python
+# source so the test bytes are unambiguous to a future reader regardless
+# of how their editor renders combining marks / variation selectors / ZWSP.
+
+
+def test_inspect_strips_variation_selector_from_manifest_labels(tmp_path):
+    """Variation Selector-16 (U+FE0F, category Mn) is the producer's
+    canonical red-team example (cited in ``ir._normalize_verdict_label``):
+    a combining mark that survives NFKC unchanged (no compatibility
+    decomposition, no precomposed sequence with Latin letters in this
+    position) and renders visually identical to the underlying label but
+    bytewise differs. Without the shared helper, a tampered manifest
+    with ``"APPROVE️"`` ships bytewise-tampered content into the
+    inspect HTML even though it looks identical to ``"APPROVE"`` in a
+    browser. The Mn-category filter in the shared helper drops it,
+    recovering the canonical bytes the producer IR would have produced."""
+    run_dir = _make_run(tmp_path)
+    _patch_manifest_labels(
+        run_dir,
+        label_true="APPROVE️",
+        label_false="DENY",
+    )
+    html, _eid = build_inspect_html(run_dir)
+    assert ">APPROVE<" in html
+    assert ">DENY<" in html
+    # Variation selector must NOT survive into the rendered HTML --
+    # otherwise the bytes a buyer's grep / hash sees diverge from the
+    # bytes ``topofuzz publish`` produces for the same run.
+    assert "️" not in html
+
+
+def test_inspect_strips_zwsp_from_manifest_labels(tmp_path):
+    """Zero-width space (U+200B, category Cf) is invisible at render
+    time but bytewise differs from the canonical label. NFKC leaves it
+    intact (no compatibility-equivalent); the Cf-category filter in the
+    shared helper drops it. A buyer's manifest-hash comparison must
+    match what producer-side IR would have produced."""
+    run_dir = _make_run(tmp_path)
+    _patch_manifest_labels(
+        run_dir,
+        label_true="APPROVE​​",
+        label_false="DE​NY",  # interior ZWSP, not just trailing.
+    )
+    html, _eid = build_inspect_html(run_dir)
+    assert ">APPROVE<" in html
+    assert ">DENY<" in html
+    assert "​" not in html
+
+
+def test_inspect_collapses_fullwidth_latin_in_manifest_labels(tmp_path):
+    """Fullwidth Latin (U+FF21..U+FF3A) renders visually as Latin
+    capitals but is a different codepoint range. NFKC collapses it to
+    ASCII -- without the shared helper, a fullwidth-tampered label slips
+    past ``.strip().upper()`` and ships bytewise-tampered into the
+    inspect HTML even though it looks identical to the ASCII pair in a
+    browser."""
+    run_dir = _make_run(tmp_path)
+    # U+FF21..U+FF3A fullwidth Latin spelling APPROVE / DENY.
+    _patch_manifest_labels(
+        run_dir,
+        label_true="ＡＰＰＲＯＶＥ",
+        label_false="ＤＥＮＹ",
+    )
+    html, _eid = build_inspect_html(run_dir)
+    assert ">APPROVE<" in html
+    assert ">DENY<" in html
+    # Fullwidth codepoints must NOT survive into the rendered HTML.
+    assert "Ａ" not in html
+    assert "Ｄ" not in html
+
+
+def test_inspect_rejects_post_normalize_collision_via_variation_selector(
+    tmp_path,
+):
+    """The collision check fires POST-normalize. The pair ("APPROVE",
+    "APPROVE️") looks distinct bytewise (7 vs 8 codepoints) but
+    collapses to identical "APPROVE" after the Mn-category filter.
+    Without the shared helper this sneaks past the consumer collision
+    check (``"APPROVE".upper() != "APPROVE️".upper()``) and the
+    inspect side-by-side flip-card would render two visually-identical
+    "APPROVE" pills with different excerpts -- worse than no inspect
+    view. The shared helper's NFKC + Mn filter exposes the collision so
+    the consumer can refuse to render."""
+    run_dir = _make_run(tmp_path)
+    _patch_manifest_labels(
+        run_dir,
+        label_true="APPROVE",
+        label_false="APPROVE️",  # collides POST-normalize.
+    )
+    with pytest.raises(InspectError) as exc_info:
+        build_inspect_html(run_dir)
+    msg = str(exc_info.value)
+    assert "collide after normalization" in msg
+    # Raw values surface in the message via repr() so the operator can
+    # see the tamper-shaped input pair, not just the post-normalize
+    # string. ``repr("APPROVE️")`` produces ``"'APPROVE\ufe0f'"``
+    # -- the escape appears verbatim in the f-string.
+    assert "️" in msg
+
+
+def test_inspect_falls_back_when_zwsp_only_label_creates_half_custom_pair(
+    tmp_path, caplog,
+):
+    """Pass-1 dual-audit regression (CR M-1 + RT M1, 2026-05-16): a label
+    like ``"​"`` (ZWSP only) is truthy under ``str.strip()`` (which
+    does NOT strip Cf characters), so a pre-normalize XOR check sees
+    both sides as "set" and skips the half-set fallback. Then the
+    helper collapses the ZWSP-only side to ``""``, the empty-fallback
+    resolves it to the default partner, and the buyer sees a
+    half-custom pair (custom-true + default-false) -- exactly the
+    scenario the pair-level fallback is meant to prevent. The fix
+    moves the XOR check to operate on the POST-normalize results so
+    this asymmetric tamper triggers the fallback."""
+    import logging
+    run_dir = _make_run(tmp_path)
+    _patch_manifest_labels(
+        run_dir,
+        label_true="ESCALATE",
+        label_false="​​",  # ZWSP only -- normalizes to "".
+    )
+    with caplog.at_level(logging.WARNING, logger="topofuzz.inspect"):
+        html, _eid = build_inspect_html(run_dir)
+    # Both labels fell back to defaults; no half-custom pair leaks.
+    assert ">APPROVE<" in html
+    assert ">DENY<" in html
+    assert ">ESCALATE<" not in html
+    assert any(
+        "exactly one of verdict_label" in rec.message
+        and "after NFKC" in rec.message
+        for rec in caplog.records
+    )

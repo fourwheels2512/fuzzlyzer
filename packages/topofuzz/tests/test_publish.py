@@ -1362,7 +1362,210 @@ def test_flip_card_rejects_over_twelve_char_manifest_label(tmp_path, caplog):
     assert fc is not None
     assert {fc["canonical_verdict"], fc["variant_verdict"]} == {"APPROVE", "DENY"}
     assert any(
-        ">12 chars after strip" in rec.message for rec in caplog.records
+        "normalizes to >12 chars" in rec.message for rec in caplog.records
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cross-consumer NFKC + Cc/Cf/M normalize red-team tests
+# (BACKLOG 2026-05-16 MAJOR: shared verdict-label normalize helper)
+# ---------------------------------------------------------------------------
+#
+# Mirrors the four red-team tests in tests/test_inspect.py for the
+# publish consumer path. The producer IR validator
+# (`ir._normalize_verdict_label`) applies NFKC + Cc/Cf/M strip +
+# .strip().upper() + 12-char cap before a manifest is ever written.
+# These tests cover the scenario where a hand-edited or supply-chain-
+# tampered manifest carries Unicode-tamper labels the IR validator
+# would have rejected -- the shared helper
+# `_normalize_verdict_label_for_consumer` is the last line of defense.
+#
+# Non-ASCII codepoints use \u escape sequences in Python source so the
+# test bytes are unambiguous to a future reader.
+
+
+def test_ceo_card_strips_variation_selector_from_manifest_labels(tmp_path):
+    """Variation Selector-16 (U+FE0F, category Mn) is the producer's
+    canonical red-team example: a combining mark that survives NFKC
+    unchanged and renders visually identical to the underlying label
+    but bytewise differs. Without the shared helper, a tampered
+    manifest with ``"APPROVE️"`` ships bytewise-tampered content
+    into the CEO card PDF even though it looks identical to ASCII
+    "APPROVE". The Mn-category filter in the shared helper drops it,
+    recovering the canonical bytes the producer IR would have
+    produced."""
+    from topofuzz.publish import (
+        _build_ceo_card_context, _load_manifest, load_publish_metadata,
+    )
+    run_dir = _make_run_with_report_json(tmp_path)
+    manifest_path = run_dir / "manifest.json"
+    m = json.loads(manifest_path.read_text())
+    m["verdict_label_true"] = "APPROVE️"
+    m["verdict_label_false"] = "DENY"
+    manifest_path.write_text(json.dumps(m), encoding="utf-8")
+    metadata = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    ctx = _build_ceo_card_context(
+        metadata=metadata, manifest=manifest,
+        verdict_flip_rate=report["headline"]["verdict_flip_rate"],
+        wilson_addenda=report["wilson_addenda"],
+        target_company=None,
+        run_dir=run_dir, threshold=0.5,
+    )
+    fc = ctx["flip_card"]
+    assert fc is not None
+    # Pair collapses to canonical bytes -- no variation selector
+    # survives into the rendered fields.
+    assert {fc["canonical_verdict"], fc["variant_verdict"]} == {"APPROVE", "DENY"}
+    assert "️" not in fc["canonical_verdict"]
+    assert "️" not in fc["variant_verdict"]
+
+
+def test_ceo_card_strips_zwsp_from_manifest_labels(tmp_path):
+    """Zero-width space (U+200B, category Cf) is invisible at render
+    time but bytewise differs from the canonical label. NFKC leaves it
+    intact (no compatibility-equivalent); the Cf-category filter in
+    the shared helper drops it. A buyer's manifest-hash comparison
+    must match what producer-side IR would have produced."""
+    from topofuzz.publish import (
+        _build_ceo_card_context, _load_manifest, load_publish_metadata,
+    )
+    run_dir = _make_run_with_report_json(tmp_path)
+    manifest_path = run_dir / "manifest.json"
+    m = json.loads(manifest_path.read_text())
+    m["verdict_label_true"] = "APPROVE​​"
+    m["verdict_label_false"] = "DE​NY"  # interior ZWSP, not trailing.
+    manifest_path.write_text(json.dumps(m), encoding="utf-8")
+    metadata = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    ctx = _build_ceo_card_context(
+        metadata=metadata, manifest=manifest,
+        verdict_flip_rate=report["headline"]["verdict_flip_rate"],
+        wilson_addenda=report["wilson_addenda"],
+        target_company=None,
+        run_dir=run_dir, threshold=0.5,
+    )
+    fc = ctx["flip_card"]
+    assert fc is not None
+    assert {fc["canonical_verdict"], fc["variant_verdict"]} == {"APPROVE", "DENY"}
+    assert "​" not in fc["canonical_verdict"]
+    assert "​" not in fc["variant_verdict"]
+
+
+def test_ceo_card_collapses_fullwidth_latin_in_manifest_labels(tmp_path):
+    """Fullwidth Latin (U+FF21..U+FF3A) renders visually as Latin
+    capitals but is a different codepoint range. NFKC collapses it to
+    ASCII -- without the shared helper, a fullwidth-tampered label
+    slips past ``.strip().upper()`` and ships bytewise-tampered into
+    the CEO card PDF."""
+    from topofuzz.publish import (
+        _build_ceo_card_context, _load_manifest, load_publish_metadata,
+    )
+    run_dir = _make_run_with_report_json(tmp_path)
+    manifest_path = run_dir / "manifest.json"
+    m = json.loads(manifest_path.read_text())
+    # U+FF21..U+FF3A fullwidth Latin spelling APPROVE / DENY.
+    m["verdict_label_true"] = "ＡＰＰＲＯＶＥ"
+    m["verdict_label_false"] = "ＤＥＮＹ"
+    manifest_path.write_text(json.dumps(m), encoding="utf-8")
+    metadata = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    ctx = _build_ceo_card_context(
+        metadata=metadata, manifest=manifest,
+        verdict_flip_rate=report["headline"]["verdict_flip_rate"],
+        wilson_addenda=report["wilson_addenda"],
+        target_company=None,
+        run_dir=run_dir, threshold=0.5,
+    )
+    fc = ctx["flip_card"]
+    assert fc is not None
+    assert {fc["canonical_verdict"], fc["variant_verdict"]} == {"APPROVE", "DENY"}
+    # Fullwidth codepoints must NOT survive into the rendered verdict
+    # fields. Spot-check the corner codepoints.
+    combined = fc["canonical_verdict"] + fc["variant_verdict"]
+    assert "Ａ" not in combined
+    assert "Ｄ" not in combined
+
+
+def test_ceo_card_rejects_post_normalize_collision_via_variation_selector(
+    tmp_path,
+):
+    """The collision check fires POST-normalize. The pair ("APPROVE",
+    "APPROVE️") looks distinct bytewise (7 vs 8 codepoints) but
+    collapses to identical "APPROVE" after the Mn-category filter.
+    Without the shared helper this sneaks past the consumer collision
+    check (``"APPROVE".upper() != "APPROVE️".upper()``) and the
+    CEO card would render two visually-identical "APPROVE" verdict
+    pills with different excerpts -- worse than no flip card. The
+    shared helper's NFKC + Mn filter exposes the collision so the
+    consumer can refuse to render."""
+    from topofuzz.publish import (
+        _build_ceo_card_context, _load_manifest, load_publish_metadata,
+    )
+    run_dir = _make_run_with_report_json(tmp_path)
+    manifest_path = run_dir / "manifest.json"
+    m = json.loads(manifest_path.read_text())
+    m["verdict_label_true"] = "APPROVE"
+    m["verdict_label_false"] = "APPROVE️"  # collides POST-normalize.
+    manifest_path.write_text(json.dumps(m), encoding="utf-8")
+    metadata = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    with pytest.raises(PublishError, match="collide after normalization"):
+        _build_ceo_card_context(
+            metadata=metadata, manifest=manifest,
+            verdict_flip_rate=report["headline"]["verdict_flip_rate"],
+            wilson_addenda=report["wilson_addenda"],
+            target_company=None,
+            run_dir=run_dir, threshold=0.5,
+        )
+
+
+def test_ceo_card_falls_back_when_zwsp_only_label_creates_half_custom_pair(
+    tmp_path, caplog,
+):
+    """Pass-1 dual-audit regression (CR M-1 + RT M1, 2026-05-16): a label
+    like ``"​"`` (ZWSP only) is truthy under ``str.strip()`` (which
+    does NOT strip Cf characters), so a pre-normalize XOR check sees
+    both sides as "set" and skips the half-set fallback. Then the
+    helper collapses the ZWSP-only side to ``""``, the empty-fallback
+    resolves it to the default partner, and the buyer sees a
+    half-custom pair (custom-true + default-false) -- exactly the
+    scenario the pair-level fallback is meant to prevent. The fix
+    moves the XOR check to operate on the POST-normalize results so
+    this asymmetric tamper triggers the fallback."""
+    from topofuzz.publish import (
+        _build_ceo_card_context, _load_manifest, load_publish_metadata,
+    )
+    import logging
+    run_dir = _make_run_with_report_json(tmp_path)
+    manifest_path = run_dir / "manifest.json"
+    m = json.loads(manifest_path.read_text())
+    m["verdict_label_true"] = "ESCALATE"
+    m["verdict_label_false"] = "​​"  # ZWSP only -- normalizes to "".
+    manifest_path.write_text(json.dumps(m), encoding="utf-8")
+    metadata = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    with caplog.at_level(logging.WARNING):
+        ctx = _build_ceo_card_context(
+            metadata=metadata, manifest=manifest,
+            verdict_flip_rate=report["headline"]["verdict_flip_rate"],
+            wilson_addenda=report["wilson_addenda"],
+            target_company=None,
+            run_dir=run_dir, threshold=0.5,
+        )
+    fc = ctx["flip_card"]
+    assert fc is not None
+    # Both labels fell back to defaults; no half-custom pair leaks.
+    assert {fc["canonical_verdict"], fc["variant_verdict"]} == {"APPROVE", "DENY"}
+    assert any(
+        "exactly one of verdict_label" in rec.message
+        and "after NFKC" in rec.message
+        for rec in caplog.records
     )
 
 

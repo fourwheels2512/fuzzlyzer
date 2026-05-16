@@ -43,6 +43,7 @@ from typing import Any
 from topofuzz.metrics.verdict_flip import (
     DEFAULT_FLIP_THRESHOLD as DEFAULT_VERDICT_THRESHOLD,
 )
+from topofuzz._verdict_labels import _normalize_verdict_label_for_consumer
 
 _log = logging.getLogger(__name__)
 
@@ -961,56 +962,79 @@ def _build_flip_card(
     # defense-in-depth.
     label_true_raw = manifest.get("verdict_label_true")
     label_false_raw = manifest.get("verdict_label_false")
+    # Cross-consumer NFKC + Cc/Cf/M normalize via shared helper
+    # (BACKLOG 2026-05-16 MAJOR). Without this step a hand-edited
+    # manifest with ZWSP / combining marks / fullwidth Latin / NBSP
+    # padding survives the consumer normalize even though the producer
+    # IR validator would have rejected it at construction time. The
+    # helper is byte-faithful to `ir._normalize_verdict_label` so a
+    # well-formed manifest round-trips identically here and a tampered
+    # one collapses to the same bytes the IR would have produced —
+    # closing the gap that lets visually-as-default content ship with
+    # bytewise-tampered labels.
+    #
+    # Normalize FIRST so the pair-level XOR check below operates on the
+    # POST-normalize results. Pass-1 dual-audit (CR M-1 + RT M1,
+    # 2026-05-16): a label like `"​"` (ZWSP only) is truthy under
+    # `.strip()` (which does NOT strip Cf characters), passes the XOR
+    # as "set", then collapses to empty in the helper and falls back to
+    # the default partner — yielding a half-custom pair (custom-true +
+    # default-false) that defeats the pair-level fallback this consumer
+    # claims to enforce. Evaluating XOR on the post-normalize result
+    # catches all such asymmetric tampers.
+    norm_true = (
+        _normalize_verdict_label_for_consumer(label_true_raw)
+        if isinstance(label_true_raw, str) else ""
+    )
+    norm_false = (
+        _normalize_verdict_label_for_consumer(label_false_raw)
+        if isinstance(label_false_raw, str) else ""
+    )
     # Step 20a/F6 follow-up dual-audit pass-1 RT M2: pair-level XOR
     # check on the manifest. The orchestrator persists labels only as
     # a pair (both-or-neither, gated on differs-from-default), so a
-    # manifest with exactly one key non-empty is an obvious tamper or
-    # hand-edit. Log and fall back to BOTH defaults rather than letting
-    # publish silently default one half against an explicit other half.
-    _has_true = isinstance(label_true_raw, str) and label_true_raw.strip()
-    _has_false = isinstance(label_false_raw, str) and label_false_raw.strip()
-    if bool(_has_true) != bool(_has_false):
+    # manifest with exactly one key resolving to non-empty after
+    # normalize is an obvious tamper or hand-edit. Log and fall back to
+    # BOTH defaults rather than letting publish silently default one
+    # half against an explicit other half.
+    if bool(norm_true) != bool(norm_false):
         _log.warning(
             "publish: manifest has exactly one of verdict_label_true/false "
-            "set (true=%r, false=%r) — both must be set together or "
-            "neither (orchestrator persists as a pair). Falling back to "
-            "APPROVE/DENY defaults.",
+            "non-empty after NFKC + Cc/Cf/M strip (true=%r, false=%r) — "
+            "both must resolve to a non-empty pair or neither (orchestrator "
+            "persists as a pair). Falling back to APPROVE/DENY defaults.",
             label_true_raw, label_false_raw,
         )
-        label_true_raw = None
-        label_false_raw = None
+        norm_true = ""
+        norm_false = ""
     # Step 20a/F6 follow-up dual-audit pass-1 RT M1 + CR MAJOR-2: a
-    # manifest with a >12-char label used to silently slice [:12],
-    # which (a) renders truncated nonsense in the CEO PDF and (b) can
-    # collide with the partner label post-slice in ways the producer
-    # IR validator would reject. Hard-reject and fall back to defaults
-    # so the publish path matches the producer's policy.
-    for raw_label, key in (
-        (label_true_raw, "verdict_label_true"),
-        (label_false_raw, "verdict_label_false"),
+    # manifest with a label that normalizes to >12 chars used to
+    # silently slice [:12], which (a) renders truncated nonsense in
+    # the CEO PDF and (b) can collide with the partner label post-slice
+    # in ways the producer IR validator would reject. Hard-reject and
+    # fall back to defaults so the publish path matches the producer's
+    # policy. Cap measured POST-normalize (not POST-strip) to mirror
+    # producer: a ZWSP-padded 15-char raw collapsing to 7 chars passes,
+    # a 14-char fullwidth raw collapsing to 14 ASCII chars does not.
+    for raw_label, norm, key in (
+        (label_true_raw, norm_true, "verdict_label_true"),
+        (label_false_raw, norm_false, "verdict_label_false"),
     ):
-        if isinstance(raw_label, str) and len(raw_label.strip()) > 12:
+        if len(norm) > 12:
             _log.warning(
-                "publish: manifest %s=%r is >12 chars after strip — "
-                "exceeds the side-by-side flip-card cap. Falling back "
-                "to APPROVE/DENY for BOTH labels (pair-level fallback; "
-                "the partner label is discarded too so the buyer sees "
-                "the same default pair rather than a half-custom pair).",
+                "publish: manifest %s=%r normalizes to >12 chars after "
+                "NFKC + Cc/Cf/M strip — exceeds the side-by-side flip-"
+                "card cap. Falling back to APPROVE/DENY for BOTH labels "
+                "(pair-level fallback; the partner label is discarded "
+                "too so the buyer sees the same default pair rather "
+                "than a half-custom pair).",
                 key, raw_label,
             )
-            label_true_raw = None
-            label_false_raw = None
+            norm_true = ""
+            norm_false = ""
             break
-    label_true = (
-        label_true_raw.strip().upper()[:12]
-        if isinstance(label_true_raw, str) and label_true_raw.strip()
-        else "APPROVE"
-    )
-    label_false = (
-        label_false_raw.strip().upper()[:12]
-        if isinstance(label_false_raw, str) and label_false_raw.strip()
-        else "DENY"
-    )
+    label_true = norm_true if norm_true else "APPROVE"
+    label_false = norm_false if norm_false else "DENY"
     # F6 pass-2 RT M1: same-after-normalize labels destroy the
     # side-by-side story. Refuse the card if a manifest opt-in
     # collapses the pair. CR pass-2 MINOR-1: include raw values so the
