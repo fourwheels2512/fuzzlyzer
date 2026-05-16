@@ -144,6 +144,79 @@ def test_orchestrator_writes_manifest(tmp_path):
     # for byte-identical manifest shape).
     assert payload["terminal_nodes"] == list(plan.topology.terminal)
     assert "verdict_node" not in payload  # v0.5 fixture in _plan(...)
+    # Step 20a/F6 follow-up: verdict_label_true/false omitted entirely
+    # when the IR is at the default APPROVE/DENY pair — keeps v0.5
+    # manifest byte-identical and downstream consumers that fall back to
+    # APPROVE/DENY see the same render as if the field never existed.
+    assert "verdict_label_true" not in payload
+    assert "verdict_label_false" not in payload
+
+
+def _rebind_topology(plan, new_topo):
+    """Return ``plan`` with ``topology=new_topo`` regardless of whether
+    RunPlan is a dataclass, attrs class, or plain object with a frozen
+    ``__dict__`` snapshot. Keeps the two persist-tests below working
+    against any of those three internal shapes."""
+    import dataclasses
+    if dataclasses.is_dataclass(plan):
+        return dataclasses.replace(plan, topology=new_topo)
+    if hasattr(plan, "__dict__"):
+        return plan.__class__(**{**plan.__dict__, "topology": new_topo})
+    return plan
+
+
+def test_orchestrator_persists_verdict_labels_when_non_default(tmp_path):
+    """Step 20a/F6 follow-up: when the IR sets non-default labels (e.g.
+    adversarial-relay → ESCALATE/DEFER), both keys MUST land in the
+    manifest. Without them, publish.py falls back to APPROVE/DENY and
+    the CEO card silently renders the wrong domain language."""
+    from topofuzz.ir import LLMConfig, Node, Topology
+    plan = _plan(tmp_path, n_rows=1)
+    cfg = LLMConfig(model="m", temperature=0.0)
+    new_topo = Topology(
+        name=plan.topology.name,
+        nodes=tuple(
+            Node(id=n.id, role=n.role, kind=n.kind, llm_config=cfg, pinned=n.pinned)
+            for n in plan.topology.nodes
+        ),
+        edges=plan.topology.edges,
+        entrypoint=plan.topology.entrypoint,
+        terminal=plan.topology.terminal,
+        verdict_label_true="escalate",  # IR normalises to upper.
+        verdict_label_false="defer",
+    )
+    plan = _rebind_topology(plan, new_topo)
+    path = write_manifest(plan, cli_args={})
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["verdict_label_true"] == "ESCALATE"
+    assert payload["verdict_label_false"] == "DEFER"
+
+
+def test_orchestrator_persists_verdict_labels_partial_opt_in(tmp_path):
+    """When only one label differs from default, BOTH must still be
+    persisted — a half-written manifest would let publish.py's
+    APPROVE/DENY fallback fill in the unset half and silently re-render
+    the wrong label pair."""
+    from topofuzz.ir import LLMConfig, Node, Topology
+    plan = _plan(tmp_path, n_rows=1)
+    cfg = LLMConfig(model="m", temperature=0.0)
+    new_topo = Topology(
+        name=plan.topology.name,
+        nodes=tuple(
+            Node(id=n.id, role=n.role, kind=n.kind, llm_config=cfg, pinned=n.pinned)
+            for n in plan.topology.nodes
+        ),
+        edges=plan.topology.edges,
+        entrypoint=plan.topology.entrypoint,
+        terminal=plan.topology.terminal,
+        verdict_label_true="escalate",
+        # verdict_label_false stays at default "DENY".
+    )
+    plan = _rebind_topology(plan, new_topo)
+    path = write_manifest(plan, cli_args={})
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["verdict_label_true"] == "ESCALATE"
+    assert payload["verdict_label_false"] == "DENY"
 
 
 def test_orchestrator_persists_verdict_node_when_set(tmp_path):
@@ -151,7 +224,7 @@ def test_orchestrator_persists_verdict_node_when_set(tmp_path):
     manifest.json when the Topology sets it, otherwise downstream
     publish (CEO card), inspect, and repro cannot mirror the runner's
     verdict-node dispatch and silently fall back to outputs[-1]."""
-    from topofuzz.ir import Edge, LLMConfig, Node, Topology
+    from topofuzz.ir import LLMConfig, Node, Topology
     plan = _plan(tmp_path, n_rows=1)
     # Rebuild plan.topology with verdict_node set.
     cfg = LLMConfig(model="m", temperature=0.0)

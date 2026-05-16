@@ -65,6 +65,8 @@ def from_langgraph(
     name: str = "topology",
     llm_configs: dict[str, LLMConfig] | None = None,
     verdict_node: str | None = None,
+    verdict_label_true: str | None = None,
+    verdict_label_false: str | None = None,
 ) -> Topology:
     """Convert a compiled LangGraph (``StateGraph.compile()``) into a Topology.
 
@@ -84,6 +86,17 @@ def from_langgraph(
             explicitly. Unknown ids raise ``NotImplementedError``. When
             ``None`` the runner falls back to the lex-first ``terminal``
             entry — the v0.5 behaviour, preserved bit-for-bit.
+        verdict_label_true: Optional v0.6 producer-side declaration of the
+            human-readable label rendered next to the judge's
+            ``passes_eval=True`` decision in the CEO card and inspect
+            view. Pass-through to the IR which strips whitespace,
+            upper-cases, and rejects strings >12 chars or that collapse
+            against ``verdict_label_false`` post-normalize. ``None``
+            preserves the default ``"APPROVE"`` (lending semantics).
+        verdict_label_false: Same shape as ``verdict_label_true``;
+            ``None`` defaults to ``"DENY"``. Examples: an adversarial-
+            relay fixture passes ``"ESCALATE"`` / ``"DEFER"``; a
+            healthcare triage fixture passes ``"URGENT"`` / ``"ROUTINE"``.
 
     Raises:
         NotImplementedError: If the graph uses an out-of-scope construct
@@ -91,6 +104,9 @@ def from_langgraph(
             the LangGraph 1.x StateGraph builder API, ``llm_configs``
             references a node id that is not present in the walked graph,
             or ``verdict_node`` is not in the walked graph.
+        pydantic.ValidationError: If either ``verdict_label_*`` violates
+            the IR normalisation rules (non-string, empty after strip,
+            >12 chars, or pair collision post-normalize).
     """
     builder = getattr(compiled, "builder", None)
     if builder is None:
@@ -162,7 +178,10 @@ def from_langgraph(
             f"See {_OOS_TRACKER}."
         )
 
-    return Topology(
+    # Build kwargs dict so unset (None) label kwargs preserve the IR's
+    # native defaults — passing ``verdict_label_true=None`` would trip the
+    # field-validator's "must be str" branch instead of using "APPROVE".
+    topo_kwargs: dict[str, Any] = dict(
         name=name,
         nodes=nodes,
         edges=edges,
@@ -170,6 +189,11 @@ def from_langgraph(
         terminal=sorted(set(terminals)),
         verdict_node=verdict_node,
     )
+    if verdict_label_true is not None:
+        topo_kwargs["verdict_label_true"] = verdict_label_true
+    if verdict_label_false is not None:
+        topo_kwargs["verdict_label_false"] = verdict_label_false
+    return Topology(**topo_kwargs)
 
 
 def _reject_sentinel_collisions(builder: Any) -> None:

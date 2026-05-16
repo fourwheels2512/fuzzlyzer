@@ -182,15 +182,23 @@ class TestCanonicalHashChainConsistency:
         # different hash universes overnight. This test pins that they
         # produce byte-identical output for the same input.
         #
-        # The recipe strips ``verdict_node`` when None so v0.5 fixtures
-        # (no verdict_node) hash byte-identically to their hash before
-        # the field existed — see Topology.canonical_hash docstring.
+        # The recipe strips ``verdict_node`` when None and BOTH
+        # ``verdict_label_true``/``verdict_label_false`` when BOTH are at
+        # the default pair ``("APPROVE","DENY")`` so v0.5 fixtures hash
+        # byte-identically to their hash before either field existed —
+        # see Topology.canonical_hash docstring.
         from fuzzeval.canonical import canonical_hash as shared
 
         topo = _sample_topology()
         expected_view = topo.model_dump(mode="json")
         if expected_view.get("verdict_node") is None:
             expected_view.pop("verdict_node", None)
+        if (
+            expected_view.get("verdict_label_true") == "APPROVE"
+            and expected_view.get("verdict_label_false") == "DENY"
+        ):
+            expected_view.pop("verdict_label_true", None)
+            expected_view.pop("verdict_label_false", None)
         assert topo.canonical_hash() == shared(expected_view)
 
     def test_topology_hash_with_verdict_node_set_includes_field(self):
@@ -210,6 +218,15 @@ class TestCanonicalHashChainConsistency:
         )
         expected_view = topo.model_dump(mode="json")
         assert expected_view["verdict_node"] == "b"
+        # Labels are at default ("APPROVE","DENY") here — strip them
+        # under the same pair-level recipe as canonical_hash so the
+        # shared-helper check stays apples-to-apples.
+        if (
+            expected_view.get("verdict_label_true") == "APPROVE"
+            and expected_view.get("verdict_label_false") == "DENY"
+        ):
+            expected_view.pop("verdict_label_true", None)
+            expected_view.pop("verdict_label_false", None)
         assert topo.canonical_hash() == shared(expected_view)
 
     def test_llm_config_hash_matches_shared_helper(self):
@@ -285,13 +302,20 @@ class TestVerdictNode:
             "shipping. Got: " + toy.canonical_hash()
         )
         # Independently recompute under the explicit "strip verdict_node
-        # when None" recipe — proves the canonical_hash method matches
-        # the documented v0.5 wire shape.
+        # when None + strip BOTH verdict_label_* when BOTH at default"
+        # recipe — proves the canonical_hash method matches the
+        # documented v0.5 wire shape.
         from fuzzeval.canonical import canonical_hash as shared
 
         v05_view = toy.model_dump(mode="json")
         v05_view.pop("verdict_node", None)
+        # v0.5 toy has both labels at default → both stripped under the
+        # pair-level rule documented in canonical_hash.
+        v05_view.pop("verdict_label_true", None)
+        v05_view.pop("verdict_label_false", None)
         assert "verdict_node" not in v05_view
+        assert "verdict_label_true" not in v05_view
+        assert "verdict_label_false" not in v05_view
         assert toy.canonical_hash() == shared(v05_view)
         # Pin (2) — Documents that ``model_dump_json()`` is NOT
         # equivalent to the canonical_hash recipe. The strip lives only
@@ -305,6 +329,10 @@ class TestVerdictNode:
         dump_view = json.loads(toy.model_dump_json())
         assert dump_view.get("verdict_node") is None
         assert "verdict_node" in dump_view
+        # model_dump_json emits the labels at default too — proves the
+        # strip is canonical_hash-only.
+        assert dump_view.get("verdict_label_true") == "APPROVE"
+        assert dump_view.get("verdict_label_false") == "DENY"
         assert shared(dump_view) != toy.canonical_hash()
 
     def test_setting_verdict_node_changes_hash(self):
@@ -339,6 +367,156 @@ class TestVerdictNode:
         b = Topology.model_validate_json(a.model_dump_json())
         assert b.verdict_node == "b"
         assert a.canonical_hash() == b.canonical_hash()
+
+
+class TestVerdictLabels:
+    """Step 20a/F6 follow-up: producer-side ``verdict_label_true`` and
+    ``verdict_label_false`` IR fields, default pair ``("APPROVE","DENY")``,
+    stripped from canonical_hash as a pair when both at default."""
+
+    def _two_node_topo(self, **labels) -> Topology:
+        return Topology(
+            name="t",
+            nodes=[Node(id="a", role="r"), Node(id="b", role="r")],
+            edges=[Edge(from_id="a", to_id="b")],
+            entrypoint="a",
+            terminal=["b"],
+            **labels,
+        )
+
+    def test_defaults_are_approve_deny(self):
+        t = self._two_node_topo()
+        assert t.verdict_label_true == "APPROVE"
+        assert t.verdict_label_false == "DENY"
+
+    def test_lowercase_input_normalized_to_uppercase(self):
+        t = self._two_node_topo(
+            verdict_label_true="escalate", verdict_label_false="defer"
+        )
+        assert t.verdict_label_true == "ESCALATE"
+        assert t.verdict_label_false == "DEFER"
+
+    def test_whitespace_stripped(self):
+        t = self._two_node_topo(
+            verdict_label_true="  escalate  ",
+            verdict_label_false="\tdefer\n",
+        )
+        assert t.verdict_label_true == "ESCALATE"
+        assert t.verdict_label_false == "DEFER"
+
+    def test_empty_after_strip_rejected(self):
+        with pytest.raises(ValidationError, match="non-empty after"):
+            self._two_node_topo(verdict_label_true="   ")
+
+    def test_non_string_rejected(self):
+        with pytest.raises(ValidationError, match="must be str"):
+            self._two_node_topo(verdict_label_true=123)  # type: ignore[arg-type]
+
+    def test_over_twelve_chars_rejected(self):
+        # 13 chars after strip+upper.
+        with pytest.raises(ValidationError, match="≤12 chars"):
+            self._two_node_topo(verdict_label_true="thirteen_char")
+
+    def test_exactly_twelve_chars_accepted(self):
+        t = self._two_node_topo(
+            verdict_label_true="twelve_chars", verdict_label_false="DENY"
+        )
+        assert t.verdict_label_true == "TWELVE_CHARS"
+        assert len(t.verdict_label_true) == 12
+
+    def test_collision_after_normalize_rejected(self):
+        # "approve" and "APPROVE" both normalize to "APPROVE" — the
+        # pair collapses and would render two excerpts under the same
+        # label. Same logic as the publish-side defense in
+        # ``publish._build_ceo_card_context``.
+        with pytest.raises(ValidationError, match="must differ"):
+            self._two_node_topo(
+                verdict_label_true="approve", verdict_label_false="APPROVE"
+            )
+
+    def test_v05_hash_unchanged_after_label_fields_added(self):
+        # Regression guard: a v0.5-shape topology (no explicit labels,
+        # default pair) must canonical-hash byte-identically to its hash
+        # before the label fields existed. Without the pair-level strip,
+        # JCS encodes the explicit defaults and silently rebuckets every
+        # persisted ir_canonical_hash and signed bundle.
+        toy = Topology(
+            name="v05-frozen",
+            nodes=[Node(id="a", role="r"), Node(id="b", role="r")],
+            edges=[Edge(from_id="a", to_id="b")],
+            entrypoint="a",
+            terminal=["b"],
+        )
+        # Same sentinel as test_v05_hash_unchanged_after_field_added —
+        # if EITHER the verdict_node strip OR the verdict_label pair
+        # strip breaks, every persisted hash diverges.
+        assert (
+            toy.canonical_hash()
+            == "94a458671a4cb056c00f0d5247576e4dc1ccbaaa802fb8724736b29aba1f0327"  # noqa: E501
+        ), (
+            "v0.5 fixture hash diverged after adding verdict_label_* "
+            "fields. The strip-when-default recipe is broken. Persisted "
+            "run.sqlite ir_canonical_hash columns will no longer match "
+            "topology regeneration. Got: " + toy.canonical_hash()
+        )
+
+    def test_setting_non_default_labels_changes_hash(self):
+        a = self._two_node_topo()
+        b = self._two_node_topo(
+            verdict_label_true="escalate", verdict_label_false="defer"
+        )
+        # Same topology shape; different verdict-label pair IS a
+        # different measurement contract identity.
+        assert a.canonical_hash() != b.canonical_hash()
+
+    def test_partial_opt_in_recipe_equivalence(self):
+        # Recipe-equivalence pin: when only one label differs from
+        # default, the label-strip rule does NOT fire (it's pair-level),
+        # so canonical_hash MUST equal the shared-helper hash on the
+        # full view (with both labels present). This proves the
+        # canonical_hash implementation matches the documented recipe
+        # for the partial-opt-in case. Companion test
+        # ``test_partial_opt_in_distinct_from_full_default`` covers the
+        # "shares a bucket with v0.5 default" anti-property.
+        from fuzzeval.canonical import canonical_hash as shared
+
+        partial = self._two_node_topo(
+            verdict_label_true="escalate", verdict_label_false="DENY"
+        )
+        view = partial.model_dump(mode="json")
+        # No label strip fires here — both labels are still in the view.
+        assert view.get("verdict_label_true") == "ESCALATE"
+        assert view.get("verdict_label_false") == "DENY"
+        # The verdict_node=None strip still fires under canonical_hash;
+        # mirror it on the view so the shared-helper comparison is
+        # apples-to-apples (this test isolates the label-strip rule).
+        view.pop("verdict_node", None)
+        assert partial.canonical_hash() == shared(view)
+
+    def test_partial_opt_in_distinct_from_full_default(self):
+        # Explicit "partial opt-in" (verdict_label_true changed, _false
+        # at default value "DENY") must produce a DIFFERENT hash than
+        # a pure-default v0.5 topology — proves the pair-level strip
+        # rule doesn't accidentally swallow the half-set case.
+        full_default = self._two_node_topo()
+        partial = self._two_node_topo(
+            verdict_label_true="escalate", verdict_label_false="DENY"
+        )
+        assert full_default.canonical_hash() != partial.canonical_hash()
+
+    def test_round_trip_through_json_preserves_labels(self):
+        a = self._two_node_topo(
+            verdict_label_true="escalate", verdict_label_false="defer"
+        )
+        b = Topology.model_validate_json(a.model_dump_json())
+        assert b.verdict_label_true == "ESCALATE"
+        assert b.verdict_label_false == "DEFER"
+        assert a.canonical_hash() == b.canonical_hash()
+
+    def test_frozen_field_assignment_rejected(self):
+        t = self._two_node_topo()
+        with pytest.raises(ValidationError):
+            t.verdict_label_true = "ESCALATE"  # type: ignore[misc]
 
 
 class TestCanonicalHash:

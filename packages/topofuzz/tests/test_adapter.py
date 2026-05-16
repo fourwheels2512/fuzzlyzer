@@ -398,6 +398,154 @@ class TestVerdictNode:
         assert bare.canonical_hash() != explicit.canonical_hash()
 
 
+class TestVerdictLabels:
+    """Step 20a/F6 follow-up: adapter forwards optional
+    ``verdict_label_true``/``verdict_label_false`` kwargs to the IR,
+    which normalises and validates them."""
+
+    def test_labels_unset_default_to_approve_deny(self):
+        topo = from_langgraph(build_lending_4role(), name="lending")
+        assert topo.verdict_label_true == "APPROVE"
+        assert topo.verdict_label_false == "DENY"
+
+    def test_labels_set_normalize_to_uppercase(self):
+        topo = from_langgraph(
+            build_lending_4role(),
+            verdict_label_true="escalate",
+            verdict_label_false="defer",
+        )
+        assert topo.verdict_label_true == "ESCALATE"
+        assert topo.verdict_label_false == "DEFER"
+
+    def test_default_labels_preserve_v05_hash(self):
+        # Passing neither label kwarg, OR passing both at default
+        # ("APPROVE" / "DENY"), must produce the SAME canonical_hash —
+        # the pair-level strip rule in IR.canonical_hash makes the
+        # explicit-default and unset cases byte-identical on the wire.
+        unset = from_langgraph(build_lending_4role(), name="lending")
+        explicit_default = from_langgraph(
+            build_lending_4role(),
+            name="lending",
+            verdict_label_true="APPROVE",
+            verdict_label_false="DENY",
+        )
+        assert unset.canonical_hash() == explicit_default.canonical_hash()
+
+    def test_non_default_labels_change_canonical_hash(self):
+        # A different label pair IS a different measurement contract
+        # identity — must produce a different canonical_hash so the
+        # signed bundle / cache key catch the change.
+        bare = from_langgraph(build_lending_4role())
+        custom = from_langgraph(
+            build_lending_4role(),
+            verdict_label_true="ESCALATE",
+            verdict_label_false="DEFER",
+        )
+        assert bare.canonical_hash() != custom.canonical_hash()
+
+    def test_over_twelve_char_label_rejected(self):
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError, match="≤12 chars"):
+            from_langgraph(
+                build_lending_4role(),
+                verdict_label_true="thirteen_char",
+            )
+
+    def test_collision_after_normalize_rejected(self):
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError, match="must differ"):
+            from_langgraph(
+                build_lending_4role(),
+                verdict_label_true="approve",
+                verdict_label_false="APPROVE",
+            )
+
+    def test_explicit_none_kwarg_uses_default(self):
+        # Pinning the explicit-None branch (red-team pass-1 MIN5): the
+        # adapter's ``topo_kwargs`` dict deliberately omits None-valued
+        # label kwargs so the IR's defaults fire instead of tripping
+        # the "must be str" branch of the field-validator. If a future
+        # refactor passes None through to ``Topology(...)`` directly,
+        # this test fails.
+        topo = from_langgraph(
+            build_lending_4role(),
+            verdict_label_true=None,
+            verdict_label_false=None,
+        )
+        assert topo.verdict_label_true == "APPROVE"
+        assert topo.verdict_label_false == "DENY"
+
+    def test_nfkc_normalize_fullwidth_collapses_to_ascii(self):
+        # Red-team pass-1 B2: fullwidth Latin "ＡＰＰＲＯＶＥ" must
+        # collapse to ASCII "APPROVE" via NFKC before the collision
+        # check fires. Without NFKC, a hand-edit could ship a label
+        # that visually renders as "APPROVE" past the collision check.
+        topo = from_langgraph(
+            build_lending_4role(),
+            verdict_label_true="ＥＳＣＡＬＡＴＥ",  # fullwidth ESCALATE
+            verdict_label_false="defer",
+        )
+        assert topo.verdict_label_true == "ESCALATE"
+
+    def test_variation_selector_collapses_to_default(self):
+        # Red-team pass-2 MAJ-1: U+FE0F (VARIATION SELECTOR-16, Mn
+        # category) used to survive the Cc/Cf-only filter, producing
+        # "APPROVE️" — visually identical to "APPROVE" but
+        # bytewise distinct. The M-category strip drops it so the post-
+        # normalize value matches the canonical "APPROVE" — preserving
+        # the "v0.5 byte-identical hash when at default" invariant
+        # against a tampered fixture that tries to bypass the
+        # canonical_hash strip-when-default rule via Mn smuggling.
+        topo = from_langgraph(
+            build_lending_4role(),
+            verdict_label_true="APPROVE️",
+            verdict_label_false="DENY️",
+        )
+        assert topo.verdict_label_true == "APPROVE"
+        assert topo.verdict_label_false == "DENY"
+        # And: this MUST hash identically to the bare default topology —
+        # if the strip didn't fire, the pair would persist in the
+        # canonical_hash payload and the v0.5-compat invariant breaks.
+        bare = from_langgraph(build_lending_4role())
+        assert topo.canonical_hash() == bare.canonical_hash()
+
+    def test_combining_mark_collision_caught(self):
+        # Red-team pass-2 MAJ-1: combining marks (Mn) like U+0323
+        # (COMBINING DOT BELOW) render as visually-similar glyphs.
+        # "AP̣PROVE" → strip Mn → "APPROVE" — equal to a separately
+        # supplied "APPROVE" — collision check fires post-normalize.
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError, match="must differ"):
+            from_langgraph(
+                build_lending_4role(),
+                verdict_label_true="AP̣PROVE",
+                verdict_label_false="APPROVE",
+            )
+
+    def test_zero_width_space_stripped(self):
+        # Red-team pass-1 B2: zero-width-space (Cf category) must be
+        # dropped so an attacker can't pass "ESCAL​ATE" and slip
+        # past the collision check while rendering as "ESCALATE" in
+        # the PDF.
+        from pydantic import ValidationError
+        # ZWSP-laden "APPROVE" collapses to "APPROVE" after Cf strip,
+        # which collides with the default — but a fullwidth-then-
+        # ZWSP fixture should also normalize cleanly when paired with
+        # a distinct other label.
+        topo = from_langgraph(
+            build_lending_4role(),
+            verdict_label_true="ESCAL​ATE",  # ZWSP between L and A
+            verdict_label_false="defer",
+        )
+        assert topo.verdict_label_true == "ESCALATE"
+        # And: ZWSP-only label is empty after filter → reject.
+        with pytest.raises(ValidationError, match="non-empty"):
+            from_langgraph(
+                build_lending_4role(),
+                verdict_label_true="​​",  # ZWSP only
+            )
+
+
 class TestReservedNodeIdChars:
     def test_colon_in_node_id_rejected_via_fake_builder(self):
         # `":"` is reserved because xray=1 flattens subgraph nodes as

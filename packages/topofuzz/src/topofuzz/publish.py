@@ -953,17 +953,54 @@ def _build_flip_card(
     if not canonical_excerpt or not variant_excerpt:
         return None
 
-    # F6 pass-1 CR M1 + pass-2 RT B1: APPROVE/DENY is lending-domain-
-    # specific, but the ONLY gallery today (lending-4role) IS approval
-    # semantics — and there is no producer-side wiring yet for
-    # `verdict_label_true/false` (BACKLOG follow-up). Defaulting to
-    # neutral "VERDICT A/B" today regresses the working lending demo
-    # to fix a future hypothetical adversarial-relay demo. Keep
-    # APPROVE/DENY as the default and honor the manifest opt-in as the
-    # forward-compat path; flip the default to neutral once a
-    # non-lending gallery + producer-side IR field ship together.
+    # F6 pass-1 CR M1 + pass-2 RT B1: APPROVE/DENY is the lending-
+    # domain default. Producer-side wiring (Step 20a/F6 follow-up,
+    # 2026-05-16) now lands non-default labels in the manifest via the
+    # IR field, but a hand-edited or tampered manifest can still slip
+    # malformed values past the IR — this consumer path stays
+    # defense-in-depth.
     label_true_raw = manifest.get("verdict_label_true")
     label_false_raw = manifest.get("verdict_label_false")
+    # Step 20a/F6 follow-up dual-audit pass-1 RT M2: pair-level XOR
+    # check on the manifest. The orchestrator persists labels only as
+    # a pair (both-or-neither, gated on differs-from-default), so a
+    # manifest with exactly one key non-empty is an obvious tamper or
+    # hand-edit. Log and fall back to BOTH defaults rather than letting
+    # publish silently default one half against an explicit other half.
+    _has_true = isinstance(label_true_raw, str) and label_true_raw.strip()
+    _has_false = isinstance(label_false_raw, str) and label_false_raw.strip()
+    if bool(_has_true) != bool(_has_false):
+        _log.warning(
+            "publish: manifest has exactly one of verdict_label_true/false "
+            "set (true=%r, false=%r) — both must be set together or "
+            "neither (orchestrator persists as a pair). Falling back to "
+            "APPROVE/DENY defaults.",
+            label_true_raw, label_false_raw,
+        )
+        label_true_raw = None
+        label_false_raw = None
+    # Step 20a/F6 follow-up dual-audit pass-1 RT M1 + CR MAJOR-2: a
+    # manifest with a >12-char label used to silently slice [:12],
+    # which (a) renders truncated nonsense in the CEO PDF and (b) can
+    # collide with the partner label post-slice in ways the producer
+    # IR validator would reject. Hard-reject and fall back to defaults
+    # so the publish path matches the producer's policy.
+    for raw_label, key in (
+        (label_true_raw, "verdict_label_true"),
+        (label_false_raw, "verdict_label_false"),
+    ):
+        if isinstance(raw_label, str) and len(raw_label.strip()) > 12:
+            _log.warning(
+                "publish: manifest %s=%r is >12 chars after strip — "
+                "exceeds the side-by-side flip-card cap. Falling back "
+                "to APPROVE/DENY for BOTH labels (pair-level fallback; "
+                "the partner label is discarded too so the buyer sees "
+                "the same default pair rather than a half-custom pair).",
+                key, raw_label,
+            )
+            label_true_raw = None
+            label_false_raw = None
+            break
     label_true = (
         label_true_raw.strip().upper()[:12]
         if isinstance(label_true_raw, str) and label_true_raw.strip()
@@ -976,11 +1013,15 @@ def _build_flip_card(
     )
     # F6 pass-2 RT M1: same-after-normalize labels destroy the
     # side-by-side story. Refuse the card if a manifest opt-in
-    # collapses the pair.
+    # collapses the pair. CR pass-2 MINOR-1: include raw values so the
+    # operator can see which input pair collided rather than guessing
+    # from the post-normalize string alone.
     if label_true == label_false:
         raise PublishError(
             f"manifest verdict_label_true/false collide after "
-            f"normalization (both → {label_true!r}); refuse to render."
+            f"normalization (raw: true={label_true_raw!r}, "
+            f"false={label_false_raw!r}; both → {label_true!r}); "
+            f"refuse to render."
         )
     return {
         "eval_prompt_excerpt": _truncate(

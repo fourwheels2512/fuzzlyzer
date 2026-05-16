@@ -1109,3 +1109,44 @@ class TestVariantStructuralIntegrity:
                 f"variant {v.canonical_hash()[:8]} lost verdict_node: "
                 f"got {v.verdict_node!r}"
             )
+
+    def test_variants_preserve_verdict_labels_through_generation(self):
+        """Step 20a/F6 follow-up (red-team pass-1 B1): every variant
+        generator must propagate ``verdict_label_true``/``verdict_label_false``
+        through ``_rebuild``. Without this, a non-lending fixture's
+        identity variant carries custom labels (e.g. ESCALATE/DEFER)
+        while permuted variants silently default to APPROVE/DENY —
+        producing asymmetric canonical_hash bucketing (variant 0
+        retains the pair under the strip rule's "differs from default"
+        branch; variants 1..N hit the strip), corrupting cell-cache
+        lookups and confirm-pass re-binding."""
+        from topofuzz.ir import Edge, LLMConfig, Node
+        cfg = LLMConfig(model="m", temperature=0.0)
+        nodes = tuple(
+            Node(id=nid, role=f"r_{nid}", llm_config=cfg)
+            for nid in ("a", "b", "c", "d")
+        )
+        topo = Topology(
+            name="vl-preserve",
+            nodes=nodes,
+            edges=(
+                Edge(from_id="a", to_id="b"),
+                Edge(from_id="b", to_id="c"),
+                Edge(from_id="c", to_id="d"),
+            ),
+            entrypoint="a",
+            terminal=("d",),
+            verdict_label_true="escalate",
+            verdict_label_false="defer",
+        )
+        variants = list(generate_variants(topo))
+        assert variants  # smoke
+        for v in variants:
+            assert v.verdict_label_true == "ESCALATE", (
+                f"variant {v.canonical_hash()[:8]} lost "
+                f"verdict_label_true: got {v.verdict_label_true!r}"
+            )
+            assert v.verdict_label_false == "DEFER", (
+                f"variant {v.canonical_hash()[:8]} lost "
+                f"verdict_label_false: got {v.verdict_label_false!r}"
+            )

@@ -313,6 +313,21 @@ def write_manifest(plan: RunPlan, *, cli_args: dict[str, Any]) -> Path:
     # don't know about the field are unaffected.
     if plan.topology.verdict_node is not None:
         payload["verdict_node"] = plan.topology.verdict_node
+    # Step 20a/F6 follow-up: include verdict_label_true/false ONLY when
+    # the pair differs from the IR default ("APPROVE","DENY"). Pair-level
+    # gate mirrors the canonical_hash strip rule — a v0.5 fixture
+    # produces a manifest byte-identical to its pre-field shape, and a
+    # publish.py/inspect.py consumer that doesn't know about the fields
+    # falls back to the same default. As soon as either differs,
+    # persist BOTH so the consumer reads the full pair (a half-written
+    # manifest with only one label would let publish.py's default fill
+    # in the other half and silently re-render the wrong label).
+    if (
+        plan.topology.verdict_label_true != "APPROVE"
+        or plan.topology.verdict_label_false != "DENY"
+    ):
+        payload["verdict_label_true"] = plan.topology.verdict_label_true
+        payload["verdict_label_false"] = plan.topology.verdict_label_false
     path = plan.run_dir / "manifest.json"
     path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False),

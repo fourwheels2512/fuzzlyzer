@@ -1301,6 +1301,71 @@ def test_flip_card_honors_manifest_verdict_labels(tmp_path):
     assert {fc["canonical_verdict"], fc["variant_verdict"]} == {"APPROVE", "DENY"}
 
 
+def test_flip_card_rejects_xor_half_set_manifest(tmp_path, caplog):
+    """Red-team pass-1 M2: orchestrator persists labels as a pair
+    (both-or-neither). A tampered manifest with exactly one label
+    non-empty must NOT let publish silently default the unset half —
+    instead, log + fall back to BOTH defaults."""
+    from topofuzz.publish import _build_ceo_card_context, _load_manifest, load_publish_metadata
+    import logging
+    run_dir = _make_run_with_report_json(tmp_path)
+    manifest_path = run_dir / "manifest.json"
+    m = json.loads(manifest_path.read_text())
+    m["verdict_label_true"] = "ESCALATE"
+    # verdict_label_false intentionally absent — half-set tamper.
+    manifest_path.write_text(json.dumps(m), encoding="utf-8")
+    metadata = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    with caplog.at_level(logging.WARNING):
+        ctx = _build_ceo_card_context(
+            metadata=metadata, manifest=manifest,
+            verdict_flip_rate=report["headline"]["verdict_flip_rate"],
+            wilson_addenda=report["wilson_addenda"],
+            target_company=None,
+            run_dir=run_dir, threshold=0.5,
+        )
+    fc = ctx["flip_card"]
+    assert fc is not None
+    # Both fell back to defaults despite half-set tamper.
+    assert {fc["canonical_verdict"], fc["variant_verdict"]} == {"APPROVE", "DENY"}
+    assert any(
+        "exactly one of verdict_label" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_flip_card_rejects_over_twelve_char_manifest_label(tmp_path, caplog):
+    """Red-team pass-1 M1 + CR MAJOR-2: a tampered manifest with a
+    label >12 chars used to silently slice and ship truncated text in
+    the CEO PDF. Now publish logs and falls back to both defaults."""
+    from topofuzz.publish import _build_ceo_card_context, _load_manifest, load_publish_metadata
+    import logging
+    run_dir = _make_run_with_report_json(tmp_path)
+    manifest_path = run_dir / "manifest.json"
+    m = json.loads(manifest_path.read_text())
+    m["verdict_label_true"] = "PARTIALLY_APPROVED"  # 18 chars
+    m["verdict_label_false"] = "REJECTED"
+    manifest_path.write_text(json.dumps(m), encoding="utf-8")
+    metadata = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    with caplog.at_level(logging.WARNING):
+        ctx = _build_ceo_card_context(
+            metadata=metadata, manifest=manifest,
+            verdict_flip_rate=report["headline"]["verdict_flip_rate"],
+            wilson_addenda=report["wilson_addenda"],
+            target_company=None,
+            run_dir=run_dir, threshold=0.5,
+        )
+    fc = ctx["flip_card"]
+    assert fc is not None
+    assert {fc["canonical_verdict"], fc["variant_verdict"]} == {"APPROVE", "DENY"}
+    assert any(
+        ">12 chars after strip" in rec.message for rec in caplog.records
+    )
+
+
 def test_build_ceo_card_pdf_end_to_end_renders_exactly_one_page(tmp_path):
     """F6 pass-1 CR M3 + pass-2 RT B2: real Chromium render, asserts
     EXACTLY 1 page on the synthetic lending fixture so a template

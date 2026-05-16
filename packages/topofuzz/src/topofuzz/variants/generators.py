@@ -161,6 +161,19 @@ def _rebuild(topology: Topology, new_nodes: tuple[Node, ...]) -> Topology:
         entrypoint=topology.entrypoint,
         terminal=topology.terminal,
         verdict_node=topology.verdict_node,
+        # Step 20a/F6 follow-up — propagate the producer-side label pair
+        # to every variant. Without this, a non-lending fixture
+        # (verdict_label_true="ESCALATE") would have its identity-variant
+        # (variant 0) carry the custom pair while permuted variants
+        # silently fall back to the default APPROVE/DENY pair. The
+        # pair-level strip rule in canonical_hash would then OMIT the
+        # pair on variants 1..N (defaulted) but RETAIN it on variant 0
+        # (custom), producing asymmetric bucketing — variant 0's cache
+        # row would NOT match the same node-shape topology declared
+        # without verdict_labels, while variants 1..N WOULD. Caught by
+        # red-team pass-1 B1.
+        verdict_label_true=topology.verdict_label_true,
+        verdict_label_false=topology.verdict_label_false,
     )
 
 

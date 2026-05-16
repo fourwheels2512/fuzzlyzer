@@ -184,11 +184,55 @@ def load_topology(spec: str) -> Topology:
             f"{path_str}:__topofuzz_verdict_node__ must be str; got "
             f"{type(verdict_node).__name__}."
         )
+    # Step 20a/F6 follow-up: forward optional
+    # ``__topofuzz_verdict_label_{true,false}__`` so producer-side
+    # custom labels survive the confirm-pass IR regeneration. Same
+    # rationale as verdict_node — a dropped label would change the
+    # variant canonical_hash and confirm wouldn't find the cells.
+    # Type-check at the boundary; defer normalisation + length rules
+    # to the IR field-validator so the recipe lives in one place.
+    # Red-team pass-1 M5: lock to canonical ``str`` (not subclass) and
+    # M6: WARN log if attr is explicitly None so a fixture author who
+    # wrote ``__topofuzz_verdict_label_true__ = None`` thinking they
+    # were being explicit about "use default" gets a visible signal
+    # rather than silent fallback.
+    # Local variable named ``dunder_attr`` to avoid shadowing the outer
+    # ``attr`` from ``_split_spec`` (red-team pass-2 MAJ-2).
+    _label_attr_pairs = [
+        ("verdict_label_true", "__topofuzz_verdict_label_true__"),
+        ("verdict_label_false", "__topofuzz_verdict_label_false__"),
+    ]
+    _label_forwards: dict[str, str | None] = {}
+    _SENTINEL = object()
+    for kwarg, dunder_attr in _label_attr_pairs:
+        raw = getattr(module, dunder_attr, _SENTINEL)
+        if raw is _SENTINEL:
+            _label_forwards[kwarg] = None
+            continue
+        if raw is None:
+            _log.warning(
+                "%s:%s = None — using default (APPROVE/DENY). Remove the "
+                "attribute entirely to silence this warning, or set it "
+                "to a non-empty str (e.g. 'ESCALATE') to opt in.",
+                path_str, dunder_attr,
+            )
+            _label_forwards[kwarg] = None
+            continue
+        if type(raw) is not str:
+            raise TypeError(
+                f"{path_str}:{dunder_attr} must be str (not subclass); got "
+                f"{type(raw).__name__}."
+            )
+        _label_forwards[kwarg] = raw
+    verdict_label_true = _label_forwards["verdict_label_true"]
+    verdict_label_false = _label_forwards["verdict_label_false"]
     return from_langgraph(
         compiled,
         name=name,
         llm_configs=llm_configs,
         verdict_node=verdict_node,
+        verdict_label_true=verdict_label_true,
+        verdict_label_false=verdict_label_false,
     )
 
 

@@ -224,6 +224,122 @@ def test_load_topology_rejects_non_string_verdict_node(tmp_path):
         load_topology(f"{f}:build_graph")
 
 
+# Step 20a/F6 follow-up: __topofuzz_verdict_label_{true,false}__
+# forwarded so confirm-pass regeneration round-trips with the same
+# canonical_hash on fixtures with custom labels (e.g. adversarial-relay).
+_FIXTURE_VERDICT_LABELS = '''
+from langgraph.graph import END, START, StateGraph
+from typing import TypedDict
+
+
+class _S(TypedDict, total=False):
+    x: str
+
+
+def _agent(state):
+    return state
+
+
+def build_graph():
+    g = StateGraph(_S)
+    g.add_node("a", _agent)
+    g.add_edge(START, "a")
+    g.add_edge("a", END)
+    return g.compile()
+
+
+__topofuzz_verdict_label_true__ = "escalate"
+__topofuzz_verdict_label_false__ = "defer"
+'''
+
+
+def test_load_topology_forwards_verdict_labels(tmp_path):
+    f = _write_fixture(tmp_path, _FIXTURE_VERDICT_LABELS)
+    topo = load_topology(f"{f}:build_graph")
+    # Forwarded raw; IR's field-validator normalises to upper-case.
+    assert topo.verdict_label_true == "ESCALATE"
+    assert topo.verdict_label_false == "DEFER"
+
+
+def test_load_topology_default_labels_when_absent(tmp_path):
+    f = _write_fixture(tmp_path)
+    topo = load_topology(f"{f}:build_graph")
+    assert topo.verdict_label_true == "APPROVE"
+    assert topo.verdict_label_false == "DENY"
+
+
+_FIXTURE_BAD_VERDICT_LABEL = '''
+from langgraph.graph import END, START, StateGraph
+from typing import TypedDict
+
+
+class _S(TypedDict, total=False):
+    x: str
+
+
+def _agent(state):
+    return state
+
+
+def build_graph():
+    g = StateGraph(_S)
+    g.add_node("a", _agent)
+    g.add_edge(START, "a")
+    g.add_edge("a", END)
+    return g.compile()
+
+
+__topofuzz_verdict_label_true__ = 42  # wrong type
+'''
+
+
+def test_load_topology_rejects_non_string_verdict_label(tmp_path):
+    f = _write_fixture(tmp_path, _FIXTURE_BAD_VERDICT_LABEL)
+    with pytest.raises(TypeError, match="__topofuzz_verdict_label_true__"):
+        load_topology(f"{f}:build_graph")
+
+
+_FIXTURE_NONE_VERDICT_LABEL = '''
+from langgraph.graph import END, START, StateGraph
+from typing import TypedDict
+
+
+class _S(TypedDict, total=False):
+    x: str
+
+
+def _agent(state):
+    return state
+
+
+def build_graph():
+    g = StateGraph(_S)
+    g.add_node("a", _agent)
+    g.add_edge(START, "a")
+    g.add_edge("a", END)
+    return g.compile()
+
+
+__topofuzz_verdict_label_true__ = None
+'''
+
+
+def test_load_topology_warns_when_verdict_label_is_explicit_none(tmp_path, caplog):
+    """Red-team pass-1 M6: an explicit
+    ``__topofuzz_verdict_label_true__ = None`` falls back to default
+    but a fixture author who wrote it thinking they were being
+    'explicit about default' deserves a visible signal rather than
+    silent fallback."""
+    import logging
+    f = _write_fixture(tmp_path, _FIXTURE_NONE_VERDICT_LABEL)
+    with caplog.at_level(logging.WARNING):
+        topo = load_topology(f"{f}:build_graph")
+    assert topo.verdict_label_true == "APPROVE"
+    assert any(
+        "= None — using default" in rec.message for rec in caplog.records
+    )
+
+
 # ---------------------------------------------------------------------------
 # load_eval_rows — JSONL
 # ---------------------------------------------------------------------------

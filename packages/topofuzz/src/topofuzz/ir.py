@@ -21,6 +21,7 @@ them.
 from __future__ import annotations
 
 import math
+import unicodedata
 from typing import Literal
 
 from fuzzeval.canonical import canonical_hash as _canonical_hash
@@ -137,6 +138,93 @@ class Topology(BaseModel):
     # because the judged node IS part of the topology's identity.
     verdict_node: str | None = None
 
+    # Step 20a/F6 follow-up (v0.6): producer-side declaration of the
+    # two human-readable verdict labels the CEO card and inspect view
+    # render next to the judge's binary decision. The default pair
+    # ``("APPROVE", "DENY")`` matches the lending fixture's semantics
+    # so a v0.5 topology stays byte-identical on the canonical_hash and
+    # on the persisted manifest.json. Non-lending fixtures (adversarial
+    # relay → ESCALATE/DEFER; healthcare triage → URGENT/ROUTINE) opt
+    # in by passing both kwargs to ``from_langgraph``.
+    #
+    # Field-validator normalisation (mode="before"):
+    #   - reject non-string at the boundary;
+    #   - strip leading/trailing whitespace;
+    #   - upper-case;
+    #   - reject empty-after-strip (would render as blank in the PDF);
+    #   - cap at 12 chars (the side-by-side flip card in
+    #     ``templates/publish_ceo_card.html.j2`` overflows above ~14
+    #     chars; 12 is the safe maximum that also matches the
+    #     defense-in-depth slice in ``publish._build_ceo_card_context``).
+    #
+    # Model-validator collision check (mode="after"):
+    #   - reject ``verdict_label_true == verdict_label_false`` post-
+    #     normalize. Two labels that collapse to the same string destroy
+    #     the side-by-side story (a buyer would see "APPROVE / APPROVE"
+    #     with two different excerpts, which is worse than no flip card).
+    #
+    # The canonical_hash recipe OMITS BOTH fields when BOTH equal the
+    # default pair, so a v0.5 fixture hashes byte-identically. As soon
+    # as either label differs from default, both stay in the payload —
+    # the label pair is part of the topology's identity (judging the
+    # same node but labelling its outputs differently IS a different
+    # measurement contract).
+    verdict_label_true: str = "APPROVE"
+    verdict_label_false: str = "DENY"
+
+    @field_validator(
+        "verdict_label_true", "verdict_label_false", mode="before"
+    )
+    @classmethod
+    def _normalize_verdict_label(cls, v: object) -> object:
+        # Strict-type guard against ``str`` subclasses that override
+        # ``__str__``/``.upper()``/``.strip()``/``__eq__`` (red-team
+        # pass-1 M5): an attacker subclass that returns non-str from
+        # ``.upper()`` could bypass the collision check post-normalize.
+        # Buyer-facing signed bundle — lock to the canonical class.
+        if type(v) is not str:
+            raise ValueError(
+                f"verdict label must be str (not subclass); got "
+                f"{type(v).__name__}."
+            )
+        # NFKC normalize FIRST (red-team pass-1 B2): without this, a
+        # manifest hand-edit or supply-chain tamper can slip a label
+        # that visually renders as "APPROVE" past the collision check
+        # via zero-width-space, fullwidth Latin, RTL-override, or
+        # ligature tricks. NFKC collapses fullwidth → ASCII and combines
+        # compatibility forms. We additionally strip:
+        #   - Cc (control chars, e.g. TAB, NUL),
+        #   - Cf (format chars, e.g. ZWSP U+200B, BOM U+FEFF, BIDI
+        #     overrides U+202A-E),
+        #   - M  (combining marks Mn/Mc/Me, e.g. U+FE0F variation
+        #     selectors, U+0323 combining-dot-below) — red-team pass-2
+        #     MAJ-1: a label like "APPROVE️" survives NFKC + Cc/Cf
+        #     strip and renders visually identical to "APPROVE" but
+        #     bytewise differs, breaking the "v0.5 byte-identical hash"
+        #     invariant and bypassing the "differs from default → persist
+        #     labels in manifest" gate.
+        # AFTER the filter the string is restricted to L/N/P/S/Z
+        # (letters/numbers/punctuation/symbols/separators) — printable
+        # only, no homoglyph or zero-width tricks.
+        normalized_nfkc = unicodedata.normalize("NFKC", v)
+        normalized = "".join(
+            ch
+            for ch in normalized_nfkc
+            if unicodedata.category(ch)[0] not in ("C", "M")
+        ).strip().upper()
+        if not normalized:
+            raise ValueError(
+                "verdict label must be non-empty after NFKC + strip + "
+                f"control-char filter; got {v!r}."
+            )
+        if len(normalized) > 12:
+            raise ValueError(
+                f"verdict label must be ≤12 chars after normalize; got "
+                f"{len(normalized)} chars in {normalized!r}. Side-by-side "
+                "flip card overflows above this limit."
+            )
+        return normalized
+
     @model_validator(mode="after")
     def _check_structural_integrity(self) -> "Topology":
         ids = [n.id for n in self.nodes]
@@ -161,6 +249,20 @@ class Topology(BaseModel):
             raise ValueError(
                 f"verdict_node {self.verdict_node!r} is not in node ids "
                 f"{sorted(id_set)}"
+            )
+        if self.verdict_label_true == self.verdict_label_false:
+            # Two labels that collapse to the same string post-normalize
+            # destroy the side-by-side story (the CEO card would show
+            # "APPROVE / APPROVE" with two excerpts). Fail at IR
+            # construction time so a bad fixture never reaches the
+            # orchestrator. Mirrors the manifest-side check in
+            # ``publish._build_ceo_card_context`` which already rejects
+            # the same collision for hand-edited manifests.
+            raise ValueError(
+                f"verdict_label_true and verdict_label_false must differ "
+                f"after normalize; both collapsed to "
+                f"{self.verdict_label_true!r}. (If you passed e.g. "
+                f"'approve' / 'APPROVE', NFKC + .upper() collapses them.)"
             )
         for e in self.edges:
             if e.from_id not in id_set:
@@ -192,16 +294,30 @@ class Topology(BaseModel):
         a different node is a different measurement) and participates in
         the hash.
 
-        NOTE: ``self.model_dump_json()`` does NOT apply the strip — it
-        emits ``"verdict_node":null`` literally. A caller who hashes
-        ``json.loads(t.model_dump_json())`` directly gets a DIFFERENT
-        bucket than ``t.canonical_hash()`` on a v0.5-shape topology.
-        Always go through ``canonical_hash()`` (or the analogous
-        ``fuzzeval.canonical.canonical_hash`` on the stripped view) for
-        cache / signing identity. Pinned by
-        ``test_ir.test_v05_hash_unchanged_after_field_added``.
+        Step 20a/F6 follow-up: ``verdict_label_true``/
+        ``verdict_label_false`` are BOTH OMITTED from the canonicalised
+        dict when BOTH equal the default pair ``("APPROVE","DENY")``.
+        Strip is at the pair level — if either label differs from default,
+        BOTH stay in the payload (the label pair is part of the topology's
+        identity; judging the same node but labelling its outputs
+        differently IS a different measurement contract). Pinned by
+        ``test_ir.test_v05_hash_unchanged_after_label_fields_added``.
+
+        NOTE: ``self.model_dump_json()`` does NOT apply either strip — it
+        emits ``"verdict_node":null`` literally and emits the labels even
+        at default. A caller who hashes ``json.loads(t.model_dump_json())``
+        directly gets a DIFFERENT bucket than ``t.canonical_hash()`` on a
+        v0.5-shape topology. Always go through ``canonical_hash()`` (or
+        the analogous ``fuzzeval.canonical.canonical_hash`` on the
+        stripped view) for cache / signing identity.
         """
         payload = self.model_dump(mode="json")
         if payload.get("verdict_node") is None:
             payload.pop("verdict_node", None)
+        if (
+            payload.get("verdict_label_true") == "APPROVE"
+            and payload.get("verdict_label_false") == "DENY"
+        ):
+            payload.pop("verdict_label_true", None)
+            payload.pop("verdict_label_false", None)
         return _canonical_hash(payload)
