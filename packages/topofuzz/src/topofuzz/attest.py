@@ -614,6 +614,19 @@ def compute_voo_for_attestation(
     values across variants, or any NaN) get ``ci_lower=ci_upper=None``
     and ``degenerate_flag=True``.
 
+    F3 MAJOR (2026-05-16) jury-aware POINT estimate: the per-eval
+    ``point`` value dispatches through
+    :func:`topofuzz.metrics.per_eval_variance` — on a v6 jury run this
+    is the per-vendor continuous variance, escaping the Bernoulli ceiling
+    that saturated the 2D ``np.var(matrix, ddof=0)`` closure. The CI
+    bootstrap still resamples the binarised majority column ``matrix[:,
+    j]`` — that's a documented minimum-scope deferral (re-signing the
+    bundle would require a v6 schema change too) tracked as a v0.6
+    POLISH item in ``packages/topofuzz/BACKLOG.md``. The asymmetry can
+    surface as a non-zero ``point`` with a degenerate ``ci_lower/upper``
+    on jury runs with a constant majority but wobbling continuous votes
+    — by design until the v0.6 follow-up lands.
+
     ``seed`` defaults to ``0`` for byte-stable re-signs of the same
     run (matches the §15 influence path).
 
@@ -659,6 +672,14 @@ def compute_voo_for_attestation(
     if matrix.size == 0 or matrix.shape[0] < 1 or matrix.shape[1] < 1:
         return None
 
+    # F3 MAJOR dispatch: on jury runs, compute the per-eval point estimate
+    # over per-vendor continuous scores instead of the Bernoulli-bounded
+    # majority. The 2D ``matrix`` (majority votes) still drives the
+    # variant-axis bootstrap CI; the per-eval point follows the same
+    # dispatch as the report bar SVG so both surfaces agree.
+    from topofuzz.metrics import per_eval_variance
+
+    per_eval_point_vector = per_eval_variance(matrix, result.per_vendor_matrix)
     n_variants = matrix.shape[0]
     alpha = (1.0 - conf) / 2.0
     out: list[dict[str, Any]] = []
@@ -677,7 +698,23 @@ def compute_voo_for_attestation(
                 "degenerate_flag": True,
             })
             continue
-        point = float(np.var(column, ddof=0))
+        # Jury dispatch: per_eval_point_vector[j] is already the
+        # per-vendor-averaged variance for jury runs; for single-judge
+        # runs it equals ``np.var(column, ddof=0)`` exactly.
+        point_arr = per_eval_point_vector[j]
+        if not np.isfinite(point_arr):
+            # The jury path can return NaN for an eval where every
+            # vendor's roster has fewer than 2 non-NaN variants (M1
+            # guard); mark degenerate rather than signing a NaN.
+            out.append({
+                "eval_id": eid,
+                "point": None,
+                "ci_lower": None,
+                "ci_upper": None,
+                "degenerate_flag": True,
+            })
+            continue
+        point = float(point_arr)
         if n_variants < 2 or bool(np.all(column == column[0])):
             # Constant column or singleton variant axis: variance is
             # structurally 0 (or trivially defined), bootstrap is a

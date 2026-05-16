@@ -65,8 +65,11 @@ from topofuzz.metrics.verdict_stability import (
     compute_verdict_stability,
 )
 from topofuzz.metrics.voo import (
+    per_eval_variance,
     variance_across_orderings,
     variance_across_orderings_ci,
+    variance_across_orderings_jury,
+    variance_across_orderings_jury_ci,
 )
 from topofuzz.metrics.voo_noise_floor import (
     compute_voo_noise_floor,
@@ -109,9 +112,12 @@ __all__ = [
     "compute_voo_noise_floor",
     "compute_worstcase_panel",
     "error_correction_rate",
+    "per_eval_variance",
     "read_score_matrix",
     "variance_across_orderings",
     "variance_across_orderings_ci",
+    "variance_across_orderings_jury",
+    "variance_across_orderings_jury_ci",
     "voo_gate_passes",
     "wilson_score_interval",
 ]

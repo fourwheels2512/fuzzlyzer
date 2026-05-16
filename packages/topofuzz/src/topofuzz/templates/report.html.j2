@@ -782,6 +782,17 @@
   {% if eval_ids_truncated %}<p class="evals-truncated">… and {{ eval_ids_truncated }} more (see manifest.json for the full list).</p>{% endif %}
   {% endif %}
 
+  {% if wilson_addenda %}
+  <h2>Statistical addenda <span class="section-tag">for the curious</span></h2>
+  <p class="explainer">Wilson 95% score interval for the verdict-flip rate — a tighter, boundary-safe CI for a binomial proportion than the bootstrap interval on the headline card.<span class="engineer-note">Wilson (1927) stays inside [0, 1] at the boundaries where the normal approximation collapses; answers "is the flip rate distinguishable from zero?" The bootstrap CI on the headline answers the orthogonal "if I resampled evals" question.</span></p>
+  <div class="chart-card">
+    <table style="border-collapse:collapse;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:14px;">
+      <tr><td style="padding:4px 12px;">flip rate</td><td style="padding:4px 12px;"><strong>{{ '%.4f' % wilson_addenda.point }}</strong> ({{ wilson_addenda.n_flips }} / {{ wilson_addenda.n_pairs }})</td></tr>
+      <tr><td style="padding:4px 12px;">Wilson {{ wilson_addenda.conf_pct }}% CI</td><td style="padding:4px 12px;">[{{ '%.4f' % wilson_addenda.ci_lower }}, {{ '%.4f' % wilson_addenda.ci_upper }}]</td></tr>
+    </table>
+  </div>
+  {% endif %}
+
   <footer class="page">
     <span>topofuzz {{ topofuzz_version }}</span>
     <span>generated {{ generated_iso }}</span>

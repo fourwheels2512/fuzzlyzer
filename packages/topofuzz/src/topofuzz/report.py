@@ -151,11 +151,15 @@ def render_report(run_dir: Path) -> Path:
     # path falls back to a placeholder SVG rather than crashing. Any
     # read failure is bubbled up to the user as a banner+log warning
     # (RT pass-1 MAJOR-5 — don't silently swallow at INFO).
-    matrix, variant_ids, eval_ids_from_db, matrix_warning = _read_matrix_or_empty(
-        run_dir, run_id
-    )
+    (
+        matrix,
+        variant_ids,
+        eval_ids_from_db,
+        matrix_warning,
+        per_vendor_matrix,
+    ) = _read_matrix_or_empty(run_dir, run_id)
 
-    voo_svg = _render_voo_bar_svg(matrix, eval_ids_from_db)
+    voo_svg = _render_voo_bar_svg(matrix, eval_ids_from_db, per_vendor_matrix)
     heatmap_svg = _render_heatmap_svg(matrix, variant_ids, eval_ids_from_db)
     influence_svg, influence_rows = _render_influence_panel(
         matrix, variant_ids, manifest
@@ -245,6 +249,8 @@ def render_report(run_dir: Path) -> Path:
             _EVAL_ID_RENDER_CAP, eval_ids_truncated,
         )
 
+    wilson_addenda = _build_wilson_addenda(flip_composition_ctx)
+
     html = _render_template(
         run_id=display_run_id,
         topology_name=manifest.get("topology_name") or "(unknown)",
@@ -270,6 +276,7 @@ def render_report(run_dir: Path) -> Path:
         summary=summary_ctx,
         flip_composition=flip_composition_ctx,
         variance_distribution=variance_distribution_ctx,
+        wilson_addenda=wilson_addenda,
     )
 
     out_path = run_dir / "report.html"
@@ -407,16 +414,73 @@ def _read_run_row(sqlite_path: Path) -> tuple[str, str]:
     return status, run_id
 
 
+def _build_wilson_addenda(
+    flip_composition_ctx: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Wilson 95% score interval for the verdict-flip rate.
+
+    "wilsons at the bottom for anyone who cares" — Wilson is a tighter,
+    boundary-safe CI for a binomial proportion. The bootstrap CI
+    already lives on ``headline.verdict_flip_rate`` (the "if I
+    resampled evals" question); Wilson answers the orthogonal "is the
+    observed rate distinguishable from zero?" question. Same closure as
+    :func:`topofuzz.attest.compute_verdict_flip_for_attestation`.
+
+    Returns ``None`` when the flip-composition context is missing or
+    carries no live flip counts — the addenda block is silently
+    omitted from the report, not rendered with placeholders.
+    """
+    if not isinstance(flip_composition_ctx, dict):
+        return None
+    n_flips = flip_composition_ctx.get("n_flips")
+    n_pairs = flip_composition_ctx.get("n_pairs")
+    # Pass-2 M-RT-P2-1: ``bool`` is a subclass of ``int`` in Python;
+    # without the explicit reject a True/False slipping through would
+    # crash :func:`wilson_score_interval`. Mirrors the score-validation
+    # discipline in :func:`_try_build_per_vendor_matrix`.
+    if (
+        isinstance(n_flips, bool)
+        or isinstance(n_pairs, bool)
+        or not isinstance(n_flips, int)
+        or not isinstance(n_pairs, int)
+    ):
+        return None
+    if n_pairs <= 0 or n_flips < 0 or n_flips > n_pairs:
+        return None
+    from topofuzz.metrics import wilson_score_interval
+
+    lo, hi = wilson_score_interval(n_flips, n_pairs, conf=0.95)
+    if lo is None or hi is None:
+        return None
+    return {
+        "n_flips": n_flips,
+        "n_pairs": n_pairs,
+        "point": float(n_flips) / float(n_pairs),
+        "ci_lower": lo,
+        "ci_upper": hi,
+        "conf_pct": 95,
+    }
+
+
 def _read_matrix_or_empty(
     run_dir: Path, run_id: str
-) -> tuple["np.ndarray", tuple[str, ...], tuple[str, ...], str | None]:
+) -> tuple[
+    "np.ndarray",
+    tuple[str, ...],
+    tuple[str, ...],
+    str | None,
+    "np.ndarray | None",
+]:
     """Read the continuous-score matrix.
 
-    Returns ``(matrix, variant_ids, eval_ids, warning)``. ``warning`` is
-    ``None`` on a clean read and a short human-readable string when the
-    matrix had to be degraded to empty (RT pass-1 MAJOR-5 — empty matrix
-    is silent today; we now surface the reason so the user sees it both
-    in the log AND in the rendered HTML).
+    Returns ``(matrix, variant_ids, eval_ids, warning, per_vendor_matrix)``.
+    ``warning`` is ``None`` on a clean read and a short human-readable
+    string when the matrix had to be degraded to empty (RT pass-1
+    MAJOR-5 — empty matrix is silent today; we now surface the reason
+    so the user sees it both in the log AND in the rendered HTML).
+    ``per_vendor_matrix`` is the F3 jury-aware companion slab (``None``
+    for single-judge / legacy-v5 runs); the report's bar SVG dispatches
+    on it to escape the Bernoulli-bounded majority for jury runs.
 
     An empty matrix is a legitimate outcome for an aborted run with no
     continuous-judge cells; the plotting helpers handle that case with a
@@ -436,8 +500,14 @@ def _read_matrix_or_empty(
     except (FileNotFoundError, ValueError, sqlite3.DatabaseError) as e:
         msg = f"score matrix unavailable: {e}"
         _log.warning("report: %s — rendering placeholders", msg)
-        return _empty_matrix(), (), (), msg
-    return result.matrix, result.variant_ids, result.eval_ids, None
+        return _empty_matrix(), (), (), msg, None
+    return (
+        result.matrix,
+        result.variant_ids,
+        result.eval_ids,
+        None,
+        result.per_vendor_matrix,
+    )
 
 
 def _empty_matrix() -> "np.ndarray":
@@ -515,22 +585,27 @@ def _placeholder_svg(message: str) -> str:
 
 
 def _render_voo_bar_svg(
-    matrix: "np.ndarray", eval_ids: tuple[str, ...]
+    matrix: "np.ndarray",
+    eval_ids: tuple[str, ...],
+    per_vendor_matrix: "np.ndarray | None" = None,
 ) -> str:
     """Per-eval variance across orderings as a bar chart.
 
-    Per-eval point estimate is ``np.var(matrix[:, j], ddof=0)`` — same
-    closure as :func:`topofuzz.metrics.variance_across_orderings` and
-    :func:`topofuzz.attest.compute_voo_for_attestation` (axis convention:
-    rows=variants, cols=evals).
+    Dispatches via :func:`topofuzz.metrics.per_eval_variance`:
+    single-judge runs keep the canonical
+    ``np.var(matrix[:, j], ddof=0)`` closure; F3 jury runs use the
+    per-vendor-averaged per-eval variance so the bar isn't
+    Bernoulli-bounded at 0.25.
     """
     import numpy as np
+
+    from topofuzz.metrics import per_eval_variance
 
     if matrix.size == 0 or matrix.shape[0] < 1 or matrix.shape[1] < 1:
         return _placeholder_svg("no continuous-judge cells to score")
 
     plt = _setup_matplotlib()
-    per_eval = np.var(matrix, axis=0, ddof=0)
+    per_eval = per_eval_variance(matrix, per_vendor_matrix)
     # NaN-column evals (one or more failed cells in that column) get a
     # zero-height bar — the alternative (skip them) would hide the fact
     # that the cell exists at all. NaN propagation in np.var is the
