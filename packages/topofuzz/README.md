@@ -6,7 +6,28 @@ If you swap two agents in your LangGraph pipeline and the final decision
 flips, your topology is brittle. `topofuzz` finds those flips and prints
 the receipt.
 
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/kirannayudu/topofuzz/blob/main/packages/topofuzz/LICENSE)
+## License
+
+Topofuzz is licensed under the Business Source License 1.1 (BSL).
+Non-production use, internal development, academic research, and
+small-scale commercial use (annual revenue under USD $100,000 from any
+use of Topofuzz) are **permitted without charge**. Production use
+beyond that threshold, or offering Topofuzz as a managed service,
+requires a commercial license — contact **licensing-TBD@modelbrew.ai**.
+Each release converts to Apache 2.0 four years after publication. Full
+terms in [LICENSE](LICENSE).
+
+## API Keys (BYO)
+
+Topofuzz runs against the LLM vendor of your choice. **Your keys stay
+on your machine.** Topofuzz reads keys from environment variables only
+(`GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+`DEEPSEEK_API_KEY`), never persists them, and never transmits anything
+other than your declared vendor API calls. See
+[SECURITY.md](../../SECURITY.md) for the full posture and
+[PRIVACY.md](../../PRIVACY.md) for the no-telemetry statement.
+
+[![License: BSL-1.1](https://img.shields.io/badge/license-BSL--1.1-blue.svg)](LICENSE)
 [![Python: 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](#install)
 
 ## Status
@@ -23,8 +44,9 @@ not an afterthought.
 
 ## Disclaimers
 
-topofuzz is **research and engineering software**, distributed under
-Apache-2.0 **with no warranty** (see `LICENSE` §7–§8).
+topofuzz is **research and engineering software**, distributed **with no
+warranty** under the terms of the [LICENSE](LICENSE) file at the root of
+this package.
 
 - **Not a certification.** topofuzz measures one specific property —
   how much a multi-agent system's answers change when you shuffle the
@@ -239,12 +261,11 @@ today: `--conformance`, `--signoff`, `--judge-pool`, `--sandbox`,
 }
 ```
 
-## License
+## License (full terms)
 
-Apache-2.0. See
-[LICENSE](https://github.com/kirannayudu/topofuzz/blob/main/packages/topofuzz/LICENSE).
-The license file is also bundled into the wheel under
-`dist-info/licenses/LICENSE` per PEP 639.
+See the **License** section at the top of this README for the summary,
+and [LICENSE](LICENSE) for the full text. The license file is also
+bundled into the wheel under `dist-info/licenses/LICENSE` per PEP 639.
 
 ## Acknowledgments
 

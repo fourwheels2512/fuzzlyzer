@@ -8,7 +8,29 @@ cost estimation, and key management. It has **no LangGraph dependency**
 and **no LLM SDK dependency** at import time, so `pip install topofuzz`
 (verify-only path) stays under ~15 MB.
 
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/kirannayudu/topofuzz/blob/main/packages/fuzzeval/LICENSE)
+## License
+
+`fuzzeval` is licensed under the Business Source License 1.1 (BSL)
+alongside `topofuzz`. Non-production use, internal development,
+academic research, and small-scale commercial use (annual revenue
+under USD $100,000) are **permitted without charge**. Production use
+beyond that threshold, or offering `fuzzeval` as a managed service,
+requires a commercial license — contact
+**licensing-TBD@modelbrew.ai**. Each release converts to Apache 2.0
+four years after publication. Full terms in [LICENSE](LICENSE).
+
+## API Keys (BYO)
+
+`fuzzeval`'s judge modules call LLM vendors only when **you** invoke
+them with credentials. **Your keys stay on your machine.** Keys are
+read from environment variables only (`GEMINI_API_KEY`,
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`), never
+persisted by `fuzzeval`, and never transmitted to any endpoint other
+than your declared vendor API. See [SECURITY.md](../../SECURITY.md)
+for the full posture and [PRIVACY.md](../../PRIVACY.md) for the
+no-telemetry statement.
+
+[![License: BSL-1.1](https://img.shields.io/badge/license-BSL--1.1-blue.svg)](LICENSE)
 [![Python: 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](#install)
 
 ## Status
@@ -62,12 +84,11 @@ See
 [BLUEPRINT_v5plus.md §17a](https://github.com/kirannayudu/topofuzz/blob/main/BLUEPRINT_v5plus.md)
 for the public-API contract.
 
-## License
+## License (full terms)
 
-Apache-2.0. See
-[LICENSE](https://github.com/kirannayudu/topofuzz/blob/main/packages/fuzzeval/LICENSE).
-The license file is also bundled into the wheel under
-`dist-info/licenses/LICENSE` per PEP 639.
+See the **License** section at the top of this README for the summary,
+and [LICENSE](LICENSE) for the full text. The license file is also
+bundled into the wheel under `dist-info/licenses/LICENSE` per PEP 639.
 
 ## See also
 

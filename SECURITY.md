@@ -1,289 +1,89 @@
-# Security
+# Security Policy
 
-This document covers the v0.5 attestation threat model, the published
-dev-key location, and a standalone reference verifier for DSSE-signed
-topofuzz runs.
+## Supported Versions
 
-## Threat model (v0.5)
+Security fixes are published only for the current release line. At any given time, exactly one line is supported.
 
-topofuzz v0.5 ships **developer-grade signing only**. Attestations are
-emitted under a single Ed25519 dev key stored on disk in unencrypted
-PKCS#8 PEM at `~/.topofuzz/dev.pem`. Every `topofuzz verify` PASS
-banner reads `[DEV-KEY]` exactly so an operator never mistakes a
-local-signed attestation for a production-grade one.
-
-| Concern | v0.5 stance | v1.0 plan |
-|---|---|---|
-| Private key encryption | Unencrypted PEM | Age-encrypted PEM (v0.6); KMS (v1.0) |
-| Key rotation | Manual `topofuzz keygen --force` | Rotation aliases + transparency log |
-| Multi-party signing | Single signer; envelope shape is plural-ready | Jury-of-3 co-signing |
-| Backing key store | Local filesystem | Cloud KMS adapters (`--kms` reserved) |
-| Verifier integrity | This document is the reference | Sigstore transparency log |
-| API key handling | Environment variable (`GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`); never written to disk | OS keyring shim via `keyring` (v0.6) |
-| Log redaction | `fuzzeval.log_redaction.SecretRedactionFilter` auto-installed on root logger at `import fuzzeval` time. Scrubs `sk-…`, `xai-…`, `AKIA…`, `AIza…`, and `Bearer …` patterns from `record.msg` + `record.args` before any handler sees them. Stdlib `logging.Filter`, idempotent. | `structlog` migration with the same redaction as a pipeline stage; required-fields contract becomes enforceable |
-
-Threats this signing scheme **does** mitigate:
-
-* Drive-by tampering of `attestation.json`, `manifest.json`, or
-  `run.sqlite` after a run finishes (signature, JCS round-trip, and
-  digest checks all flag this).
-* Orphan-attestation replay (dropping `attestation.json` from one run
-  into another run dir): `topofuzz verify` requires `manifest.json`
-  and the signed `run.sqlite` digest to be co-located when verifying
-  in-place.
-
-Threats this scheme **does not** mitigate:
-
-* A local attacker with read access to `~/.topofuzz/dev.pem` can
-  forge any attestation indistinguishably from the developer. This
-  is by design for v0.5 and the reason the `[DEV-KEY]` watermark
-  exists.
-* Long-lived auditability: there is no transparency log in v0.5.
-  Rotating the dev key invalidates every prior `topofuzz verify`
-  against a run signed with the old key — keep the old `dev.pub.pem`
-  around if you need to re-verify historical bundles.
-
-## Published public key
-
-The canonical v0.5 dev pubkey lives in this repository at:
-
-```
-keys/dev.pub.pem
-```
-
-For a tagged release the stable URL is:
-
-```
-https://github.com/kirannayudu/topofuzz/blob/v0.5.0rc1/keys/dev.pub.pem
-```
-
-The pubkey is byte-identical across the `v0.5.0rc1` → `v0.5.0` promotion
-(same dev-key fixture); on GA promotion the canonical URL switches to
-`/blob/v0.5.0/...` without re-signing the v0.5 fixture bundle. This
-byte-identical promise is enforced by code-review discipline plus the
-sha256-pin in
-[`packages/topofuzz/tests/test_release_fixture_pins.py`](https://github.com/kirannayudu/topofuzz/blob/main/packages/topofuzz/tests/test_release_fixture_pins.py)
-— the test MUST exist at every release tag; a rotation requires
-bumping the pinned digest in the same commit. The pin protects
-against accidental `_regen.py` runs but does not defeat an adversary
-with merge access; for external trust, pin to a GitHub-immutable tag
-URL like `/blob/v0.5.0rc1/keys/dev.pub.pem` rather than `main`.
-
-The private half is **never** committed. Anyone running
-`topofuzz keygen` generates their own keypair locally; the committed
-public key matches the keypair that signs the v0.5 fixture bundle
-at `packages/topofuzz/tests/fixtures/signed/`. To verify a run signed
-by a different operator, point `topofuzz verify --pubkey <path>` at
-their published pubkey.
-
-## Standalone reference verifier
-
-`topofuzz verify` is the production verify path. It depends only on
-`cryptography + rfc8785 + typer + rich + pydantic + fuzzeval` — no
-LLM SDKs, no LangGraph, no plotting. If you want to verify a topofuzz
-attestation without installing topofuzz at all, the following
-~30-line script does the cryptographic core in
-stdlib + `cryptography`:
-
-```python
-#!/usr/bin/env python3
-# verify_dsse.py — v0.5 reference verifier for topofuzz attestations.
-# Standard base64 only; the DSSE v1.0 URL-safe MUST is handled in
-# `topofuzz verify`. No JCS round-trip; this script prints the
-# *authenticated* payload bytes for operator inspection only.
-# Deps: stdlib + cryptography. Exit 0 on first verifying signature.
-import base64, json, sys
-from pathlib import Path
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.serialization import load_pem_public_key
-
-if len(sys.argv) != 3:
-    sys.exit("usage: verify_dsse.py <envelope.json> <pubkey.pem>")
-env = json.loads(Path(sys.argv[1]).read_bytes())
-pub = load_pem_public_key(Path(sys.argv[2]).read_bytes())
-ptype = env["payloadType"].encode("utf-8")
-payload = base64.b64decode(env["payload"], validate=True)
-pae = (b"DSSEv1 " + str(len(ptype)).encode("ascii") + b" " + ptype + b" "
-       + str(len(payload)).encode("ascii") + b" " + payload)
-for s in env["signatures"]:
-    try:
-        pub.verify(base64.b64decode(s["sig"], validate=True), pae)
-    except InvalidSignature:
-        continue
-    sys.stdout.buffer.write(payload)
-    sys.exit(0)
-sys.exit(f"FAIL: no signature verified ({len(env['signatures'])} tried)")
-```
-
-What it does:
-
-1. Decodes the DSSE envelope JSON.
-2. Loads the Ed25519 public key from a PEM SubjectPublicKeyInfo file.
-3. Reconstructs the DSSE v1.0 Pre-Authentication Encoding (PAE)
-   byte-exactly: `DSSEv1 SP len(type) SP type SP len(payload) SP payload`.
-4. Verifies each signature against the PAE; the first match wins.
-5. Prints the authenticated payload bytes to stdout (so the operator
-   can pipe to `jq` or `python -m json.tool`).
-
-What it deliberately omits relative to `topofuzz verify`:
-
-* **URL-safe base64**: the DSSE v1.0 spec requires verifiers to accept
-  both standard and URL-safe encodings. This reference script accepts
-  standard only to stay short; production `topofuzz verify` accepts
-  both.
-* **JCS round-trip check**: a fully-spec-compliant verifier
-  re-canonicalizes the parsed payload via RFC 8785 JCS and asserts
-  the bytes match the authenticated bytes. This catches the rare
-  "signer canonicalized incorrectly" failure mode. The script prints
-  the authenticated bytes instead; the operator can compare manually.
-* **Run-dir binding**: `topofuzz verify` re-hashes `run.sqlite` and
-  re-canonicalizes the on-disk `manifest.json` against the envelope's
-  signed copies. The reference script verifies only the envelope.
-* **`payloadType` semantic binding**: integrators using this reference
-  script as a security boundary **MUST** add an explicit
-  `assert env["payloadType"] == EXPECTED_TYPE` before trusting the
-  payload. The PAE-binding only catches *mutation of an existing
-  envelope* — it does NOT catch a fresh signature over an
-  attacker-chosen `payloadType` value (any signer with any key can
-  produce a valid envelope claiming any type). `topofuzz verify` does
-  enforce the canonical `application/vnd.topofuzz.run+json;v=<v>`
-  string match; the reference script omits this check for minimality
-  and that is why it is labeled a reference, not a security boundary.
-
-**Reproducing the test:**
-
-```bash
-# From the repo root, after `topofuzz keygen` once on this machine
-# (or just use the committed fixture):
-python verify_dsse.py \
-    packages/topofuzz/tests/fixtures/signed/attestation.json \
-    keys/dev.pub.pem | python -m json.tool
-```
-
-Expected: pretty-printed payload JSON on stdout, exit code 0.
-Tampering with any byte of the envelope flips the exit to nonzero.
-
-## Verify-only install footprint
-
-`pip install topofuzz` (base, no extras) pulls only:
-
-| Package | Used for |
+| Topofuzz version | Status |
 |---|---|
-| `fuzzeval` | DSSE primitives + key management |
-| `cryptography` | Ed25519 + PEM parsing |
-| `rfc8785` | JCS canonicalization |
-| `typer` + `rich` | CLI surface |
-| `pydantic` | Manifest schema validation |
+| 0.5.x (current pre-release: `0.5.0rc1`) | Supported — security fixes published as point releases on this line |
+| < 0.5 | Unsupported |
 
-No `langgraph`, no `litellm`, no `anthropic`/`openai`/`google-genai`,
-no `matplotlib`, no `jinja2`. The verify codepath through
-`topofuzz.cli.verify` is hard-checked by
-`packages/topofuzz/tests/test_import_guard.py` to confirm the
-forbidden modules are not transitively loaded.
+(Once v0.6 ships, this table is updated in the same commit to mark v0.6.x supported and v0.5.x end-of-life.)
 
-The `topofuzz[verify]` extras name is reserved for forward-compat
-and ships **empty** in v0.5 because the base install is already
-verify-safe. The `topofuzz[full]` extras pull the run-time stack
-(LangGraph + LLM SDKs + plotting) and add roughly 400 MB of wheels.
+## Reporting a Vulnerability
 
-## Cache-directory trust
+Email: **security-TBD@modelbrew.ai**
 
-`topofuzz run` uses `diskcache` for `LLMCache` and `JudgeCache`
-under `--cache <dir>` (default `.cache/topofuzz`). `diskcache` is a
-pickle-backed store. **Treat `--cache <dir>` as you would any
-pickle file**: only point it at directories you control. The cache
-layer at `fuzzeval/cache.py` defends against the most obvious
-deserialization footgun by refusing to round-trip any value that is
-not a `ContinuousScore` / `BinaryScore` (`JudgeCache`) or `bytes` /
-`bytearray` (`LLMCache`), but a determined attacker
-who can write arbitrary bytes to your cache directory can still
-load object types you trust at attribute-access time. Do not check
-`.cache/topofuzz/` into a shared repository, do not point `--cache`
-at a network share, and prefer `--no-cache` in CI runners where the
-cache root is shared across tenants. v0.6 will switch the on-disk
-cache format to JSON-only to remove this surface entirely.
+Response SLA: acknowledge within 72 hours; coordinated-disclosure window 90 days from acknowledgment.
 
-## Operator checklist
+PGP key: **[TBD — fingerprint will be published here]**
 
-* **POSIX**: `~/.topofuzz/dev.pem` is written `chmod 0o600` and its
-  parent directory `chmod 0o700` by `topofuzz keygen`. Audit with
-  `ls -la ~/.topofuzz/`.
-* **Windows**: NTFS ACLs inherit from the user profile directory,
-  which is private by default. In shared environments
-  (e.g. a build agent under a service account), explicitly remove
-  group/everyone read with:
+Please include: topofuzz version, affected component (`topofuzz`, `fuzzeval`, `topofuzz publish`, `topofuzz verify`, etc.), reproduction steps, and a suggested fix if you have one.
 
-  ```powershell
-  icacls $env:USERPROFILE\.topofuzz\dev.pem /inheritance:r `
-      /grant:r "$env:USERNAME:(R,W)"
-  ```
+For coordinated disclosure that prefers a non-email channel, GitHub Security Advisories on the project repository (private vulnerability reporting) is also accepted.
 
-* **CI**: do not check `dev.pem` into a CI secret store yet — the
-  v0.5 dev key is a developer artifact, not a release-signing key.
-  Use `--no-cache` and a fresh per-run keypair in ephemeral CI
-  containers; treat the resulting attestation as `[DEV-KEY]`-tagged.
+## API Key Handling
 
-## What topofuzz protects and does not protect against
+Topofuzz operates under a strict bring-your-own-key (BYO) model.
 
-### Protects
+- **Vendor** API keys are read from environment variables only: `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`.
+- **Vendor** API keys are never persisted to disk by Topofuzz, never written to any cache file, and never transmitted to any endpoint other than the declared vendor API (see **Network Egress** below).
+- The only on-disk secret Topofuzz creates is the local Ed25519 attestation-signing key at `~/.topofuzz/dev.pem` (POSIX `chmod 0o600`); this is not a vendor key and is never transmitted off-host.
+- The `topofuzz repro` command emits a shell script with log-redaction guards (see **Log Redaction** below); the generated script will not echo or log API keys even if invoked under `set -x`.
 
-* **DSSE envelope tampering.** A bit-flipped `attestation.json`,
-  `manifest.json`, or `run.sqlite` fails `topofuzz verify` (Ed25519
-  signature + JCS round-trip + sqlite digest match all checked).
-* **Orphan-attestation replay across run dirs.** The signed payload
-  binds the attestation to the run-dir digests; copying
-  `attestation.json` into a different run dir fails verify.
-* **Cache poisoning of non-score types.** `fuzzeval/cache.py` refuses
-  to round-trip any value that is not a `ContinuousScore` /
-  `BinaryScore` / `bytes`.
-* **Transparency-log integrity for `--rekor` runs.** When `--rekor`
-  succeeds, the signed envelope is posted to the Sigstore Public Good
-  Instance, where third-party inclusion proofs are independently
-  retrievable. A tampered `report.json.dsse.rekor.json` is detectable
-  against the live log.
+## Network Egress
 
-### Does not protect
+Topofuzz makes outbound HTTPS requests **only** to the following endpoints, and only when explicitly invoked by the user:
 
-* **Prompt injection of the agents under test.** topofuzz is the
-  measurement instrument; if your topology's agents are vulnerable to
-  prompt injection from eval inputs, topofuzz will faithfully measure
-  the resulting instability, not prevent it.
-* **LLM-as-judge corruption.** The judge is itself an LLM call; a
-  judge model that is biased, lying, or jailbroken will produce a
-  biased, lying, or jailbroken score. `--jury-of-3` reduces
-  single-vendor bias but does not eliminate adversarial judge
-  behavior.
-* **Untrusted topology fixtures.** `load_topology` calls
-  `importlib.exec_module` on user-supplied Python. A hostile fixture
-  has full host privileges (same as `python path/to/fixture.py`). The
-  one-shot stderr warning emitted at import time is the only
-  in-process mitigation; v0.6 may add an `--allow-untrusted-fixture`
-  opt-in. Do not feed topofuzz fixtures from sources you would not
-  `python` directly.
-* **Key compromise via shared `$HOME`.** Two users on the same
-  machine with read access to each other's home dirs can read each
-  other's `~/.topofuzz/dev.pem` and forge attestations. POSIX `0600`
-  and Windows ACL guidance live in the operator checklist above;
-  topofuzz does not enforce them at sign time.
-* **Rekor takedown.** Sigstore Public Good Instance commits are
-  permanent. topofuzz cannot remove a submission after the fact.
-  Treat `--rekor` as a publication action, not a private signing
-  step.
-* **Third-party LLM provider TOS / availability / pricing.** The
-  judge and agent calls reach external services (Gemini, Anthropic,
-  OpenAI, etc.). topofuzz cannot guarantee provider uptime, refuse
-  rate limits, or compliance posture; the run-status taxonomy
-  surfaces `degraded` / `cost_cap_hit` / `failed` outcomes but the
-  underlying provider behavior is out of scope.
+- `generativelanguage.googleapis.com` (Gemini) — vendor LLM API
+- `api.openai.com` (OpenAI) — vendor LLM API
+- `api.anthropic.com` (Anthropic) — vendor LLM API
+- `api.deepseek.com` (DeepSeek) — vendor LLM API
+- `rekor.sigstore.dev` (Sigstore Rekor transparency log) — **only when `--rekor` is explicitly passed**; never on the default path
+- `unpkg.com` (HTMX library CDN, `htmx.org@1.9.12`) — **only when `topofuzz ui` is invoked**; the request is issued by the user's browser when loading the served HTML page, not by the Python process. Vendoring HTMX locally ships in v0.6.
+- `aistudio.google.com` (Google AI Studio key-issuance page) — **only when `topofuzz ui` is invoked and the user clicks the "Get a Gemini key" link** rendered by the no-key page; this is a user-initiated browser navigation, not an automatic request.
 
-## Reporting vulnerabilities
+No telemetry, no analytics, no crash reporting, no auto-update checks. The Python process does **not** phone home on the default path.
 
-For findings that can be safely disclosed publicly, open an issue at
-<https://github.com/kirannayudu/topofuzz/issues> with the label `security`.
+To verify:
+- `topofuzz scan` produces zero outbound network traffic.
+- `topofuzz run --dry-run` produces zero outbound network traffic.
+- Observe network traffic during any topofuzz invocation; only the endpoints listed above appear, and only the ones gated by their flag/subcommand.
 
-For findings that require coordinated disclosure, use GitHub's private
-vulnerability reporting at
-<https://github.com/kirannayudu/topofuzz/security/advisories/new>. The
-maintainer is alerted automatically and the report stays private until
-a fix is published. A PGP public key + fingerprint will be added here
-at v0.6.
+## Cryptographic Attestation
+
+Topofuzz signs every run bundle with DSSE (Dead Simple Signing Envelope, an in-toto / sigstore standard). The signed bundle can be re-verified offline with `topofuzz verify <run-dir>`.
+
+The DSSE envelope is byte-exact against the [`secure-systems-lab/dsse`](https://github.com/secure-systems-lab/dsse) v1.0.0 reference vectors. Verification depends only on `cryptography + rfc8785` and does not require the LLM runtime stack.
+
+The signing-key rotation policy is published with the v0.6 key-store hardening release. Until then, the v0.5 dev-key posture is summarised inline below: a single Ed25519 key at `~/.topofuzz/dev.pem`, POSIX `chmod 0o600`, unencrypted PEM, with a `[DEV-KEY]` watermark printed by `topofuzz verify` so an operator never mistakes a local-signed attestation for a production-grade one. Production-grade key escrow (KMS / Sigstore) is a v1.0 milestone.
+
+## Log Redaction
+
+Topofuzz auto-installs a redaction filter (`fuzzeval.log_redaction.SecretRedactionFilter`) on the root logger at `import fuzzeval` time. It scrubs the following patterns from log records before any handler sees them: `sk-…` (OpenAI / Anthropic / xAI dev-key formats), `xai-…`, `AKIA…` (AWS access key id), `AIza…` (Google AI Studio / Gemini), and `Bearer …` (RFC 6750 bearer tokens).
+
+The `sk-…`, `xai-…`, `AKIA…` patterns cover vendor key formats beyond the four declared LLM endpoints as a defense-in-depth measure, so that secrets leaked from adjacent tooling do not surface in topofuzz logs either.
+
+Log-redaction test coverage: 24 tests in `packages/fuzzeval/tests/test_log_redaction.py`.
+
+**Report a redaction gap as a security vulnerability.** A leaked key in a log record is a P0.
+
+## License-Acceptance Telemetry
+
+None. Topofuzz transmits no acceptance event to any server.
+
+A first-run CLI click-through ships in v0.6 and will create a local-only flag file at `~/.topofuzz/license-accepted`; that file is never transmitted, and no telemetry surrounds it. Until v0.6 ships, no acceptance flag is written or read.
+
+---
+
+## Boundary Conditions
+
+The claims above are load-bearing. Future contributors **must** keep this file in sync with the code on any change that touches:
+
+- The set of outbound HTTP destinations (`packages/topofuzz/src/topofuzz/rekor.py`, the LLM SDK call sites, the UI templates under `packages/topofuzz/src/topofuzz/ui/`).
+- The redaction filter (`packages/fuzzeval/src/fuzzeval/log_redaction.py`) — pattern additions or removals require updating **Log Redaction** above.
+- The BYO-only posture (any code in `packages/topofuzz/src/topofuzz/cli.py` that reads a credential from anywhere other than `os.environ` requires updating **API Key Handling**).
+- The on-disk secret list (any code that writes a secret to disk requires updating **API Key Handling**).
+
+If you add any outbound HTTP path, you must also weaken the no-telemetry statement above to reflect what is now transmitted.
