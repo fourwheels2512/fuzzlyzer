@@ -155,6 +155,7 @@ def _rebuild(topology: Topology, new_nodes: tuple[Node, ...]) -> Topology:
         edges=topology.edges,
         entrypoint=topology.entrypoint,
         terminal=topology.terminal,
+        verdict_node=topology.verdict_node,
     )
 
 

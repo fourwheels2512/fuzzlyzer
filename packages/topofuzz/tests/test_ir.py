@@ -176,16 +176,164 @@ class TestCanonicalHashChainConsistency:
         # fuzzeval.canonical helper, the §7 cache identity gets two
         # different hash universes overnight. This test pins that they
         # produce byte-identical output for the same input.
+        #
+        # The recipe strips ``verdict_node`` when None so v0.5 fixtures
+        # (no verdict_node) hash byte-identically to their hash before
+        # the field existed — see Topology.canonical_hash docstring.
         from fuzzeval.canonical import canonical_hash as shared
 
         topo = _sample_topology()
-        assert topo.canonical_hash() == shared(topo.model_dump(mode="json"))
+        expected_view = topo.model_dump(mode="json")
+        if expected_view.get("verdict_node") is None:
+            expected_view.pop("verdict_node", None)
+        assert topo.canonical_hash() == shared(expected_view)
+
+    def test_topology_hash_with_verdict_node_set_includes_field(self):
+        # When verdict_node is set, it IS part of the topology identity
+        # (judging a different node is a different measurement) and
+        # participates in the canonical hash. This pins the dispatch
+        # branch where the field is preserved through to JCS.
+        from fuzzeval.canonical import canonical_hash as shared
+
+        topo = Topology(
+            name="sample",
+            nodes=[Node(id="a", role="r"), Node(id="b", role="r")],
+            edges=[Edge(from_id="a", to_id="b")],
+            entrypoint="a",
+            terminal=["a", "b"],
+            verdict_node="b",
+        )
+        expected_view = topo.model_dump(mode="json")
+        assert expected_view["verdict_node"] == "b"
+        assert topo.canonical_hash() == shared(expected_view)
 
     def test_llm_config_hash_matches_shared_helper(self):
         from fuzzeval.canonical import canonical_hash as shared
 
         cfg = LLMConfig(model="m", temperature=0.0, seed=1)
         assert cfg.canonical_hash() == shared(cfg.model_dump(mode="json"))
+
+
+class TestVerdictNode:
+    """Step 20a: optional first-class ``verdict_node`` field, distinct from
+    ``terminal``."""
+
+    def test_default_is_none(self):
+        topo = _sample_topology()
+        assert topo.verdict_node is None
+
+    def test_set_to_existing_node_id_accepted(self):
+        topo = Topology(
+            name="t",
+            nodes=[Node(id="a", role="r"), Node(id="b", role="r")],
+            edges=[Edge(from_id="a", to_id="b")],
+            entrypoint="a",
+            terminal=["b"],
+            verdict_node="a",
+        )
+        assert topo.verdict_node == "a"
+
+    def test_set_to_unknown_node_id_rejected(self):
+        with pytest.raises(ValidationError, match="verdict_node"):
+            Topology(
+                name="t",
+                nodes=[Node(id="a", role="r")],
+                edges=[],
+                entrypoint="a",
+                terminal=["a"],
+                verdict_node="ghost",
+            )
+
+    def test_v05_hash_unchanged_after_field_added(self):
+        # Regression guard: a v0.5-shape topology (no verdict_node) must
+        # canonical-hash byte-identically to its hash before this field
+        # existed. The hash recipe strips verdict_node when None for
+        # exactly this reason — protecting persisted run.sqlite
+        # ir_canonical_hash columns, signed bundles, and JudgeCache
+        # rebucketing from invalidation. The pinned hexes below were
+        # produced under the pre-20a IR — if either changes, every
+        # v0.5 fixture's hash on disk diverges.
+        #
+        # Pin (1) — synthetic toy topology.
+        toy = Topology(
+            name="v05-frozen",
+            nodes=[Node(id="a", role="r"), Node(id="b", role="r")],
+            edges=[Edge(from_id="a", to_id="b")],
+            entrypoint="a",
+            terminal=["b"],
+        )
+        # Hex pinned from the strip-when-None reconstruction (see the
+        # independent `shared(v05_view)` check 10 lines below — that's
+        # the load-bearing recipe guard; this literal is the future-
+        # regression sentinel that catches rfc8785 / pydantic / JCS
+        # churn before it silently re-buckets every persisted
+        # ir_canonical_hash. NOT independently verified against a
+        # pre-20a build — the recipe equivalence is what proves v0.5
+        # wire shape, not this literal.
+        assert (
+            toy.canonical_hash()
+            == "94a458671a4cb056c00f0d5247576e4dc1ccbaaa802fb8724736b29aba1f0327"  # noqa: E501
+        ), (
+            "Strip-when-None recipe broken — v0.5 fixture hash diverged. "
+            "Persisted run.sqlite ir_canonical_hash columns will no "
+            "longer match topology regeneration. Investigate before "
+            "shipping. Got: " + toy.canonical_hash()
+        )
+        # Independently recompute under the explicit "strip verdict_node
+        # when None" recipe — proves the canonical_hash method matches
+        # the documented v0.5 wire shape.
+        from fuzzeval.canonical import canonical_hash as shared
+
+        v05_view = toy.model_dump(mode="json")
+        v05_view.pop("verdict_node", None)
+        assert "verdict_node" not in v05_view
+        assert toy.canonical_hash() == shared(v05_view)
+        # Pin (2) — Documents that ``model_dump_json()`` is NOT
+        # equivalent to the canonical_hash recipe. The strip lives only
+        # in ``canonical_hash``; a caller who hashes
+        # ``json.loads(t.model_dump_json())`` thinking it's equivalent
+        # gets a DIFFERENT bucket. Pinning this gap surfaces any future
+        # attempt to "simplify" canonical_hash to call model_dump_json
+        # directly (which would silently re-bucket every persisted
+        # variant_id under the v0.5-compat strip).
+        import json
+        dump_view = json.loads(toy.model_dump_json())
+        assert dump_view.get("verdict_node") is None
+        assert "verdict_node" in dump_view
+        assert shared(dump_view) != toy.canonical_hash()
+
+    def test_setting_verdict_node_changes_hash(self):
+        a = Topology(
+            name="t",
+            nodes=[Node(id="a", role="r"), Node(id="b", role="r")],
+            edges=[Edge(from_id="a", to_id="b")],
+            entrypoint="a",
+            terminal=["a", "b"],
+        )
+        b = Topology(
+            name="t",
+            nodes=[Node(id="a", role="r"), Node(id="b", role="r")],
+            edges=[Edge(from_id="a", to_id="b")],
+            entrypoint="a",
+            terminal=["a", "b"],
+            verdict_node="b",
+        )
+        # Same topology shape; different judged node IS a different
+        # measurement identity.
+        assert a.canonical_hash() != b.canonical_hash()
+
+    def test_round_trip_through_json_preserves_verdict_node(self):
+        a = Topology(
+            name="t",
+            nodes=[Node(id="a", role="r"), Node(id="b", role="r")],
+            edges=[Edge(from_id="a", to_id="b")],
+            entrypoint="a",
+            terminal=["a", "b"],
+            verdict_node="b",
+        )
+        b = Topology.model_validate_json(a.model_dump_json())
+        assert b.verdict_node == "b"
+        assert a.canonical_hash() == b.canonical_hash()
 
 
 class TestCanonicalHash:

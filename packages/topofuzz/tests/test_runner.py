@@ -958,6 +958,155 @@ def test_run_judge_marks_failure_when_terminal_absent_from_outputs():
     assert judge.seen_payloads == []
 
 
+# ---------------------------------------------------------------------------
+# Step 20a — first-class verdict_node IR field
+# ---------------------------------------------------------------------------
+
+
+def test_runner_judges_verdict_node_when_set_overrides_terminal():
+    """Step 20a: when ``Topology.verdict_node`` is set, the judge scores
+    THAT node's output, not the lex-first terminal.
+
+    This is the contract that lets a supervisor or multi-terminal topology
+    name its judged node explicitly, removing the lexical-luck fragility
+    of "terminal = anything wired to END."
+    """
+    cfg = LLMConfig(model="google/gemini-2.5-pro", temperature=0.0)
+    # terminal = ("a", "b") — lex-first is "a". verdict_node = "b" should
+    # override and the judge should score b, not a.
+    topo = Topology(
+        name="verdict-node-override",
+        nodes=tuple(
+            Node(id=nid, role=f"r_{nid}", llm_config=cfg)
+            for nid in ("a", "b", "c")
+        ),
+        edges=(
+            Edge(from_id="a", to_id="b"),
+            Edge(from_id="b", to_id="c"),
+        ),
+        entrypoint="a",
+        terminal=("a", "b"),
+        verdict_node="b",
+    )
+    judge = FakeJudge(score_to_return=ContinuousScore(value=0.7))
+    cell = _run(
+        run_variant(
+            topo,
+            {"id": "e1", "input": "x"},
+            llm_callable=FakeLLM(),
+            judge=judge,
+        )
+    )
+    pld = judge.seen_payloads[0]
+    out = {o.node_id: o.response_text for o in cell.node_outputs}
+    assert pld["agent_output"] == out["b"]  # verdict_node, not terminal[0]
+    assert pld["agent_output"] != out["a"]  # not the lex-first terminal
+    assert pld["agent_output"] != out["c"]  # not the last walked node
+
+
+def test_runner_falls_back_to_terminal_when_verdict_node_none():
+    """Step 20a v0.5-compat: when verdict_node is None (default), the
+    runner falls back to the lex-first terminal — the pre-20a behaviour,
+    preserved bit-for-bit so v0.5 fixtures keep working unchanged."""
+    cfg = LLMConfig(model="google/gemini-2.5-pro", temperature=0.0)
+    topo = Topology(
+        name="v05-shape",
+        nodes=tuple(
+            Node(id=nid, role=f"r_{nid}", llm_config=cfg)
+            for nid in ("a", "b", "c")
+        ),
+        edges=(
+            Edge(from_id="a", to_id="b"),
+            Edge(from_id="b", to_id="c"),
+        ),
+        entrypoint="a",
+        terminal=("b", "a"),  # unsorted — lex-first is "a"
+        # verdict_node intentionally NOT set
+    )
+    assert topo.verdict_node is None
+    judge = FakeJudge(score_to_return=ContinuousScore(value=0.7))
+    cell = _run(
+        run_variant(
+            topo,
+            {"id": "e1", "input": "x"},
+            llm_callable=FakeLLM(),
+            judge=judge,
+        )
+    )
+    pld = judge.seen_payloads[0]
+    out = {o.node_id: o.response_text for o in cell.node_outputs}
+    assert pld["agent_output"] == out["a"]  # lex-first terminal
+
+
+def test_run_judge_marks_failure_when_verdict_node_absent_from_outputs():
+    """Step 20a defence-in-depth: if verdict_node is set but the declared
+    node is absent from walked outputs, the judge call marks the cell
+    judge_failure with verdict_node in the reason — NOT a fallback to
+    terminal[0] (which would silently launder a wrong-node score)."""
+    out = NodeOutput(
+        node_id="n0",
+        role="r0",
+        response_text="some text",
+        model_served_version="google/gemini-2.5-pro",
+        cache_hit=False,
+        latency_ms=0,
+    )
+    judge = FakeJudge(score_to_return=ContinuousScore(value=0.9))
+    result, judge_failure, reason = _run(
+        _run_judge(
+            judge=judge,
+            judge_cache=None,
+            outputs=[out],
+            terminal=("n0",),  # would succeed on its own
+            verdict_node="missing_node",  # but verdict_node overrides
+            eval_row={"id": "e1", "input": "x"},
+            variant_id="v1",
+            rubric_hash="h",
+            judge_model_version="m",
+        )
+    )
+    assert result is None
+    assert judge_failure is True
+    assert "missing_node" in reason
+    assert "verdict_node" in reason
+    # The judge must NOT have been consulted — no fallback to terminal.
+    assert judge.seen_payloads == []
+
+
+def test_run_judge_suppresses_multi_terminal_warning_when_verdict_node_set(caplog):
+    """Step 20a: the multi-terminal "ambiguous which one is judged" warning
+    only fires when verdict_node is unset. Setting verdict_node is the
+    user's explicit disambiguation — log noise would falsely imply
+    ambiguity remains."""
+    import logging
+    out_a = NodeOutput(
+        node_id="a", role="r", response_text="A",
+        model_served_version="m", cache_hit=False, latency_ms=0,
+    )
+    out_b = NodeOutput(
+        node_id="b", role="r", response_text="B",
+        model_served_version="m", cache_hit=False, latency_ms=0,
+    )
+    judge = FakeJudge(score_to_return=ContinuousScore(value=0.7))
+    with caplog.at_level(logging.WARNING, logger="topofuzz.runner"):
+        _run(
+            _run_judge(
+                judge=judge, judge_cache=None,
+                outputs=[out_a, out_b],
+                terminal=("a", "b"),
+                verdict_node="b",
+                eval_row={"id": "e1"}, variant_id="v1",
+                rubric_hash="h", judge_model_version="m",
+            )
+        )
+    assert not any(
+        "multi-terminal" in r.message.lower()
+        or "terminal nodes" in r.message.lower()
+        for r in caplog.records
+    )
+    assert judge.seen_payloads[0]["agent_output"] == "B"
+
+
 def test_runner_marks_judge_failure_when_judge_raises(tmp_path):
     topo = _toy_topology(n=1)
     judge = FakeJudge(raise_exc=RuntimeError("kaboom"))

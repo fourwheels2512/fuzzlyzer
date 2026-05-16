@@ -389,6 +389,66 @@ def _build_run_dir_for_ablate(
     return run_dir, canonical_id, v_id
 
 
+def test_ablate_async_anchors_on_verdict_node_not_lex_first_terminal(tmp_path):
+    """Step 20a BLOCKER B1 regression guard: when v_topology declares a
+    v0.6 ``verdict_node``, ablation must anchor leave-one-out attribution
+    to THAT node, not the lex-first terminal — otherwise F4 attribution
+    silently scores fragility against the wrong upstream nodes.
+
+    Build a topology with terminal=("a","z") (lex-first "a"), verdict_node
+    "z", and assert the ``substitute_terminal`` ablation point names "z".
+    """
+    canonical_outputs = [
+        _make_node_output_dict("a"),
+        _make_node_output_dict("z", response_text="CANONICAL VERDICT: APPROVE"),
+    ]
+    v_outputs = [
+        _make_node_output_dict("a"),
+        _make_node_output_dict("z", response_text="V VERDICT: DENY"),
+    ]
+    run_dir, canonical_id, v_id = _build_run_dir_for_ablate(
+        tmp_path,
+        canonical_outputs=canonical_outputs,
+        v_outputs=v_outputs,
+        canonical_score=0.9,
+        v_score=0.1,
+    )
+    triples = find_all_flipping_triples(run_dir)
+    assert len(triples) == 1
+
+    cfg = LLMConfig(model="google/gemini-2.5-flash", temperature=0.0)
+    nodes = (
+        Node(id="a", role="r_a", llm_config=cfg),
+        Node(id="z", role="r_z", llm_config=cfg),
+    )
+    edges = (Edge(from_id="a", to_id="z"),)
+    # Both terminal — lex-first is "a", but verdict_node names "z".
+    topo_canonical = Topology(
+        name="vn", nodes=nodes, edges=edges,
+        entrypoint="a", terminal=("a", "z"), verdict_node="z",
+    )
+    topo_v = Topology(
+        name="vn_v", nodes=nodes, edges=edges,
+        entrypoint="a", terminal=("a", "z"), verdict_node="z",
+    )
+
+    judge = MockJuryJudge(scores_queue=[1.0])
+    summary = asyncio.run(
+        _ablate_async(
+            run_dir=run_dir, run_id="ablate-vn",
+            triples=triples,
+            by_hash={canonical_id: topo_canonical, v_id: topo_v},
+            eval_rows_by_id={"eval_001": {"id": "eval_001", "input": "x"}},
+            judge=judge, max_cost_usd=None,
+            llm_callable=FakeLLM(), dry_run=False,
+        )
+    )
+    terminal_results = [r for r in summary.results if r.kind == "substitute_terminal"]
+    assert len(terminal_results) == 1
+    # Must anchor on verdict_node "z", NOT lex-first terminal "a".
+    assert terminal_results[0].ablated_node_id == "z"
+
+
 def test_ablate_async_terminal_substitution_always_closes_flip(tmp_path):
     """Terminal-node ablation substitutes canonical's terminal text and
     re-judges. With a mock jury returning canonical's score, the flip

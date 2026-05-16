@@ -850,25 +850,33 @@ async def _ablate_async(
             continue
 
         v_topology = by_hash[v_id]
+        # Use the SAME dispatch the runner uses for the judge target —
+        # if the topology declares a v0.6 ``verdict_node``, anchor
+        # ablation to it; otherwise fall back to the lex-first terminal
+        # (runner._run_judge sorts ``terminal`` and takes the first
+        # present output). Mismatching this anchor would silently
+        # attribute leave-one-out flips against a non-judged node and
+        # corrupt the F4 attribution table on every v0.6 fixture.
+        # (Step 20a BLOCKER B1.)
         terminal_ids = tuple(sorted(v_topology.terminal))
-        if not terminal_ids:
-            _log.warning(
-                "ablate: variant %s has empty Topology.terminal; skipping.",
-                v_id[:8],
-            )
-            continue
-        # Use the same lex-first reduction the runner uses for the
-        # judge target (runner._run_judge sorts terminal and takes the
-        # first present output).
-        terminal_id = terminal_ids[0]
-        # Find terminal position in V's execution order.
+        if v_topology.verdict_node is not None:
+            verdict_id = v_topology.verdict_node
+        else:
+            if not terminal_ids:
+                _log.warning(
+                    "ablate: variant %s has empty Topology.terminal and "
+                    "no verdict_node; skipping.", v_id[:8],
+                )
+                continue
+            verdict_id = terminal_ids[0]
+        # Find verdict-node position in V's execution order.
         v_node_ids = [n.id for n in v_topology.nodes]
         try:
-            terminal_pos = v_node_ids.index(terminal_id)
+            terminal_pos = v_node_ids.index(verdict_id)
         except ValueError:
             _log.warning(
-                "ablate: terminal %r not in v_topology.nodes for variant "
-                "%s; skipping.", terminal_id, v_id[:8],
+                "ablate: verdict node %r not in v_topology.nodes for "
+                "variant %s; skipping.", verdict_id, v_id[:8],
             )
             continue
         terminal_node = v_topology.nodes[terminal_pos]
@@ -918,7 +926,7 @@ async def _ablate_async(
                 break
 
             node_id = node.id
-            is_terminal = node_id == terminal_id
+            is_terminal = node_id == verdict_id
 
             # RT M3: refuse ablation on nodes with duplicate snapshots
             # in EITHER side's persisted outputs. Routes through the

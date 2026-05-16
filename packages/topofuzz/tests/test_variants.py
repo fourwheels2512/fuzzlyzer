@@ -1073,3 +1073,34 @@ class TestVariantStructuralIntegrity:
         for v in generate_variants(topo):
             roundtripped = Topology.model_validate_json(v.model_dump_json())
             assert roundtripped.canonical_hash() == v.canonical_hash()
+
+    def test_variants_preserve_verdict_node_through_generation(self):
+        """Step 20a: every variant generator must preserve ``verdict_node``
+        through ``_rebuild`` — otherwise the runner's verdict_node dispatch
+        silently falls back to terminal[0] on every permutation, defeating
+        the field's purpose."""
+        from topofuzz.ir import Edge, LLMConfig, Node
+        cfg = LLMConfig(model="m", temperature=0.0)
+        nodes = tuple(
+            Node(id=nid, role=f"r_{nid}", llm_config=cfg)
+            for nid in ("a", "b", "c", "d")
+        )
+        topo = Topology(
+            name="vn-preserve",
+            nodes=nodes,
+            edges=(
+                Edge(from_id="a", to_id="b"),
+                Edge(from_id="b", to_id="c"),
+                Edge(from_id="c", to_id="d"),
+            ),
+            entrypoint="a",
+            terminal=("d",),
+            verdict_node="b",
+        )
+        variants = list(generate_variants(topo))
+        assert variants  # smoke
+        for v in variants:
+            assert v.verdict_node == "b", (
+                f"variant {v.canonical_hash()[:8]} lost verdict_node: "
+                f"got {v.verdict_node!r}"
+            )

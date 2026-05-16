@@ -115,6 +115,22 @@ class Topology(BaseModel):
     # is not preserved. Variant generators must not assume `terminal[0]`
     # carries any priority.
     terminal: tuple[str, ...]
+    # Optional first-class declaration of "the node whose output IS the
+    # verdict the judge scores," distinct from `terminal` ("any node wired
+    # to END"). `terminal` conflates "produces the verdict" with
+    # "supervisor short-circuits to END," producing lexical-luck fragility
+    # on multi-terminal or supervisor topologies. Set this to remove that
+    # ambiguity; leave `None` to fall back to the lex-first `terminal`
+    # entry (the v0.5 behaviour, preserved bit-for-bit).
+    #
+    # The canonical_hash recipe OMITS this field when `None`, so a v0.5
+    # fixture (no verdict_node) hashes byte-identically to its hash before
+    # this field existed — JCS would otherwise encode an explicit
+    # `"verdict_node": null` and silently rebucket cache identity. A
+    # v0.6 fixture (verdict_node set) gets a legitimately new hash
+    # distinct from the same topology declared without verdict_node,
+    # because the judged node IS part of the topology's identity.
+    verdict_node: str | None = None
 
     @model_validator(mode="after")
     def _check_structural_integrity(self) -> "Topology":
@@ -136,6 +152,11 @@ class Topology(BaseModel):
                 raise ValueError(
                     f"terminal {t!r} is not in node ids {sorted(id_set)}"
                 )
+        if self.verdict_node is not None and self.verdict_node not in id_set:
+            raise ValueError(
+                f"verdict_node {self.verdict_node!r} is not in node ids "
+                f"{sorted(id_set)}"
+            )
         for e in self.edges:
             if e.from_id not in id_set:
                 raise ValueError(
@@ -156,5 +177,26 @@ class Topology(BaseModel):
         is shared with :meth:`LLMConfig.canonical_hash` and the cache
         key producer in :mod:`fuzzeval.cache` — a divergence here would
         silently re-bucket cache identity and corrupt the §7 invariant.
+
+        ``verdict_node=None`` is OMITTED from the canonicalised dict so a
+        v0.5 topology (no verdict_node field on the wire) hashes
+        byte-identically to its hash before this field existed. Without
+        the omission, JCS would encode an explicit ``"verdict_node":null``
+        and silently re-bucket every cached cell and signed bundle. When
+        the field is set, it IS part of the topology's identity (judging
+        a different node is a different measurement) and participates in
+        the hash.
+
+        NOTE: ``self.model_dump_json()`` does NOT apply the strip — it
+        emits ``"verdict_node":null`` literally. A caller who hashes
+        ``json.loads(t.model_dump_json())`` directly gets a DIFFERENT
+        bucket than ``t.canonical_hash()`` on a v0.5-shape topology.
+        Always go through ``canonical_hash()`` (or the analogous
+        ``fuzzeval.canonical.canonical_hash`` on the stripped view) for
+        cache / signing identity. Pinned by
+        ``test_ir.test_v05_hash_unchanged_after_field_added``.
         """
-        return _canonical_hash(self.model_dump(mode="json"))
+        payload = self.model_dump(mode="json")
+        if payload.get("verdict_node") is None:
+            payload.pop("verdict_node", None)
+        return _canonical_hash(payload)

@@ -357,6 +357,42 @@ class TestLlmConfigs:
         assert bare.canonical_hash() != enriched.canonical_hash()
 
 
+class TestVerdictNode:
+    """Step 20a: adapter accepts optional verdict_node and validates it."""
+
+    def test_verdict_node_unset_defaults_to_none(self):
+        topo = from_langgraph(build_lending_4role(), name="lending_4role")
+        assert topo.verdict_node is None
+
+    def test_verdict_node_set_to_walked_id_accepted(self):
+        topo = from_langgraph(
+            build_lending_4role(),
+            name="lending_4role",
+            verdict_node="decision",
+        )
+        assert topo.verdict_node == "decision"
+
+    def test_unknown_verdict_node_raises(self):
+        # Typos surface immediately rather than silently falling back to
+        # terminal[0] — the same fail-loud discipline as llm_configs.
+        with pytest.raises(NotImplementedError, match="verdict_node"):
+            from_langgraph(
+                build_lending_4role(),
+                verdict_node="not_a_node",
+            )
+
+    def test_verdict_node_changes_canonical_hash(self):
+        # Setting verdict_node IS a topology identity change — the judged
+        # node participates in the canonical hash so a "what does this
+        # measure" change does not silently share cache rows with the
+        # ambiguous v0.5 declaration.
+        bare = from_langgraph(build_lending_4role())
+        explicit = from_langgraph(
+            build_lending_4role(), verdict_node="decision"
+        )
+        assert bare.canonical_hash() != explicit.canonical_hash()
+
+
 class TestReservedNodeIdChars:
     def test_colon_in_node_id_rejected_via_fake_builder(self):
         # `":"` is reserved because xray=1 flattens subgraph nodes as

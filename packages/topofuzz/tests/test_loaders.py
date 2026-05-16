@@ -147,6 +147,78 @@ def test_load_topology_rejects_bad_llm_configs_values(tmp_path):
         load_topology(f"{f}:build_graph")
 
 
+# Step 20a: __topofuzz_verdict_node__ forwarded so confirm-pass
+# regeneration round-trips with the same canonical_hash.
+_FIXTURE_VERDICT_NODE = '''
+from langgraph.graph import END, START, StateGraph
+from typing import TypedDict
+
+
+class _S(TypedDict, total=False):
+    x: str
+
+
+def _agent(state):
+    return state
+
+
+def build_graph():
+    g = StateGraph(_S)
+    g.add_node("a", _agent)
+    g.add_node("b", _agent)
+    g.add_edge(START, "a")
+    g.add_edge("a", "b")
+    g.add_edge("b", END)
+    return g.compile()
+
+
+__topofuzz_verdict_node__ = "a"
+'''
+
+
+def test_load_topology_forwards_verdict_node(tmp_path):
+    f = _write_fixture(tmp_path, _FIXTURE_VERDICT_NODE)
+    topo = load_topology(f"{f}:build_graph")
+    assert topo.verdict_node == "a"
+
+
+def test_load_topology_omits_verdict_node_when_absent(tmp_path):
+    f = _write_fixture(tmp_path)  # canonical fixture has no verdict_node
+    topo = load_topology(f"{f}:build_graph")
+    assert topo.verdict_node is None
+
+
+_FIXTURE_BAD_VERDICT_NODE = '''
+from langgraph.graph import END, START, StateGraph
+from typing import TypedDict
+
+
+class _S(TypedDict, total=False):
+    x: str
+
+
+def _agent(state):
+    return state
+
+
+def build_graph():
+    g = StateGraph(_S)
+    g.add_node("a", _agent)
+    g.add_edge(START, "a")
+    g.add_edge("a", END)
+    return g.compile()
+
+
+__topofuzz_verdict_node__ = 42  # wrong type
+'''
+
+
+def test_load_topology_rejects_non_string_verdict_node(tmp_path):
+    f = _write_fixture(tmp_path, _FIXTURE_BAD_VERDICT_NODE)
+    with pytest.raises(TypeError, match="__topofuzz_verdict_node__"):
+        load_topology(f"{f}:build_graph")
+
+
 # ---------------------------------------------------------------------------
 # load_eval_rows — JSONL
 # ---------------------------------------------------------------------------

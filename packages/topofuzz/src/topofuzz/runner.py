@@ -588,6 +588,7 @@ async def run_variant(
         rubric_hash=rubric_hash,
         judge_model_version=judge_model_version,
         judge_prompt_renderer=judge_prompt_renderer,
+        verdict_node=variant_ir.verdict_node,
     )
 
     return Cell(
@@ -762,27 +763,38 @@ async def _run_judge(
     rubric_hash: str,
     judge_model_version: str,
     judge_prompt_renderer: Callable[[dict], str] | None = None,
+    verdict_node: str | None = None,
 ) -> tuple[JudgeResult | None, bool, str | None]:
     if judge is None or not outputs:
         return None, False, None
 
-    # The judged "pipeline output" is the DECLARED terminal node's
+    # The judged "pipeline output" is the DECLARED verdict node's
     # response — NOT whatever node ``order_swap`` happened to walk last.
-    # ``Topology.terminal`` is populated by the adapter from
-    # ``add_edge(node, END)``, validated non-empty by the IR, and
-    # preserved verbatim by every variant generator, so it is the
-    # topology's own statement of "this node produces the verdict".
+    # Source of truth (in priority order):
+    #
+    # 1. ``Topology.verdict_node`` if set — the v0.6 first-class field
+    #    that says "this node produces the verdict," independent of which
+    #    nodes are wired to END. Removes the lexical-luck fragility on
+    #    multi-terminal or supervisor topologies where ``terminal``
+    #    conflates "produces the verdict" with "supervisor short-circuits
+    #    to END." (Step 20a MAJOR.)
+    # 2. The lex-first entry of ``Topology.terminal`` otherwise — the
+    #    v0.5 behaviour, preserved bit-for-bit so existing fixtures keep
+    #    working unchanged.
+    #
     # Judging ``outputs[-1]`` instead let a permutation that lands a
     # non-verdict agent (e.g. ``intake``) last be scored as a verdict —
     # fabricating verdict-flips and corrupting every score-matrix metric.
     # See .planning/verdict-flip-rootcause/ for the full root-cause.
     #
-    # Note the terminal node may have run EARLY in a permuted variant
+    # Note the verdict node may have run EARLY in a permuted variant
     # (the runner walks ``nodes`` order), i.e. before its upstream
     # context arrived. That is intentional: "the verdict node decided
     # with starved context" IS the fragility signal we want to measure —
     # not an artifact to skip.
     #
+    # When ``verdict_node`` is set the multi-terminal warning is moot
+    # (the topology has explicitly named the judged node). When unset,
     # ``terminal`` has no priority among entries — the adapter sorts it,
     # but the IR validator does NOT enforce sortedness, so a directly-
     # constructed Topology could pass an unsorted tuple. We judge the
@@ -790,10 +802,12 @@ async def _run_judge(
     # deterministic regardless of how ``terminal`` was built. All v0.5
     # fixtures are single-terminal so this never actually matters today;
     # multi-terminal reduction is a documented BACKLOG item.
-    if len(terminal) > 1:
+    if verdict_node is None and len(terminal) > 1:
         _log.warning(
-            "judge: topology declares %d terminal nodes %r; v0.5 judges "
-            "the lex-first present one. Multi-terminal reduction is BACKLOG.",
+            "judge: topology declares %d terminal nodes %r and no "
+            "verdict_node; judging the lex-first present terminal. "
+            "Set Topology.verdict_node to remove this ambiguity "
+            "(multi-terminal reduction is BACKLOG).",
             len(terminal), terminal,
         )
     # node_id is unique per topology — enforced by the IR structural
@@ -801,23 +815,33 @@ async def _run_judge(
     # every variant generator's ``_rebuild`` — so this dict never silently
     # drops an output.
     by_node = {o.node_id: o for o in outputs}
-    terminal_output = next(
-        (by_node[t] for t in sorted(terminal) if t in by_node), None
-    )
-    if terminal_output is None:
-        # Terminal node produced no output. Unreachable in the v0.5
-        # runner — the IR validator guarantees every ``terminal`` entry
-        # is in ``nodes``, and cancellation returns a Cell before
-        # ``_run_judge`` — so this only fires if a future generator drops
-        # the terminal node. Mark the cell a judge_failure rather than
-        # fall back to ``outputs[-1]``: that fallback is the exact bug
-        # this function exists to kill (a wrong-node score laundered into
-        # the matrix as real data). A judge_failure cell is excluded from
-        # every metric — the honest outcome.
-        reason = (
-            f"terminal node(s) {terminal!r} absent from node_outputs "
-            f"(walked: {[o.node_id for o in outputs]!r})"
+    if verdict_node is not None:
+        terminal_output = by_node.get(verdict_node)
+    else:
+        terminal_output = next(
+            (by_node[t] for t in sorted(terminal) if t in by_node), None
         )
+    if terminal_output is None:
+        # Verdict node produced no output. Unreachable in the v0.5
+        # runner — the IR validator guarantees ``terminal`` (and
+        # ``verdict_node`` when set) is in ``nodes``, and cancellation
+        # returns a Cell before ``_run_judge`` — so this only fires if a
+        # future generator drops the verdict node. Mark the cell a
+        # judge_failure rather than fall back to ``outputs[-1]``: that
+        # fallback is the exact bug this function exists to kill (a
+        # wrong-node score laundered into the matrix as real data). A
+        # judge_failure cell is excluded from every metric — the honest
+        # outcome.
+        if verdict_node is not None:
+            reason = (
+                f"verdict_node {verdict_node!r} absent from node_outputs "
+                f"(walked: {[o.node_id for o in outputs]!r})"
+            )
+        else:
+            reason = (
+                f"terminal node(s) {terminal!r} absent from node_outputs "
+                f"(walked: {[o.node_id for o in outputs]!r})"
+            )
         _log.warning("judge: %s for variant %s", reason, variant_id)
         return None, True, reason
     final_output = terminal_output.response_text

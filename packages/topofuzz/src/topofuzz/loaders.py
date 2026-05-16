@@ -168,7 +168,23 @@ def load_topology(spec: str) -> Topology:
         llm_configs = llm_configs_raw
 
     name = getattr(module, "__topofuzz_name__", Path(path_str).stem)
-    return from_langgraph(compiled, name=name, llm_configs=llm_configs)
+    # Step 20a: forward optional ``__topofuzz_verdict_node__`` so
+    # ``confirm._reconstruct_variants`` (which regenerates the IR via
+    # this loader) round-trips a v0.6 fixture with the same canonical
+    # hash as the kickoff run. Dropping the field would silently
+    # rebucket every variant_id and break confirm-pass resolution.
+    verdict_node = getattr(module, "__topofuzz_verdict_node__", None)
+    if verdict_node is not None and not isinstance(verdict_node, str):
+        raise TypeError(
+            f"{path_str}:__topofuzz_verdict_node__ must be str; got "
+            f"{type(verdict_node).__name__}."
+        )
+    return from_langgraph(
+        compiled,
+        name=name,
+        llm_configs=llm_configs,
+        verdict_node=verdict_node,
+    )
 
 
 def load_eval_rows(path: str | Path) -> list[dict]:

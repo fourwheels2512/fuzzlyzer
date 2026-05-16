@@ -59,6 +59,7 @@ def from_langgraph(
     *,
     name: str = "topology",
     llm_configs: dict[str, LLMConfig] | None = None,
+    verdict_node: str | None = None,
 ) -> Topology:
     """Convert a compiled LangGraph (``StateGraph.compile()``) into a Topology.
 
@@ -70,12 +71,21 @@ def from_langgraph(
             generators to fire — they key on ``llm_config.model``. Unmapped
             nodes get ``llm_config=None``. Unknown keys raise
             ``NotImplementedError`` so typos surface immediately.
+        verdict_node: Optional v0.6 first-class declaration of "the node
+            whose output IS the verdict the judge scores," distinct from
+            ``terminal`` ("any node wired to END"). LangGraph cannot
+            introspect this from the compiled graph (nothing in
+            ``StateGraph`` names a verdict node), so the user passes it
+            explicitly. Unknown ids raise ``NotImplementedError``. When
+            ``None`` the runner falls back to the lex-first ``terminal``
+            entry — the v0.5 behaviour, preserved bit-for-bit.
 
     Raises:
         NotImplementedError: If the graph uses an out-of-scope construct
             (see module docstring), its compiled object does not expose
-            the LangGraph 1.x StateGraph builder API, or ``llm_configs``
-            references a node id that is not present in the walked graph.
+            the LangGraph 1.x StateGraph builder API, ``llm_configs``
+            references a node id that is not present in the walked graph,
+            or ``verdict_node`` is not in the walked graph.
     """
     builder = getattr(compiled, "builder", None)
     if builder is None:
@@ -104,6 +114,11 @@ def from_langgraph(
             f"llm_configs references node id(s) not in the walked graph: "
             f"{sorted(unknown)!r}. Known node ids: {sorted(walked_ids)!r}. "
             f"See {_OOS_TRACKER}."
+        )
+    if verdict_node is not None and verdict_node not in walked_ids:
+        raise NotImplementedError(
+            f"verdict_node {verdict_node!r} is not in the walked graph. "
+            f"Known node ids: {sorted(walked_ids)!r}. See {_OOS_TRACKER}."
         )
 
     nodes: list[Node] = [
@@ -148,6 +163,7 @@ def from_langgraph(
         edges=edges,
         entrypoint=entrypoints[0],
         terminal=sorted(set(terminals)),
+        verdict_node=verdict_node,
     )
 
 
