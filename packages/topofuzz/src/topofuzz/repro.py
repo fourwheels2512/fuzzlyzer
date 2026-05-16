@@ -354,6 +354,68 @@ def read_eval_input(eval_path: Path, eval_id: str) -> str:
     raise ReproError(f"eval_id={eval_id!r} not found in {eval_path}")
 
 
+def _resolve_verdict_node(manifest: dict) -> str | None:
+    """Pick the node id whose output the generated repro should compare.
+
+    Precedence mirrors :func:`topofuzz.runner._run_judge` and
+    :func:`topofuzz.publish._excerpt_terminal_output` (Step 20a / F6 BLOCKER):
+
+    1. ``manifest.verdict_node`` (v0.6 first-class field) — used as-is if a
+       non-empty trimmed ``str``. A present-but-malformed value (empty
+       string, non-string type) is rejected with a one-line warning so an
+       operator can grep the log; resolution falls through to (2).
+    2. The lex-first entry of ``manifest.terminal_nodes`` (v0.5.5 transitional
+       shape) when every entry is a non-empty ``str``. A list with even one
+       blank / non-string entry is rejected wholesale rather than skip-and-
+       continue: a malformed manifest is a bug, and silently picking
+       "alpha" out of ``["", "alpha"]`` would hide the bug from the operator
+       without preventing the runner from making a different choice.
+    3. ``None`` — for v0.5 manifests with neither field. The rendered script
+       falls back to ``history[-1][1]`` (legacy behaviour preserved bit-for-
+       bit for existing gallery runs).
+
+    Returns the resolved node id or ``None`` for the v0.5 fallback path.
+    """
+    raw_verdict = manifest.get("verdict_node")
+    if raw_verdict is not None:
+        if not isinstance(raw_verdict, str):
+            _log.warning(
+                "topofuzz repro: manifest.verdict_node is a %s, not a string; "
+                "ignoring (a malformed manifest is the underlying bug — fix "
+                "the orchestrator, don't lean on this fallback)",
+                type(raw_verdict).__name__,
+            )
+        elif not raw_verdict.strip():
+            _log.warning(
+                "topofuzz repro: manifest.verdict_node is empty / whitespace; "
+                "falling through to terminal_nodes (mirrors publish)."
+            )
+        else:
+            return raw_verdict
+
+    raw_terminals = manifest.get("terminal_nodes")
+    if raw_terminals is None:
+        return None
+    if not isinstance(raw_terminals, list):
+        _log.warning(
+            "topofuzz repro: manifest.terminal_nodes is a %s, not a list; "
+            "ignoring.",
+            type(raw_terminals).__name__,
+        )
+        return None
+    if not all(isinstance(t, str) and t.strip() for t in raw_terminals):
+        _log.warning(
+            "topofuzz repro: manifest.terminal_nodes contains blank or "
+            "non-string entries (%r); the whole list is rejected to surface "
+            "the malformed manifest rather than silently pick a survivor.",
+            raw_terminals,
+        )
+        return None
+    if not raw_terminals:
+        return None
+    return sorted(raw_terminals)[0]
+
+
 def _load_manifest(run_dir: Path) -> dict:
     """Read and parse ``manifest.json`` once. Centralises error message."""
     try:
@@ -444,6 +506,28 @@ def build_repro_script(
     hash_neg = hashes[idx_neg]
     hash_pos = hashes[idx_pos]
 
+    # Resolve the judged node the same way ``runner._run_judge`` and
+    # ``publish._excerpt_terminal_output`` do (Step 20a / F6 BLOCKER).
+    # Without this, the generated repro returns whatever node a permutation
+    # walked last, which on multi-terminal / supervisor topologies is not
+    # the node the judge actually scored — the same lexical-luck fragility
+    # ``verdict_node`` was introduced to kill.
+    verdict_node = _resolve_verdict_node(manifest)
+    # Audit RT-pass-1 M1: if the orchestrator declared ``verdict_node``
+    # but neither variant ordering actually walked it, the rendered script
+    # would AssertionError mid-run after the buyer has already paid for the
+    # first Gemini turn. Catch that here — surface as ReproError with both
+    # orderings so the operator can diagnose without running the script.
+    if verdict_node is not None and (
+        verdict_node not in ordering_neg or verdict_node not in ordering_pos
+    ):
+        raise ReproError(
+            f"manifest.verdict_node={verdict_node!r} is not present in "
+            f"both flip orderings (NEG={ordering_neg!r}, POS={ordering_pos!r}). "
+            "Topology drifted since the run was captured — re-run "
+            "``topofuzz run`` to refresh the manifest."
+        )
+
     eval_path = _resolve_eval_path(cli_args, run_dir)
     eval_input = read_eval_input(eval_path, eid)
 
@@ -493,6 +577,7 @@ def build_repro_script(
         hash_neg_short=hash_neg[:8],
         hash_pos_short=hash_pos[:8],
         threshold=threshold,
+        verdict_node=verdict_node,
     )
     return text, eid
 

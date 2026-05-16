@@ -575,3 +575,356 @@ def test_build_repro_script_jinja2_missing_raises_friendly(tmp_path, monkeypatch
     monkeypatch.setattr(builtins, "__import__", fake_import)
     with pytest.raises(ReproError, match=r"\[full\]"):
         build_repro_script(run_dir)
+
+
+# ---------------------------------------------------------------------------
+# Step 20a / F6 BLOCKER — repro must dispatch on manifest.verdict_node
+# ---------------------------------------------------------------------------
+
+
+def _patch_manifest(run_dir: Path, **fields) -> None:
+    m = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    m.update(fields)
+    (run_dir / "manifest.json").write_text(
+        json.dumps(m), encoding="utf-8"
+    )
+
+
+def test_repro_emits_explicit_verdict_node_when_manifest_sets_it(tmp_path):
+    """v0.6 manifest path — generated script must carry the named node.
+
+    Without the Step 20a fix the template hardcoded ``history[-1][1]`` which
+    silently judged whichever node a permutation walked last — fabricating
+    flips on multi-terminal / supervisor topologies. The reproducer must
+    carry the orchestrator's declared verdict_node so the comparison
+    matches what ``runner._run_judge`` actually scored.
+    """
+    run_dir = _make_synthetic_run(tmp_path, with_flip=True)
+    # ``n2`` is NOT the last node in either ordering (NEG is ["n2", "n1"],
+    # POS is ["n1", "n2"]); picking it surfaces any test that latently
+    # depends on the last-walked-node fallback.
+    _patch_manifest(run_dir, verdict_node="n2", terminal_nodes=["n2"])
+    text, _ = build_repro_script(run_dir)
+    assert 'VERDICT_NODE = "n2"' in text
+    assert "run_chain(ORDERING_NEG, LLM_CONFIGS, VERDICT_NODE)" in text
+
+
+def test_repro_falls_back_to_lex_first_terminal_node(tmp_path):
+    """v0.5.5 transitional path — only ``terminal_nodes`` set (no
+    ``verdict_node``). Must mirror ``runner._run_judge``'s lex-first
+    dispatch so the script and the runner score the same node.
+
+    The synthetic orderings are ``["n1", "n2"]`` and ``["n2", "n1"]``; the
+    terminal_nodes list ``["n2", "n1"]`` lex-sorts to ``"n1"`` so the test
+    distinguishes the lex-first behaviour from "list-first" or "ordering
+    last".
+    """
+    run_dir = _make_synthetic_run(tmp_path, with_flip=True)
+    _patch_manifest(run_dir, terminal_nodes=["n2", "n1"])
+    text, _ = build_repro_script(run_dir)
+    assert 'VERDICT_NODE = "n1"' in text
+
+
+def test_repro_no_verdict_fields_emits_none(tmp_path):
+    """v0.5 manifest — neither ``verdict_node`` nor ``terminal_nodes``.
+
+    Backwards-compat: the script must compile, ``VERDICT_NODE`` is ``None``,
+    and the fallback path returns ``history[-1][1]`` so legacy gallery runs
+    keep reproducing without re-running the orchestrator. Jinja's ``tojson``
+    filter emits JSON ``null`` for Python ``None``, which is NOT a valid
+    Python literal — a regression there would NameError the generated
+    script at load. This test catches that via AST parse.
+    """
+    import ast
+
+    run_dir = _make_synthetic_run(tmp_path, with_flip=True)
+    text, _ = build_repro_script(run_dir)
+    tree = ast.parse(text)
+    found_verdict = False
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "VERDICT_NODE"
+        ):
+            found_verdict = True
+            assert isinstance(node.value, ast.Constant)
+            assert node.value.value is None, (
+                "v0.5 manifest must render VERDICT_NODE = None (not 'null')"
+            )
+    assert found_verdict, "VERDICT_NODE assignment missing from rendered script"
+
+
+def test_repro_verdict_node_preferred_over_terminal_nodes(tmp_path):
+    """When both fields are present, ``verdict_node`` wins — matches the
+    runner's precedence so a manifest that pinned the verdict node never
+    silently gets re-interpreted by repro. ``n1`` is in both synthetic
+    orderings, so the render-time presence check (RT M1) accepts it.
+    """
+    run_dir = _make_synthetic_run(tmp_path, with_flip=True)
+    _patch_manifest(
+        run_dir,
+        verdict_node="n1",
+        terminal_nodes=["n2"],
+    )
+    text, _ = build_repro_script(run_dir)
+    assert 'VERDICT_NODE = "n1"' in text
+
+
+def test_repro_empty_verdict_node_falls_through(tmp_path):
+    """Mirror publish's empty/whitespace rejection — an empty string is
+    not a valid node id; resolution must fall through to terminal_nodes
+    (or None when neither yields a valid id)."""
+    run_dir = _make_synthetic_run(tmp_path, with_flip=True)
+    _patch_manifest(
+        run_dir,
+        verdict_node="   ",
+        terminal_nodes=["n2"],
+    )
+    text, _ = build_repro_script(run_dir)
+    assert 'VERDICT_NODE = "n2"' in text
+
+
+def test_repro_terminal_nodes_with_blank_entry_rejected(tmp_path):
+    """A malformed terminal_nodes list (e.g. an empty string) must be
+    treated as absent; the renderer must NOT pick the blank as lex-first
+    and emit ``VERDICT_NODE = ""`` (which the runtime would then fail to
+    match against any history entry)."""
+    run_dir = _make_synthetic_run(tmp_path, with_flip=True)
+    _patch_manifest(run_dir, terminal_nodes=["", "alpha"])
+    text, _ = build_repro_script(run_dir)
+    # Falls all the way through to None — neither "" nor "alpha" is picked
+    # because the whole list is rejected when any entry fails the validator.
+    import ast
+    tree = ast.parse(text)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "VERDICT_NODE"
+        ):
+            assert node.value.value is None
+
+
+def test_repro_byte_identical_with_verdict_node_set(tmp_path):
+    """The byte-identical contract (covered for v0.5 manifests by
+    ``test_build_repro_script_byte_identical_on_double_render``) must also
+    hold for v0.6 manifests with ``verdict_node`` set."""
+    run_dir = _make_synthetic_run(tmp_path, with_flip=True)
+    _patch_manifest(run_dir, verdict_node="n2", terminal_nodes=["n2"])
+    text1, _ = build_repro_script(run_dir)
+    text2, _ = build_repro_script(run_dir)
+    assert text1 == text2
+
+
+def test_repro_script_remains_syntactically_valid_with_verdict_node(tmp_path):
+    """Sanity: with verdict_node set the generated script still parses as
+    Python — the new top-level constant + ``run_chain`` signature change
+    must not produce invalid syntax."""
+    import ast
+
+    run_dir = _make_synthetic_run(tmp_path, with_flip=True)
+    _patch_manifest(run_dir, verdict_node="n2", terminal_nodes=["n2"])
+    text, eid = build_repro_script(run_dir)
+    ast.parse(text, filename=f"repro_{eid}.py")  # raises on bad syntax
+
+
+# ---------------------------------------------------------------------------
+# Pass-1 audit folds — RT M1 / M2 / M3, CR M1
+# ---------------------------------------------------------------------------
+
+
+def test_repro_render_time_check_rejects_verdict_node_not_in_orderings(tmp_path):
+    """RT pass-1 M1 — if the orchestrator declared a ``verdict_node`` that
+    isn't actually walked by either flip ordering, the render must fail
+    with ``ReproError`` (not silently emit a script that AssertionErrors
+    mid-run after the buyer has paid for the first Gemini turn)."""
+    run_dir = _make_synthetic_run(tmp_path, with_flip=True)
+    # The synthetic orderings are ["n1", "n2"] / ["n2", "n1"]; "ghost" is
+    # NOT in either, so the rendered script would never match it at runtime.
+    _patch_manifest(run_dir, verdict_node="ghost", terminal_nodes=["ghost"])
+    with pytest.raises(ReproError, match="ghost.*not present in both flip orderings"):
+        build_repro_script(run_dir)
+
+
+def test_repro_render_time_check_passes_when_verdict_node_walked(tmp_path):
+    """The render-time check must NOT false-positive when verdict_node IS
+    in both orderings (regardless of position)."""
+    run_dir = _make_synthetic_run(tmp_path, with_flip=True)
+    # "n1" appears in both ORDERING_NEG and ORDERING_POS even though it
+    # isn't last in NEG.
+    _patch_manifest(run_dir, verdict_node="n1")
+    text, _ = build_repro_script(run_dir)
+    assert 'VERDICT_NODE = "n1"' in text
+
+
+def test_resolve_verdict_node_logs_warning_on_non_string_type(tmp_path, caplog):
+    """RT pass-1 M3 — a non-string verdict_node (list/dict/int/bool) is
+    silently demoted to None elsewhere; here we surface it as a warning
+    so an operator can grep the log for a malformed manifest."""
+    import logging
+    from topofuzz.repro import _resolve_verdict_node
+
+    with caplog.at_level(logging.WARNING, logger="topofuzz.repro"):
+        out = _resolve_verdict_node({"verdict_node": ["risk", "policy"]})
+    assert out is None
+    assert any("not a string" in r.message for r in caplog.records)
+
+
+def test_resolve_verdict_node_logs_warning_on_empty_string(tmp_path, caplog):
+    """RT pass-1 M3 mirror — empty/whitespace verdict_node logs and falls
+    through (matches publish's behaviour for log parity)."""
+    import logging
+    from topofuzz.repro import _resolve_verdict_node
+
+    with caplog.at_level(logging.WARNING, logger="topofuzz.repro"):
+        out = _resolve_verdict_node({"verdict_node": "   "})
+    assert out is None
+    assert any("empty" in r.message.lower() for r in caplog.records)
+
+
+def test_resolve_verdict_node_logs_warning_on_non_list_terminal_nodes(caplog):
+    """RT pass-1 M3 — same for malformed terminal_nodes."""
+    import logging
+    from topofuzz.repro import _resolve_verdict_node
+
+    with caplog.at_level(logging.WARNING, logger="topofuzz.repro"):
+        out = _resolve_verdict_node({"terminal_nodes": "decision"})
+    assert out is None
+    assert any("not a list" in r.message for r in caplog.records)
+
+
+def test_resolve_verdict_node_handles_empty_terminal_list_silently():
+    """Empty list (orchestrator wrote ``terminal_nodes: []``) → None,
+    but quietly: it's not malformed, just empty (e.g. cancelled run).
+    """
+    import logging
+    from topofuzz.repro import _resolve_verdict_node
+
+    out = _resolve_verdict_node({"terminal_nodes": []})
+    assert out is None
+
+
+def _publish_pick_verdict_node_field(manifest: dict) -> str | None:
+    """Faithful inline copy of publish.py:927-942's field-resolution.
+
+    The actual code lives inside ``_build_ceo_card_context`` (publish.py
+    around line 920), where it sets ``verdict_node_id`` and
+    ``terminal_nodes`` before passing to ``_excerpt_terminal_output``.
+    If this canary copy ever drifts from publish.py's inline block, this
+    test will fail — that's the point. **If you update publish.py's
+    resolver, update this copy AND topofuzz.repro._resolve_verdict_node
+    in lockstep.**
+    """
+    verdict_node_id = manifest.get("verdict_node")
+    if isinstance(verdict_node_id, str) and not verdict_node_id.strip():
+        verdict_node_id = None
+    if not isinstance(verdict_node_id, str):
+        verdict_node_id = None
+    terminal_nodes_raw = manifest.get("terminal_nodes")
+    if isinstance(terminal_nodes_raw, list) and all(
+        isinstance(t, str) and t.strip() for t in terminal_nodes_raw
+    ):
+        terminal_nodes = tuple(terminal_nodes_raw)
+    else:
+        terminal_nodes = None
+    # Reduce to a single node id the same way _excerpt_terminal_output
+    # does on the field level (sorted lex-first when verdict_node is
+    # unset). _excerpt_terminal_output also has a "first PRESENT in
+    # by_node" survival rule, but that operates on outputs, not on the
+    # manifest fields; the canary is field-level only.
+    if verdict_node_id is not None:
+        return verdict_node_id
+    if terminal_nodes:
+        return sorted(terminal_nodes)[0]
+    return None
+
+
+def test_resolve_verdict_node_field_level_parity_with_publish():
+    """RT pass-1 M2 — field-level resolver canary (runner-vs-repro contract).
+
+    repro and publish each re-implement the same field-level precedence
+    (verdict_node string → lex-first terminal_nodes → None). A future PR
+    that loosens one without the other re-introduces the silent
+    wrong-node-scored bug on the buyer-facing artifact (the demo PDF and
+    the standalone repro script would name different nodes, and a
+    skeptical compliance reviewer declares the product broken).
+
+    **Scope:** field-level only. ``publish._excerpt_terminal_output``
+    additionally applies a "first present in by_node" survival rule on the
+    actual node-output set, which repro cannot replicate at render time
+    (no access to per-cell ``node_outputs_json``). The output-level
+    divergence on multi-terminal with cancelled outputs is BACKLOG, not
+    in this canary's scope.
+    """
+    from topofuzz.repro import _resolve_verdict_node
+
+    cases = [
+        ("explicit verdict_node wins",
+         {"verdict_node": "explicit", "terminal_nodes": ["other"]}),
+        ("terminal_nodes lex-first when verdict_node unset",
+         {"terminal_nodes": ["zebra", "alpha", "mango"]}),
+        ("empty-string verdict_node falls through",
+         {"verdict_node": "", "terminal_nodes": ["fallback"]}),
+        ("whitespace verdict_node falls through",
+         {"verdict_node": "   ", "terminal_nodes": ["only-one"]}),
+        ("solo verdict_node, no terminal_nodes",
+         {"verdict_node": "winner"}),
+        ("solo terminal_nodes, no verdict_node",
+         {"terminal_nodes": ["solo"]}),
+        ("v0.5 manifest with neither field", {}),
+        ("verdict_node with empty terminal_nodes list",
+         {"verdict_node": "single", "terminal_nodes": []}),
+        ("list-typed verdict_node ignored, terminal_nodes used",
+         {"verdict_node": ["a", "b"], "terminal_nodes": ["fallback"]}),
+        ("int-typed terminal_nodes entry rejects whole list",
+         {"terminal_nodes": ["valid", 0]}),
+        # RT pass-2 MIN-2: type widening — these all must demote to None.
+        ("bool-typed verdict_node", {"verdict_node": False}),
+        ("int-typed verdict_node", {"verdict_node": 0}),
+        ("float-typed verdict_node", {"verdict_node": 0.0}),
+        ("dict-typed verdict_node", {"verdict_node": {"a": "b"}}),
+        ("None-valued verdict_node", {"verdict_node": None}),
+        ("dict-typed terminal_nodes ignored",
+         {"terminal_nodes": {"a": "b"}}),
+    ]
+    for label, fields in cases:
+        repro_pick = _resolve_verdict_node(fields)
+        publish_pick = _publish_pick_verdict_node_field(fields)
+        assert repro_pick == publish_pick, (
+            f"resolver drift on case '{label}' ({fields}): "
+            f"repro picked {repro_pick!r}, publish picked {publish_pick!r}"
+        )
+
+
+def test_repro_runtime_failure_uses_banner_exit_not_assertion(tmp_path):
+    """RT pass-1 m3 — the generated script's verdict_node-missing failure
+    path should be a clean ``sys.exit(...)`` with a stderr banner, not a
+    raw ``AssertionError`` traceback (compliance reviewers misread
+    tracebacks as 'API problems' and dismiss the result).
+
+    RT pass-2 MAJ-2: exit code must NOT be 2 (collides with cli.py's
+    ``_BAD_USAGE_EXIT == 2``). We exit 1 to match the existing
+    empty-LLM-response branch (both are "inconclusive reproduction").
+    """
+    import ast
+
+    run_dir = _make_synthetic_run(tmp_path, with_flip=True)
+    _patch_manifest(run_dir, verdict_node="n2", terminal_nodes=["n2"])
+    text, _ = build_repro_script(run_dir)
+    assert "REPRO INCONCLUSIVE" in text
+    assert "sys.exit(2)" not in text  # exit 2 reserved for CLI bad-usage
+    # And the raw AssertionError must NOT appear inside run_chain.
+    tree = ast.parse(text)
+    for fn in ast.walk(tree):
+        if isinstance(fn, ast.FunctionDef) and fn.name == "run_chain":
+            for sub in ast.walk(fn):
+                if isinstance(sub, ast.Raise) and isinstance(sub.exc, ast.Call):
+                    called = sub.exc.func
+                    name = getattr(called, "id", None) or getattr(called, "attr", None)
+                    assert name != "AssertionError", (
+                        "run_chain still raises AssertionError on missing "
+                        "verdict_node — must use sys.exit(...) for the "
+                        "compliance-reviewer-friendly path."
+                    )

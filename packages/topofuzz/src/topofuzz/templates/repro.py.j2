@@ -23,6 +23,16 @@ EVAL_INPUT = {{ eval_input | tojson }}
 ORDERING_NEG = {{ ordering_neg | tojson }}
 # Variant {{ hash_pos_short }} — verdict score >= {{ threshold }} ("APPROVE" side)
 ORDERING_POS = {{ ordering_pos | tojson }}
+# Node the orchestrator declared as the verdict producer — what
+# ``topofuzz.runner._run_judge`` actually scored. The reproducer must
+# compare THIS node's output across orderings (Step 20a / F6 BLOCKER
+# fix), not whatever node a permutation happened to walk last. ``None``
+# for v0.5 manifests that predate the ``terminal_nodes`` / ``verdict_node``
+# fields — falls back to the last node walked.
+# NOTE: explicit ``None`` branch — Jinja's ``tojson`` filter emits JSON
+# ``null`` for Python ``None``, which is NOT a valid Python literal and
+# would NameError at script load.
+VERDICT_NODE = {% if verdict_node is none %}None{% else %}{{ verdict_node | tojson }}{% endif %}
 
 
 def _cfg_field(cfg, name, default):
@@ -34,8 +44,15 @@ def _cfg_field(cfg, name, default):
     return default
 
 
-def run_chain(ordering, llm_configs):
-    """Run nodes sequentially in ``ordering``; each node sees prior outputs."""
+def run_chain(ordering, llm_configs, verdict_node):
+    """Run nodes sequentially in ``ordering``; return verdict_node's output.
+
+    Each node sees prior outputs. When ``verdict_node`` is set we return the
+    response of that specific node id (matches ``topofuzz.runner._run_judge``
+    dispatch) regardless of whether it ran first, last, or in the middle.
+    When ``verdict_node`` is ``None`` (v0.5 manifest) we fall back to the
+    last node walked.
+    """
     history = []
     for node_id in ordering:
         cfg = llm_configs[node_id]
@@ -50,12 +67,31 @@ def run_chain(ordering, llm_configs):
             messages=[{"role": "user", "content": prompt}],
         )
         history.append((node_id, resp.choices[0].message.content))
+    if verdict_node is not None:
+        for nid, out in history:
+            if nid == verdict_node:
+                return out
+        # Exit 1 with a single-line banner rather than raise AssertionError
+        # so a compliance reviewer running this script sees a clear
+        # "topology drift" message instead of a Python traceback they might
+        # dismiss as "Gemini rate-limit". Exit 1 matches the existing
+        # empty-LLM-response branch below — both are "inconclusive
+        # reproduction" failures — and avoids collision with the topofuzz
+        # CLI's exit-2 == bad-usage convention (cli.py:_BAD_USAGE_EXIT).
+        import sys
+        print(
+            f"REPRO INCONCLUSIVE: verdict_node {verdict_node!r} did not "
+            f"appear in ordering {ordering!r} — topology drifted since the "
+            "run was captured; re-run the original topofuzz audit.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     return history[-1][1]
 
 
 if __name__ == "__main__":
-    out_neg = run_chain(ORDERING_NEG, LLM_CONFIGS)
-    out_pos = run_chain(ORDERING_POS, LLM_CONFIGS)
+    out_neg = run_chain(ORDERING_NEG, LLM_CONFIGS, VERDICT_NODE)
+    out_pos = run_chain(ORDERING_POS, LLM_CONFIGS, VERDICT_NODE)
     print(f"Ordering NEG {ORDERING_NEG}\n  final: {out_neg!r}\n")
     print(f"Ordering POS {ORDERING_POS}\n  final: {out_pos!r}\n")
     if not out_neg or not out_pos:
