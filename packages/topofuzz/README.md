@@ -32,9 +32,10 @@ other than your declared vendor API calls. See
 
 ## Status
 
-**v0.5.0rc1** — soft launch. Single-judge by default (Gemini); opt-in
-jury-of-3 (Anthropic + OpenAI + Gemini) lives behind `--jury-of-3` and
-ships stub-only in rc1 — real-keys integration test lands in v0.5.1.
+**v0.6.0.** Single-judge by default (Gemini); opt-in jury-of-3
+(Anthropic + OpenAI + Gemini) lives behind `--jury-of-3` and is wired
+end-to-end through the CLI, manifest, runner, and report with
+jury-aware VOO and Wilson 95% CIs.
 
 DSSE-signed run bundles, byte-exact against the
 [`secure-systems-lab/dsse`](https://github.com/secure-systems-lab/dsse)
@@ -215,13 +216,13 @@ ships a ~30-line `verify_dsse.py` reference verifier that depends only on
 the Python stdlib + the `cryptography` package (no `rfc8785`, no
 `pydantic`).
 
-### Jury-of-3 (opt-in, stub-only in v0.5.0rc1)[^jury]
+### Jury-of-3 (opt-in)
 
 Pass `--jury-of-3` to fan each judge call out to Anthropic + OpenAI +
 Gemini, take the mean of parseable scores, and report
 `judge_failure_rate` + `judge_independence.vendor_overlap` separately.
-The schema ships in v0.5.0rc1 as INFORMATIONAL; the v1.0 promotion to a
-HARD gate is a gate-logic change, not a schema bump.
+The schema is INFORMATIONAL in v0.6.0; the v1.0 promotion to a HARD
+gate is a gate-logic change, not a schema bump.
 
 ```bash
 export ANTHROPIC_API_KEY=...  # or via your secret manager
@@ -234,13 +235,7 @@ topofuzz run <fixture>:build_graph --eval <rows.csv> --n 50 --jury-of-3
 Missing keys surface as `judge_failure` cells, not as a kickoff error
 (per the
 [BLUEPRINT §A](https://github.com/kirannayudu/topofuzz/blob/main/BLUEPRINT_v5plus.md)
-degraded-badge contract). The end-to-end real-keys integration test for
-`topofuzz run --jury-of-3` is deferred to v0.5.1 — v0.5.0rc1 ships with
-stub-only jury unit + soft-DoD coverage.
-
-[^jury]: v0.5.0rc1 ships the jury opt-in wired end-to-end through the
-    CLI, manifest, runner, and report. The deferred piece is an
-    integration test that exercises three real vendors on `--n 10`.
+degraded-badge contract).
 
 ### Reserved flag namespace
 
@@ -257,7 +252,7 @@ today: `--conformance`, `--signoff`, `--judge-pool`, `--sandbox`,
   author = {Nayudu, Kiran},
   year   = {2026},
   url    = {https://github.com/kirannayudu/topofuzz},
-  version = {0.5.0rc1}
+  version = {0.6.0}
 }
 ```
 
