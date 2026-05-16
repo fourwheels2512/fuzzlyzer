@@ -183,7 +183,10 @@ Read these before quoting any number:
 
 ## License
 
-The gallery contents are released under the same Apache-2.0 license as
-topofuzz itself — see the repo-root `LICENSE`. Eval rows are
+The gallery contents are released under the same Business Source
+License 1.1 as topofuzz itself — see the repo-root `LICENSE` and the
+canonical 4-line BSL header at the top of every gallery `fixture.py`.
+The CI gate at `.github/workflows/ci.yml` enforces header presence
+via `scripts/add_copyright_headers.py --check`. Eval rows are
 synthetic; any resemblance to real applicants, posts, or articles is
 illustrative only.

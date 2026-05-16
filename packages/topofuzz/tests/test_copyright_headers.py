@@ -171,6 +171,27 @@ def test_iter_python_files_skips_pycache(script, tmp_path):
     assert "dropped.py" not in names
 
 
+def test_iter_python_files_skips_runs_directory(script, tmp_path):
+    """Bundle 1 pass-1 CR MINOR-1: once gallery is in WATCHED_DIRS,
+    each gallery dir owns a `runs/<run_id>/` subtree of variant + judge
+    artifacts. The inserter must not silently apply a BSL header to any
+    `.py` file that a future variant generator dumps under `runs/`."""
+    root = tmp_path / "gallery"
+    root.mkdir()
+    (root / "fixture.py").write_text("", encoding="utf-8")
+    runs = root / "runs" / "2026-05-16-abc"
+    runs.mkdir(parents=True)
+    (runs / "debug_dump.py").write_text("", encoding="utf-8")
+    nested = root / "subdir" / "runs" / "deep"
+    nested.mkdir(parents=True)
+    (nested / "nested_under_runs.py").write_text("", encoding="utf-8")
+    files = script.iter_python_files((root,))
+    names = [p.name for p in files]
+    assert "fixture.py" in names
+    assert "debug_dump.py" not in names
+    assert "nested_under_runs.py" not in names
+
+
 def test_iter_python_files_returns_sorted(script, tmp_path):
     root = tmp_path / "pkg"
     root.mkdir()

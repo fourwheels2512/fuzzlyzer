@@ -837,15 +837,25 @@ async def _run_judge(
         # wrong-node score laundered into the matrix as real data). A
         # judge_failure cell is excluded from every metric — the honest
         # outcome.
+        # Single prefix `terminal node(s) ` for BOTH branches so an
+        # operator's saved `failure_reason LIKE 'terminal node%'` SQL
+        # filter (established under the v0.5 fallback path before
+        # verdict_node shipped in v0.6) matches the verdict_node-failure
+        # rows too. The verdict_node case keeps the literal
+        # `verdict_node=` suffix so the cause is still grep-distinguishable
+        # from a v0.5-style multi-terminal absence (L861 closed
+        # 2026-05-16; see BACKLOG entry "operator `failure_reason` SQL
+        # filters").
+        walked = [o.node_id for o in outputs]
         if verdict_node is not None:
             reason = (
-                f"verdict_node {verdict_node!r} absent from node_outputs "
-                f"(walked: {[o.node_id for o in outputs]!r})"
+                f"terminal node(s) {verdict_node!r} (verdict_node={verdict_node!r}) "
+                f"absent from node_outputs (walked: {walked!r})"
             )
         else:
             reason = (
                 f"terminal node(s) {terminal!r} absent from node_outputs "
-                f"(walked: {[o.node_id for o in outputs]!r})"
+                f"(walked: {walked!r})"
             )
         _log.warning("judge: %s for variant %s", reason, variant_id)
         return None, True, reason

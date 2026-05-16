@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Kiran Nayudu. All rights reserved.
+# Licensed under the Business Source License 1.1.
+# See LICENSE file in the project root for full terms.
+# <!-- PATENT_PENDING_NOTICE_GOES_HERE -->
+
 """langgraph-adversarial-relay-dsv4: identical to fixture.py, skeptic on DeepSeek V4 Pro.
 
 The ONLY difference from ``fixture.py`` is the ``downside_risk_underwriter``

@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Kiran Nayudu. All rights reserved.
+# Licensed under the Business Source License 1.1.
+# See LICENSE file in the project root for full terms.
+# <!-- PATENT_PENDING_NOTICE_GOES_HERE -->
+
 """insurance-claim-triage: 4-agent skeptic-in-the-middle for health-insurance claims.
 
 Same mechanism as langgraph-adversarial-relay, applied to a different

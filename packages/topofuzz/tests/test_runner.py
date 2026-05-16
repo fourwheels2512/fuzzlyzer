@@ -1112,6 +1112,70 @@ def test_run_judge_suppresses_multi_terminal_warning_when_verdict_node_set(caplo
     assert judge.seen_payloads[0]["agent_output"] == "B"
 
 
+def test_run_judge_failure_reason_uses_unified_terminal_node_prefix():
+    """L861: BOTH the explicit-verdict_node branch and the v0.5 terminal
+    fallback emit `failure_reason` with the same `terminal node(s) `
+    prefix. An operator's saved
+    ``WHERE failure_reason LIKE 'terminal node%'`` SQL filter
+    (established under v0.5 before verdict_node shipped in v0.6) must
+    match BOTH failure shapes; the v0.6 verdict_node-absence rows used
+    to silently miss that filter."""
+    out = NodeOutput(
+        node_id="actual_node",
+        role="r0",
+        response_text="walked here",
+        model_served_version="m",
+        cache_hit=False,
+        latency_ms=0,
+    )
+    judge = FakeJudge(score_to_return=ContinuousScore(value=0.9))
+
+    # Branch 1: explicit verdict_node is set but absent from outputs.
+    _, jf_v, reason_v = _run(
+        _run_judge(
+            judge=judge,
+            judge_cache=None,
+            outputs=[out],
+            terminal=("actual_node",),
+            verdict_node="missing_v",
+            eval_row={"id": "e1"},
+            variant_id="v1",
+            rubric_hash="h",
+            judge_model_version="m",
+        )
+    )
+    assert jf_v is True
+    assert reason_v.startswith("terminal node(s) "), (
+        f"verdict_node-absence reason must use unified prefix, got: {reason_v!r}"
+    )
+    # The `verdict_node=` literal stays in the suffix so cause is
+    # grep-distinguishable from a v0.5 multi-terminal absence.
+    assert "verdict_node=" in reason_v
+    assert "missing_v" in reason_v
+
+    # Branch 2: no verdict_node, lex-first terminal fallback absent.
+    _, jf_t, reason_t = _run(
+        _run_judge(
+            judge=judge,
+            judge_cache=None,
+            outputs=[out],
+            terminal=("missing_a", "missing_b"),
+            verdict_node=None,
+            eval_row={"id": "e1"},
+            variant_id="v1",
+            rubric_hash="h",
+            judge_model_version="m",
+        )
+    )
+    assert jf_t is True
+    assert reason_t.startswith("terminal node(s) "), (
+        f"v0.5 terminal-fallback reason must use unified prefix, got: {reason_t!r}"
+    )
+    # The v0.5 branch does NOT carry `verdict_node=` so operators can
+    # still distinguish the two failure shapes if they want.
+    assert "verdict_node=" not in reason_t
+
+
 def test_runner_marks_judge_failure_when_judge_raises(tmp_path):
     topo = _toy_topology(n=1)
     judge = FakeJudge(raise_exc=RuntimeError("kaboom"))

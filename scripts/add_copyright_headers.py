@@ -54,6 +54,12 @@ WATCHED_DIRS: tuple[Path, ...] = (
     REPO_ROOT / "packages" / "topofuzz" / "tests",
     REPO_ROOT / "packages" / "fuzzeval" / "src" / "fuzzeval",
     REPO_ROOT / "packages" / "fuzzeval" / "tests",
+    # Gallery fixtures are the strongest buyer-facing copy-paste demo
+    # surface and the substrate the F6 CEO-card PDF references. A
+    # competitor forking the gallery without seeing a BSL header has
+    # zero notice of the license terms — BACKLOG follow-up "Gallery
+    # fixtures unwatched" closed 2026-05-16, option (a) chosen.
+    REPO_ROOT / "examples" / "gallery",
 )
 
 COPYRIGHT_HEADER_LINES: tuple[str, ...] = (
@@ -86,15 +92,22 @@ _PEP263_RE = re.compile(rb"^[ \t\v]*#.*?coding[=:][ \t]*([-_.a-zA-Z0-9]+)")
 def iter_python_files(roots: tuple[Path, ...] = WATCHED_DIRS) -> list[Path]:
     """Return sorted list of `.py` files under the watched roots.
 
-    Skips `__pycache__` directories. Sort yields stable ordering so the
-    CI failure list is reproducible across machines.
+    Skips `__pycache__` and `runs/` directories. Sort yields stable
+    ordering so the CI failure list is reproducible across machines.
+    The `runs/` skip is load-bearing once gallery is in WATCHED_DIRS
+    (pass-1 CR MINOR-1): each gallery dir owns a `runs/<run_id>/`
+    subtree of variant + judge artifacts. No `.py` lands there today,
+    but a future variant generator that ever dumps a `.py` (e.g.
+    regenerated fixture, debug script) would silently get a BSL
+    header on user-generated content otherwise, and `--check` would
+    then turn red on a regenerated scratch run.
     """
     files: list[Path] = []
     for root in roots:
         if not root.is_dir():
             continue
         for path in root.rglob("*.py"):
-            if "__pycache__" in path.parts:
+            if "__pycache__" in path.parts or "runs" in path.parts:
                 continue
             files.append(path)
     return sorted(files)
