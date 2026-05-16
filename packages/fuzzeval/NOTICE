@@ -1,8 +1,14 @@
 fuzzeval
 Copyright 2026 Kiran Nayudu
 
-This product is licensed under the Apache License, Version 2.0. See LICENSE
-for the full text.
+Effective with version 0.2.0 (released alongside topofuzz 0.6.0), this
+product is licensed under the Business Source License 1.1 (BUSL-1.1),
+with Change License = Apache License 2.0 four years after each version
+is published. See LICENSE for the full text.
+
+Version 0.1.0 (released alongside topofuzz 0.5.x) was released under
+the Apache License, Version 2.0, and that published artifact remains
+under its original license. The license change is not retroactive.
 
 Acknowledgments
 ---------------

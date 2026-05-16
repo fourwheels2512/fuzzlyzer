@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases prior to `0.1.0` were development drops on the `0.1.0.dev0`
 placeholder version and are not separately enumerated.
 
+## [Unreleased]
+
+### Changed
+
+- **License change from Apache 2.0 to Business Source License 1.1
+  (BUSL-1.1), effective v0.2.0 (ships alongside topofuzz v0.6.0).**
+  Same terms as topofuzz: non-production / academic / small-scale
+  commercial use (under USD $100,000 annual gross revenue) remain
+  permitted without charge; production-scale use requires a commercial
+  license — contact `licensing-TBD@modelbrew.ai`. Each release
+  auto-converts to Apache 2.0 four years after publication. Full
+  terms in `LICENSE`. Version 0.1.0 was released under the Apache
+  License, Version 2.0, and remains under that license as published —
+  the license change is not retroactive.
+
 ## [0.1.0] — 2026-05-13
 
 First public release. Ships alongside `topofuzz` v0.5.0rc1 as the

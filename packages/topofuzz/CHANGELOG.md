@@ -10,6 +10,23 @@ placeholder version and are not separately enumerated.
 
 ## [Unreleased]
 
+### Changed
+
+- **License change from Apache 2.0 to Business Source License 1.1
+  (BUSL-1.1), effective v0.6.0.** Non-production use, internal
+  development, academic research, and small-scale commercial use
+  (annual gross revenue under USD $100,000 from any use of the
+  Licensed Work) remain permitted without charge. Production use
+  beyond that threshold, or offering Topofuzz as a managed service,
+  requires a commercial license — contact
+  `licensing-TBD@modelbrew.ai`. Each release auto-converts to Apache
+  2.0 four years after publication. Full terms in `LICENSE` (root and
+  per-package).
+  Historical 0.5.x versions (including `0.5.0rc1`) were released under
+  the Apache License, Version 2.0, and those published artifacts
+  remain under their original license — the license change is not
+  retroactive.
+
 ### Added
 
 - **F3 — `--jury-of-3` wired with per-vendor vote breakdown.**

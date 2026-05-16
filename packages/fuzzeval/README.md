@@ -30,7 +30,7 @@ than your declared vendor API. See [SECURITY.md](../../SECURITY.md)
 for the full posture and [PRIVACY.md](../../PRIVACY.md) for the
 no-telemetry statement.
 
-[![License: BSL-1.1](https://img.shields.io/badge/license-BSL--1.1-blue.svg)](LICENSE)
+[![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE)
 [![Python: 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](#install)
 
 ## Status
@@ -44,16 +44,16 @@ Pinned upper bound: any consumer should depend on `fuzzeval>=0.1,<0.2`.
 
 ```bash
 # Base install — verify-path safe (cryptography, rfc8785, pydantic).
-pip install "fuzzeval==0.1.0"
+pip install "fuzzeval==0.2.0"
 
 # With statistics extras (numpy + scipy for cluster bootstrap).
-pip install "fuzzeval[stats]==0.1.0"
+pip install "fuzzeval[stats]==0.2.0"
 
 # With on-disk cache support (diskcache for LLMCache + JudgeCache).
-pip install "fuzzeval[cache]==0.1.0"
+pip install "fuzzeval[cache]==0.2.0"
 
 # All extras.
-pip install "fuzzeval[stats,cache]==0.1.0"
+pip install "fuzzeval[stats,cache]==0.2.0"
 ```
 
 ## Public API

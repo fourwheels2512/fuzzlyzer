@@ -2,10 +2,10 @@
 name = "topofuzz"
 # Soft launch as 0.5.0rc1; promote to 0.5.0 after smoke-test feedback per
 # project_step12b_handoff.md's lockdown decisions (2026-05-13).
-version = "0.5.0rc1"
+version = "0.6.0"
 description = "Topology Safety Fuzzer for multi-agent LLM systems"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = { text = "BUSL-1.1" }
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.11"
 authors = [{ name = "Kiran Nayudu" }]
@@ -13,7 +13,7 @@ keywords = ["langgraph", "llm", "evaluation", "multi-agent", "topology", "fuzzin
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
+    "License :: Other/Proprietary License",
     "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
@@ -28,7 +28,7 @@ classifiers = [
 ]
 dependencies = [
     # Pinned to 0.1.x — same major series. v0.2 may break the §17a contract.
-    "fuzzeval>=0.1,<0.2",
+    "fuzzeval>=0.2,<0.3",
     "typer>=0.12",
     "rich>=13",
     "cryptography>=42",

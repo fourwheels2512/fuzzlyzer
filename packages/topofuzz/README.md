@@ -27,7 +27,7 @@ other than your declared vendor API calls. See
 [SECURITY.md](../../SECURITY.md) for the full posture and
 [PRIVACY.md](../../PRIVACY.md) for the no-telemetry statement.
 
-[![License: BSL-1.1](https://img.shields.io/badge/license-BSL--1.1-blue.svg)](LICENSE)
+[![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE)
 [![Python: 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](#install)
 
 ## Status
@@ -97,10 +97,10 @@ this package.
 
 ```bash
 # Full install: LangGraph adapter + LLM SDKs + plotting + signing (~400 MB).
-pip install "topofuzz[full]==0.5.0rc1"
+pip install "topofuzz[full]==0.6.0"
 
 # Verify-only install: cryptography + rfc8785 only — no LLM stack (~15 MB).
-pip install "topofuzz==0.5.0rc1"
+pip install "topofuzz==0.6.0"
 ```
 
 Python 3.11+ on macOS, Linux, and Windows. Use a virtualenv.
