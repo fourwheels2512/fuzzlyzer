@@ -49,6 +49,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# ``Topology`` is light (no langgraph dependency); hoist to module top
+# so the L910 re-construction path inside ``_reconstruct_variants`` does
+# not pay the per-call local-import cost on every confirm pass.
+from topofuzz.ir import Topology
+
 _log = logging.getLogger(__name__)
 
 # Default repeat count for the confirm pass. K=3 gives a strict majority
@@ -305,6 +310,153 @@ def _reconstruct_variants(
             f"failed to load fixture {fixture!r} for the confirm pass: "
             f"{type(e).__name__}: {e}"
         ) from e
+
+    # Step 20a/F6 follow-up (L910): re-apply manifest-persisted v0.6
+    # fields (verdict_node + verdict_label_true/false) BEFORE variant
+    # generation. The orchestrator persists these whenever they differ
+    # from the IR defaults (orchestrator.py:310-330, gated independently
+    # for verdict_node and pair-level for the labels).
+    #
+    # ``load_topology`` only forwards these via fixture-file dunders
+    # (``__topofuzz_verdict_node__``, ``__topofuzz_verdict_label_*__``).
+    # A Python-API consumer who passed these via ``from_langgraph(...)``
+    # has them in the manifest but NOT in the fixture file, so the
+    # regenerated topology comes back as v0.5-shape, the strip rules in
+    # canonical_hash fire asymmetrically, and every candidate hash
+    # diverges from the persisted run. Re-apply here so confirm-pass
+    # buyer-side "re-run my bundle" works on non-lending domains (the
+    # exact buyer-visible artifact the F6 CEO card targets).
+    #
+    # **Precedence policy: manifest wins.** This is the buyer-attestation
+    # contract — the signed manifest is the source of truth a
+    # ``topofuzz verify`` consumer is re-running. A tampered fixture
+    # file cannot rebind verdict identity away from what the producer
+    # signed. If a fixture-file dunder disagrees with the manifest, we
+    # log a WARNING so a forensic operator has evidence of the override.
+    #
+    # **Partial-pair defense.** The orchestrator emits the label pair as
+    # a unit (both or neither). A hand-edited/tampered manifest with
+    # only ONE label key is NOT producer-emitted state — accept it
+    # would silently fall back to the topology default for the absent
+    # side, rendering e.g. "ESCALATE/DENY" instead of "ESCALATE/DEFER"
+    # on the CEO PDF. Reject partial pairs at the confirm boundary.
+    m_label_true = manifest.get("verdict_label_true")
+    m_label_false = manifest.get("verdict_label_false")
+    if (m_label_true is None) != (m_label_false is None):
+        raise ConfirmError(
+            f"manifest verdict_label_* pair half-written — both keys must "
+            f"be present or both absent (the producer-side pair-level "
+            f"gate emits them as a unit). Got verdict_label_true="
+            f"{m_label_true!r}, verdict_label_false={m_label_false!r}. "
+            f"run_id={manifest.get('run_id')!r}"
+        )
+    m_verdict_node = manifest.get("verdict_node")
+    needs_v06_rebind = (
+        m_label_true is not None
+        or m_label_false is not None
+        or m_verdict_node is not None
+    )
+    if needs_v06_rebind:
+        # Log when manifest values OVERRIDE fixture-file dunders that
+        # set a different value — a forensic operator needs an audit
+        # trail when the attestation contract supersedes the source file.
+        if (
+            m_verdict_node is not None
+            and topology.verdict_node is not None
+            and m_verdict_node != topology.verdict_node
+        ):
+            _log.warning(
+                "confirm: manifest.verdict_node=%r overrides fixture-file "
+                "__topofuzz_verdict_node__=%r (manifest wins — attestation "
+                "contract). run_id=%r",
+                m_verdict_node,
+                topology.verdict_node,
+                manifest.get("run_id"),
+            )
+        # Label override warning: ONLY fire when the loaded topology
+        # ALREADY carries a non-default label value (i.e. the fixture
+        # file explicitly set ``__topofuzz_verdict_label_*__``) AND
+        # that value disagrees with the manifest. The IR defaults to
+        # APPROVE/DENY for un-set labels, so a Python-API consumer
+        # whose fixture has no dunders comes back as APPROVE/DENY
+        # post-load — comparing those defaults to a manifest's
+        # ESCALATE/DEFER would always trigger a "manifest overrides"
+        # warning on the legitimate L910 path. Train-the-operator-to-
+        # ignore-this-log is the failure mode pass-2 caught (CR M1 /
+        # RT N1): the audit-trail value of the override-log only
+        # exists when the warning fires SELDOM and means something.
+        #
+        # Cheap correct gate: the fixture-file dunder produced a
+        # non-default value iff the loaded topology is non-default.
+        fixture_has_custom_labels = (
+            topology.verdict_label_true != "APPROVE"
+            or topology.verdict_label_false != "DENY"
+        )
+        if (
+            fixture_has_custom_labels
+            and m_label_true is not None
+            and m_label_true != topology.verdict_label_true
+        ):
+            _log.warning(
+                "confirm: manifest.verdict_label_true=%r overrides "
+                "fixture-file value %r (manifest wins). run_id=%r",
+                m_label_true, topology.verdict_label_true,
+                manifest.get("run_id"),
+            )
+        if (
+            fixture_has_custom_labels
+            and m_label_false is not None
+            and m_label_false != topology.verdict_label_false
+        ):
+            _log.warning(
+                "confirm: manifest.verdict_label_false=%r overrides "
+                "fixture-file value %r (manifest wins). run_id=%r",
+                m_label_false, topology.verdict_label_false,
+                manifest.get("run_id"),
+            )
+        # Re-construct through ``Topology(...)`` rather than
+        # ``model_copy(update=...)``: ``model_copy`` does NOT re-run
+        # the field-validators or model-validators in pydantic v2, which
+        # would let a tampered NFKC-collision / RTL-override / 13-char
+        # label slip past the IR's hardening. Going through the
+        # constructor fires every validator (label normalize + pair
+        # collision check + structural integrity + tds_version derive).
+        try:
+            topology = Topology(
+                name=topology.name,
+                nodes=topology.nodes,
+                edges=topology.edges,
+                entrypoint=topology.entrypoint,
+                terminal=topology.terminal,
+                verdict_node=(
+                    m_verdict_node
+                    if m_verdict_node is not None
+                    else topology.verdict_node
+                ),
+                verdict_label_true=(
+                    m_label_true
+                    if m_label_true is not None
+                    else topology.verdict_label_true
+                ),
+                verdict_label_false=(
+                    m_label_false
+                    if m_label_false is not None
+                    else topology.verdict_label_false
+                ),
+            )
+        except (ValueError, TypeError) as e:
+            # Pydantic raises ValidationError (a ValueError subclass) on
+            # bad labels / unknown verdict_node; TypeError covers the
+            # str-subclass guard. Wrap so the operator sees "the
+            # manifest's persisted fields were rejected" with the
+            # run_id pinned, rather than a bare pydantic stacktrace.
+            raise ConfirmError(
+                f"manifest v0.6 fields rejected by IR validation "
+                f"(verdict_node={m_verdict_node!r}, "
+                f"verdict_label_true={m_label_true!r}, "
+                f"verdict_label_false={m_label_false!r}, "
+                f"run_id={manifest.get('run_id')!r}): {e}"
+            ) from e
 
     ord_list = list(order_swap(topology, rng_seed=rng_seed))
     role_list = list(role_swap(topology))

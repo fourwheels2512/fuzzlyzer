@@ -519,6 +519,169 @@ class TestVerdictLabels:
             t.verdict_label_true = "ESCALATE"  # type: ignore[misc]
 
 
+class TestTdsVersionDerivation:
+    """Step 20a/F6 follow-up (L849): ``tds_version`` is auto-derived in
+    the after-validator — "0.5.0" iff v0.5-shape (no verdict_node,
+    default labels), "0.6.0" otherwise. An OLD v0.5 consumer (its own
+    ``Literal["0.5.0"]``) rejects a v0.6 manifest at the validation
+    boundary rather than silently parsing it and rebucketing the cache.
+    """
+
+    def _two_node_topo(self, **extra) -> Topology:
+        return Topology(
+            name="t",
+            nodes=[Node(id="a", role="r"), Node(id="b", role="r")],
+            edges=[Edge(from_id="a", to_id="b")],
+            entrypoint="a",
+            terminal=["b"],
+            **extra,
+        )
+
+    def test_v05_shape_derives_050(self):
+        t = self._two_node_topo()
+        assert t.tds_version == "0.5.0"
+
+    def test_verdict_node_set_derives_060(self):
+        t = self._two_node_topo(verdict_node="b")
+        assert t.tds_version == "0.6.0"
+
+    def test_custom_label_true_derives_060(self):
+        t = self._two_node_topo(verdict_label_true="escalate")
+        assert t.tds_version == "0.6.0"
+
+    def test_custom_label_false_derives_060(self):
+        t = self._two_node_topo(verdict_label_false="defer")
+        assert t.tds_version == "0.6.0"
+
+    def test_both_v06_features_derive_060(self):
+        t = self._two_node_topo(
+            verdict_node="b",
+            verdict_label_true="escalate",
+            verdict_label_false="defer",
+        )
+        assert t.tds_version == "0.6.0"
+
+    def test_explicit_050_on_v06_shape_rejected(self):
+        # A v0.6-shape topology tagged with the v0.5 wire version would
+        # silently parse on an old consumer and rebucket the cache — the
+        # exact failure mode the bump exists to prevent. Refuse the
+        # mismatch at IR construction.
+        with pytest.raises(ValidationError, match="disagrees"):
+            self._two_node_topo(verdict_node="b", tds_version="0.5.0")
+
+    def test_explicit_060_on_v05_shape_rejected(self):
+        # The inverse: a pure v0.5-shape topology tagged "0.6.0" would
+        # confuse old consumers (Literal mismatch) without any benefit.
+        with pytest.raises(ValidationError, match="disagrees"):
+            self._two_node_topo(tds_version="0.6.0")
+
+    def test_explicit_matching_tag_accepted(self):
+        # When the explicit tag matches the derivation, accept (callers
+        # who set tds_version explicitly are free to do so — what we
+        # refuse is a mismatch).
+        t = self._two_node_topo(tds_version="0.5.0")
+        assert t.tds_version == "0.5.0"
+        v06 = self._two_node_topo(
+            verdict_node="b", tds_version="0.6.0"
+        )
+        assert v06.tds_version == "0.6.0"
+
+    def test_unknown_tds_version_value_rejected_by_literal(self):
+        # Literal["0.5.0","0.6.0"] is the wire allowlist — neither older
+        # ("0.4.x") nor newer ("0.7.0") values get silently accepted.
+        with pytest.raises(ValidationError):
+            self._two_node_topo(tds_version="0.7.0")
+        with pytest.raises(ValidationError):
+            self._two_node_topo(tds_version="0.4.0")
+
+    def test_v06_manifest_round_trip_via_json(self):
+        # A v0.6-shape topology round-trips through model_dump_json /
+        # model_validate_json with tds_version="0.6.0" preserved.
+        a = self._two_node_topo(verdict_node="b")
+        b = Topology.model_validate_json(a.model_dump_json())
+        assert b.tds_version == "0.6.0"
+        assert a.canonical_hash() == b.canonical_hash()
+
+    def test_v06_tag_distinct_from_v05_in_hash(self):
+        # The whole point of the bump: a v0.5-shape topology and a
+        # v0.6-shape topology with otherwise identical fields produce
+        # DIFFERENT canonical hashes (verdict_node alone already breaks
+        # them, but pinning the version-tag participation here documents
+        # that the bump is part of the identity).
+        v05 = self._two_node_topo()
+        v06 = self._two_node_topo(verdict_node="b")
+        assert v05.tds_version != v06.tds_version
+        assert v05.canonical_hash() != v06.canonical_hash()
+
+    def test_explicit_mismatch_via_model_validate_rejected(self):
+        # Dual-audit fold (CR pass-1 M2 / RT pass-1 M2): the
+        # explicit-mismatch branch must fire uniformly across every
+        # Pydantic construction path. ``Topology.model_validate(dict)`` is
+        # the path a JSON-deserialised tampered manifest takes.
+        payload = {
+            "tds_version": "0.5.0",  # downgrade attempt
+            "name": "t",
+            "nodes": [{"id": "a", "role": "r"}, {"id": "b", "role": "r"}],
+            "edges": [{"from_id": "a", "to_id": "b"}],
+            "entrypoint": "a",
+            "terminal": ["b"],
+            "verdict_node": "b",  # v0.6-shape
+        }
+        with pytest.raises(ValidationError, match="disagrees"):
+            Topology.model_validate(payload)
+
+    def test_explicit_mismatch_via_model_validate_json_rejected(self):
+        # Dual-audit fold (CR pass-1 M2 / RT pass-1 M2): same downgrade
+        # attack as above, but through the JSON-deserialise path. This
+        # is the exact buyer-side surface — a CRO running
+        # ``topofuzz verify`` on a peer-shared bundle whose JSON has been
+        # tampered to claim tds_version="0.5.0" while carrying
+        # verdict_node must hard-fail at validation.
+        import json as _json
+        payload = _json.dumps({
+            "tds_version": "0.5.0",  # downgrade attempt
+            "name": "t",
+            "nodes": [{"id": "a", "role": "r"}, {"id": "b", "role": "r"}],
+            "edges": [{"from_id": "a", "to_id": "b"}],
+            "entrypoint": "a",
+            "terminal": ["b"],
+            "verdict_node": "b",
+        })
+        with pytest.raises(ValidationError, match="disagrees"):
+            Topology.model_validate_json(payload)
+
+    def test_model_copy_does_not_re_derive_documented(self):
+        # Dual-audit fold (RT pass-1 M2): documents the known Pydantic v2
+        # limitation — ``model_copy(update=...)`` does NOT re-run the
+        # @model_validator chain. A caller who mutates a v0.5-shape
+        # topology to v0.6-shape via model_copy ends up with a
+        # tds_version="0.5.0" tag that disagrees with the new shape.
+        #
+        # The fix is operator-side discipline: shape-changing mutation
+        # MUST go through ``Topology(...)`` or ``model_validate``. The
+        # IR docstring (_derive_tds_version) names this explicitly. Pin
+        # the limitation here so a future "let's just fix it in
+        # model_copy" refactor surfaces a regression test rather than
+        # silently changing the semantics.
+        v05 = self._two_node_topo()
+        assert v05.tds_version == "0.5.0"
+        # Bypass the validator chain via model_copy(update=...).
+        mutated = v05.model_copy(update={"verdict_node": "b"})
+        # The shape IS v0.6, but the tag is still "0.5.0" — exactly the
+        # documented limitation a Pydantic-v2 caller must know about.
+        assert mutated.verdict_node == "b"
+        assert mutated.tds_version == "0.5.0"
+        # Round-tripping through model_validate_json catches the
+        # local inconsistency: the JSON payload carries "tds_version"
+        # in the wire keys (it's never excluded by default), so the
+        # round-trip path counts as an "explicit" tag — the
+        # explicit-mismatch branch fires and raises ValidationError.
+        # That is the safety net for the model_copy gap — silent
+        # mis-tag becomes a hard fail on the next validator round-trip.
+        with pytest.raises(ValidationError, match="disagrees"):
+            Topology.model_validate_json(mutated.model_dump_json())
+
+
 class TestCanonicalHash:
     def test_is_deterministic_64char_hex(self):
         a = _sample_topology()

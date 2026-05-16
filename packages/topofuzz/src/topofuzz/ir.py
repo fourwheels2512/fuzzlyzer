@@ -112,7 +112,26 @@ class Edge(BaseModel):
 class Topology(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    tds_version: Literal["0.5.0"] = "0.5.0"
+    # Step 20a/F6 follow-up (v0.6): widen the Literal to accept both the
+    # v0.5 and v0.6 wire tags, and let the after-validator AUTO-DERIVE
+    # the actual value from the field set ("0.5.0" iff the topology uses
+    # zero v0.6 features; "0.6.0" iff any of verdict_node /
+    # non-default verdict_label_* is set). The default stays "0.5.0" so
+    # the v0.5 byte-identical canonical_hash invariant holds bit-for-bit
+    # — only a topology that opts into a v0.6 field gets tagged "0.6.0".
+    #
+    # Why bump at all: pre-bump, a v0.6 producer emits a manifest with
+    # verdict_node / verdict_label_* keys but tds_version still pinned
+    # at "0.5.0". An OLD v0.5 consumer (its own ``Literal["0.5.0"]``)
+    # silently parses the manifest, ignores the unknown keys, and
+    # recomputes a v0.5-shape canonical_hash — silently rebucketing
+    # caches and signature checks at the manifest layer. Post-bump,
+    # the OLD consumer's Literal rejects "0.6.0" with a clear
+    # ValidationError instead of silently misbucketing. CRO/CAIO running
+    # ``topofuzz verify`` on a peer-shared v0.6 bundle sees the right
+    # shape (a hard fail with a version-mismatch error) rather than
+    # a wrong shape (silent acceptance + cache-misbucket).
+    tds_version: Literal["0.5.0", "0.6.0"] = "0.5.0"
     name: str
     nodes: tuple[Node, ...]
     edges: tuple[Edge, ...]
@@ -275,6 +294,70 @@ class Topology(BaseModel):
                 )
         return self
 
+    @model_validator(mode="after")
+    def _derive_tds_version(self) -> "Topology":
+        # Auto-derive tds_version from the field set so a caller cannot
+        # mismatch a v0.6-shape topology with a v0.5 tag (or vice versa).
+        # The field stays in the wire format (still emitted by
+        # ``model_dump``); only its value is derived rather than declared.
+        # Bypass ``frozen=True`` via ``object.__setattr__`` — the new
+        # value is already a legal Literal so we are not skipping any
+        # field-level validation.
+        #
+        # Declared AFTER ``_check_structural_integrity`` so structural
+        # invariants (verdict_node must exist in node ids, etc.) run
+        # first. A topology with ``verdict_node="ghost"`` raises a
+        # structural error here rather than getting a misleading
+        # "0.6.0" derivation tag on an invalid IR (RT pass-1 Nit2).
+        is_v06_shape = (
+            self.verdict_node is not None
+            or self.verdict_label_true != "APPROVE"
+            or self.verdict_label_false != "DENY"
+        )
+        derived = "0.6.0" if is_v06_shape else "0.5.0"
+        # If the caller passed an explicit ``tds_version`` that disagrees
+        # with the derived value, refuse to silently rewrite their tag —
+        # a v0.6-shape topology tagged "0.5.0" would silently parse on
+        # an old consumer and rebucket the cache (the exact failure mode
+        # the bump exists to prevent). A v0.5-shape topology tagged
+        # "0.6.0" would also confuse old consumers for no benefit.
+        if self.tds_version != derived:
+            # Distinguish "caller asserted a wrong tag" from "default
+            # silently fired" — when the default fired, we just promote;
+            # when the caller asserted, we error. ``model_fields_set``
+            # is populated by every Pydantic construction path that
+            # accepts user input (``__init__``, ``model_validate``,
+            # ``model_validate_json``), so the explicit-mismatch branch
+            # fires uniformly across direct calls, dict-validate, AND
+            # JSON-validate paths (RT pass-1 M2 / CR pass-1 M2).
+            #
+            # Known limitation (RT pass-1 M2): ``model_copy(update=...)``
+            # does NOT re-run validators in Pydantic v2, so a caller who
+            # mutates v0.5→v0.6 shape via ``model_copy`` ends up with a
+            # mismatched ``tds_version`` until the next round-trip
+            # through a real validator (e.g. JSON re-validate). Use
+            # ``Topology(...)`` constructor (or ``model_validate``) for
+            # any shape-changing mutation that needs validator coverage.
+            if "tds_version" in self.model_fields_set:
+                raise ValueError(
+                    f"tds_version={self.tds_version!r} disagrees with the "
+                    f"topology shape (derived={derived!r}). v0.5-shape "
+                    "topologies (no verdict_node, default APPROVE/DENY "
+                    "labels) must tag tds_version='0.5.0'; topologies that "
+                    "set verdict_node or non-default verdict_label_* must "
+                    "tag tds_version='0.6.0'. Drop the explicit "
+                    "tds_version kwarg to let the IR derive it."
+                )
+            object.__setattr__(self, "tds_version", derived)
+            # Mark the promoted field as set so ``model_dump(exclude_unset
+            # =True)`` emits it on the wire (RT pass-1 M3). Without this,
+            # a v0.6-shape topology that round-trips through
+            # ``exclude_unset=True`` silently drops ``tds_version`` and
+            # a downstream consumer falls back to the "0.5.0" default —
+            # the exact silent-downgrade the bump exists to prevent.
+            self.__pydantic_fields_set__.add("tds_version")
+        return self
+
     def canonical_hash(self) -> str:
         """SHA-256 of the RFC 8785 (JCS) canonicalization of this topology.
 
@@ -302,6 +385,20 @@ class Topology(BaseModel):
         identity; judging the same node but labelling its outputs
         differently IS a different measurement contract). Pinned by
         ``test_ir.test_v05_hash_unchanged_after_label_fields_added``.
+
+        Step 20a/F6 follow-up (v0.6, L849): ``tds_version`` is
+        auto-derived in the after-validator — "0.5.0" iff the topology
+        is v0.5-shape (no verdict_node, default labels), "0.6.0"
+        otherwise. The wire-format value still participates in the
+        canonical hash, but because the derivation is deterministic
+        from the same field set the strip rules already key on, a
+        v0.5-shape topology emits ``tds_version="0.5.0"`` (preserving
+        the v0.5 byte-identical hash invariant) and a v0.6-shape
+        topology emits ``tds_version="0.6.0"`` (correctly distinguishing
+        the bucket from a v0.5 cache). Pinned by
+        ``test_ir.test_v05_hash_unchanged_after_field_added`` (v0.5
+        sentinel hash unchanged) and the new tds_version derivation
+        regression tests in ``test_ir.TestTdsVersionDerivation``.
 
         NOTE: ``self.model_dump_json()`` does NOT apply either strip — it
         emits ``"verdict_node":null`` literally and emits the labels even
