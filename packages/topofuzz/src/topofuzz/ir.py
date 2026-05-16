@@ -14,8 +14,7 @@ tuples at validation time, so callers can still pass lists for ergonomics.
 Structural integrity is enforced at construction (entrypoint and terminal
 ids must exist in `nodes`, edges must reference existing nodes, node ids
 must be unique). Semantic invariants (e.g. "temperature>0 requires seed
-to be set") are out of scope per BLUEPRINT §5; revisit if Pramana needs
-them.
+to be set") are out of scope per BLUEPRINT §5; revisit if needed.
 """
 
 from __future__ import annotations

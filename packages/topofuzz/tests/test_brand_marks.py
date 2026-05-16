@@ -10,7 +10,7 @@ strings" (2026-05-16) — regression-protects the `™` mark on the
 FIRST mention per page, per spec lines 1577-1578.
 
 Surfaces:
-- README.md H1 (per-package; root README is pramana-eval, skipped)
+- README.md H1 (per-package; no root README in this repo)
 - Typer app `help=` text (CLI app description)
 - report.html.j2 H1 (visible page header)
 - inspect.html.j2 `<title>` (first brand mention; H1 is non-brand)
@@ -79,20 +79,6 @@ def test_fuzzeval_readme_h1_has_trademark() -> None:
     first_line = readme.split("\n", 1)[0]
     assert first_line == f"# fuzzeval{TM}", (
         f"fuzzeval README H1 missing ™ mark — got {first_line!r}"
-    )
-
-
-def test_root_readme_is_pramana_eval_not_topofuzz() -> None:
-    """Root README is the pramana-eval surface, NOT topofuzz —
-    intentionally skipped from the trademark sweep. Locking this in
-    so a future contributor doesn't 'helpfully' add a topofuzz ™ to
-    the root README.md."""
-    root_readme = _read_utf8(_repo_root() / "README.md")
-    first_line = root_readme.split("\n", 1)[0]
-    assert first_line == "# pramana-eval", (
-        f"root README is no longer pramana-eval (now {first_line!r}) — "
-        "if topofuzz/fuzzeval moved to the root, add a ™-on-H1 test for "
-        "the new root H1 and update this assertion."
     )
 
 

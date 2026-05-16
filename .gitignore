@@ -49,9 +49,6 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Run artifacts (results are user-specific; do not commit by default)
-pramana_test_results.json
-
 # Internal launch / marketing artifacts (not for public repo)
 .launch/
 

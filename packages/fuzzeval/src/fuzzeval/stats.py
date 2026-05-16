@@ -8,7 +8,7 @@ two-level paired cluster bootstrap used by topofuzz's
 variance-across-orderings CI (BLUEPRINT §9 metric #1).
 
 Public API frozen per BLUEPRINT_v5plus.md §17a so dependent packages
-(pramana-eval and others) can import against the contract on Day 1.
+can import against the contract on Day 1.
 """
 
 from __future__ import annotations
@@ -187,7 +187,7 @@ def percentile_cluster_bootstrap(
         stat = lambda m: float(np.mean(np.var(m, axis=0)))
         result = percentile_cluster_bootstrap(scores, stat, seed=0)
 
-    but pramana-eval and other consumers can pass their own closures.
+    but external consumers can pass their own closures.
 
     Signature locked per BLUEPRINT_v5plus.md §17a; ``seed`` is an additive
     keyword-only extension matching the ``percentile_bootstrap`` precedent

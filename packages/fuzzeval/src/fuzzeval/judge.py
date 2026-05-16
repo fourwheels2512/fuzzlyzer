@@ -6,11 +6,10 @@
 """Judge protocol, result types, and the v0.5 single-judge implementation.
 
 Type contract (``ContinuousScore`` / ``BinaryScore`` / ``Judge``) lives in
-this module because it is the BLUEPRINT_v5plus.md §17a frozen public API:
-both topofuzz and (future) pramana import from here. Cache code in
-:mod:`fuzzeval.cache` references ``JudgeResult`` for round-trip type
-guards; runner code in :mod:`topofuzz.runner` injects ``Judge``-shaped
-objects.
+this module because it is the BLUEPRINT_v5plus.md §17a frozen public API
+that topofuzz imports from. Cache code in :mod:`fuzzeval.cache`
+references ``JudgeResult`` for round-trip type guards; runner code in
+:mod:`topofuzz.runner` injects ``Judge``-shaped objects.
 
 The :class:`SingleJudge` implementation (Weekend 2 step 7) renders a
 plain-text rubric template, calls one LLM via :mod:`litellm`, parses
@@ -130,10 +129,10 @@ JudgeResult = ContinuousScore | BinaryScore
 class Judge(Protocol):
     """Judge protocol. Implementations: :class:`SingleJudge`, :class:`JuryJudge`.
 
-    ``payload`` is a rubric-specific dict. Topofuzz will pass:
+    ``payload`` is a rubric-specific dict. Topofuzz passes:
         {"variant_id", "eval_row", "agent_output"}
-    Pramana (future) will pass:
-        {"problem", "ground_truth", "candidate_answer", "nirnaya_section"}
+    External consumers pass their own keys; the judge only sees the
+    rubric-prompted shape.
     """
 
     def score(self, payload: dict) -> JudgeResult: ...

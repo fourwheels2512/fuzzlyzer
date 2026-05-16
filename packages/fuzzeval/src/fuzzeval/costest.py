@@ -21,8 +21,8 @@ Per BLUEPRINT_v5plus.md §17a:
 ``estimate`` also accepts ``agent_model`` and ``judge_model`` as keyword
 arguments. These are an additive extension to the §17a-locked signature,
 matching the ``seed=`` precedent in :func:`fuzzeval.stats.percentile_cluster_bootstrap`:
-positional callers per §17a still work; downstream callers (CLI, Pramana)
-that need per-model rates pass them by name.
+positional callers per §17a still work; downstream callers (CLI, external
+consumers) that need per-model rates pass them by name.
 """
 
 from __future__ import annotations
