@@ -31,6 +31,7 @@ import asyncio
 import atexit
 import logging
 import signal
+import sys
 from contextlib import ExitStack
 from importlib import resources
 from pathlib import Path
@@ -49,6 +50,11 @@ from fuzzeval.keys import (
 
 from topofuzz import __version__
 from topofuzz.attest import load_and_verify_attestation
+from topofuzz.license_check import (
+    LICENSE_REFUSED_EXIT_CODE,
+    HomeUnresolvableError,
+    prompt_and_record,
+)
 
 if TYPE_CHECKING:
     # Annotation-only — `from __future__ import annotations` keeps these
@@ -261,11 +267,42 @@ def _reject_unknown_extras(argv: list[str]) -> None:
     """
     if not argv:
         return
+    # Common mistake: ``--accept-license`` is a callback flag, so it
+    # must come BEFORE the subcommand (`topofuzz --accept-license run
+    # ...`), not after. Click otherwise reports a generic "unknown
+    # option" which is hard to debug. Surface a placement hint —
+    # together with any OTHER unknown flags, so the user sees the
+    # whole picture (pass-2 RT M1: hint must not eclipse co-present
+    # typos).
+    bare_tokens = [tok.split("=", 1)[0] for tok in argv]
+    if "--accept-license" in bare_tokens:
+        others = [tok for tok in bare_tokens if tok != "--accept-license"]
+        msg = (
+            "topofuzz: --accept-license must come BEFORE the subcommand "
+            "(e.g. `topofuzz --accept-license run ...`, not "
+            "`topofuzz run ... --accept-license`)."
+        )
+        if others:
+            msg += f" Also unknown option(s): {' '.join(others)}"
+        typer.echo(msg, err=True)
+        raise typer.Exit(code=_BAD_USAGE_EXIT)
     typer.echo(
         f"topofuzz: unknown option(s): {' '.join(argv)}",
         err=True,
     )
     raise typer.Exit(code=_BAD_USAGE_EXIT)
+
+
+# Subcommands that skip the first-run license click-through.
+#
+# ``verify`` is the buyer-side audit tool — re-verifying a topofuzz
+# attestation bundle is not "using" topofuzz commercially, so requiring
+# acceptance there would block third-party auditors. BACKLOG entry
+# "CLI click-through" boundary condition: "Skip the prompt_and_record
+# call ONLY for verify." Every other subcommand (scan / run / report /
+# repro / inspect / publish / confirm / ablate / keygen /
+# langgraph-import / ui) is gated.
+_LICENSE_EXEMPT_COMMANDS: frozenset[str] = frozenset({"verify"})
 
 
 @app.callback(invoke_without_command=True)
@@ -274,6 +311,16 @@ def _root(
     version: bool = typer.Option(
         False, "--version", "-V", help="Print version and exit."
     ),
+    accept_license: bool = typer.Option(
+        False,
+        "--accept-license",
+        help=(
+            "Accept the BSL 1.1 license terms non-interactively. "
+            "Equivalent to running once interactively, answering y at the "
+            "prompt, and re-running. Persists to "
+            "~/.topofuzz/license-accepted (chmod 600 on POSIX)."
+        ),
+    ),
 ) -> None:
     if version:
         typer.echo(f"topofuzz {__version__}")
@@ -281,6 +328,33 @@ def _root(
     if ctx.invoked_subcommand is None:
         typer.echo(ctx.get_help())
         raise typer.Exit()
+    # First-run license click-through. ``verify`` (and any other
+    # auditor-facing command) is exempt — see _LICENSE_EXEMPT_COMMANDS.
+    # Detection of non-interactive context uses sys.stdin.isatty(); CI
+    # / piped invocations MUST pass --accept-license or the command
+    # refuses with exit code 2 and an actionable message.
+    if ctx.invoked_subcommand in _LICENSE_EXEMPT_COMMANDS:
+        return
+    non_interactive = not sys.stdin.isatty()
+    try:
+        accepted = prompt_and_record(
+            force=accept_license,
+            non_interactive=non_interactive,
+        )
+    except HomeUnresolvableError as e:
+        typer.echo(
+            f"topofuzz: cannot resolve user home directory ({e}). "
+            "Set HOME (POSIX) or USERPROFILE (Windows) and re-run.",
+            err=True,
+        )
+        raise typer.Exit(code=LICENSE_REFUSED_EXIT_CODE) from e
+    if not accepted:
+        typer.echo(
+            "topofuzz: license acceptance required. Re-run interactively "
+            "and answer y at the prompt, or pass --accept-license.",
+            err=True,
+        )
+        raise typer.Exit(code=LICENSE_REFUSED_EXIT_CODE)
 
 
 def _not_yet(command: str, lands: str) -> None:

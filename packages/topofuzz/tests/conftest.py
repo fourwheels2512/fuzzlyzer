@@ -22,7 +22,12 @@ explicitly via ``monkeypatch.setattr``).
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
+
+from topofuzz import __version__
 
 
 @pytest.fixture(autouse=True)
@@ -40,3 +45,39 @@ def _isolate_dev_key(
         "fuzzeval.keys.default_dev_priv_path",
         lambda: fake_home / ".topofuzz" / "dev.pem",
     )
+
+
+@pytest.fixture(autouse=True)
+def _preaccept_license(
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    """Pre-accept the BSL license in a per-test fake home directory.
+
+    The CLI's first-run click-through (``topofuzz.license_check``)
+    refuses non-interactive invocations without ``--accept-license`` —
+    and ``CliRunner`` is always non-interactive. Without this fixture,
+    every existing CLI test would hit the gate and exit 2 with
+    "license acceptance required."
+
+    The fixture (a) redirects ``Path.home()`` to a per-test tmp dir so
+    no real user state is mutated, and (b) writes a valid acceptance
+    record there. ``test_license_check.py`` overrides ``Path.home`` with
+    its own per-test ``fake_home`` fixture (monkeypatch undo is LIFO),
+    so it controls whether the acceptance file is present.
+    """
+    fake_home = tmp_path_factory.mktemp("license-home")
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    accept_dir = fake_home / ".topofuzz"
+    accept_dir.mkdir(parents=True, exist_ok=True)
+    (accept_dir / "license-accepted").write_text(
+        json.dumps(
+            {
+                "version": __version__,
+                "accepted_at": "2026-05-16T00:00:00Z",
+                "license": "BUSL-1.1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return fake_home
