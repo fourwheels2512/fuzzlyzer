@@ -1589,3 +1589,245 @@ def test_dry_run_forces_no_cache_at_cli_layer(tmp_path, monkeypatch):
     assert not cache_dir.exists(), (
         "dry-run must not create the cache dir even when --cache is supplied"
     )
+
+
+# ---------------------------------------------------------------------------
+# F3 — --jury-models flag parsing + JuryJudge wire-up
+# ---------------------------------------------------------------------------
+
+
+def test_parse_jury_models_three_distinct_models():
+    """Happy path: three different LiteLLM model ids → vendor names
+    derived from the provider prefix; entries case-folded-sorted before
+    naming (F3 M3 fix) so vendor → model is repro-stable across
+    superficially-equivalent re-typings."""
+    from topofuzz.cli import _parse_jury_models
+
+    models, allow_dup = _parse_jury_models(
+        "google/gemini-2.5-flash,google/gemini-2.5-pro,deepseek/deepseek-chat"
+    )
+    # Sorted entries: ['deepseek/deepseek-chat', 'google/gemini-2.5-flash',
+    # 'google/gemini-2.5-pro'] → deepseek, google, google_2.
+    assert models == {
+        "deepseek": "deepseek/deepseek-chat",
+        "google": "google/gemini-2.5-flash",
+        "google_2": "google/gemini-2.5-pro",
+    }
+    assert allow_dup is False
+
+
+def test_parse_jury_models_order_invariant():
+    """F3 M3 audit fix: re-typing the trio in a different order produces
+    the same vendor → model map. The persisted votes_json key order is
+    therefore stable across superficially-equivalent re-runs."""
+    from topofuzz.cli import _parse_jury_models
+
+    a, _ = _parse_jury_models(
+        "google/gemini-2.5-flash,google/gemini-2.5-pro,deepseek/deepseek-chat"
+    )
+    b, _ = _parse_jury_models(
+        "deepseek/deepseek-chat,google/gemini-2.5-pro,google/gemini-2.5-flash"
+    )
+    c, _ = _parse_jury_models(
+        "google/gemini-2.5-pro,deepseek/deepseek-chat,google/gemini-2.5-flash"
+    )
+    assert a == b == c
+
+
+def test_parse_jury_models_rejects_collision_with_user_smuggled_suffix():
+    """F3 RT B1 audit fix: a user input ``"google_2/x,google/y,google/z"``
+    must not silently clobber. The auto-suffix walk now tracks produced
+    names and increments past collisions."""
+    from topofuzz.cli import _parse_jury_models
+
+    models, allow_dup = _parse_jury_models(
+        "google_2/foo,google/bar,google/baz"
+    )
+    # Three entries → three distinct vendor names. The user's literal
+    # `google_2` is preserved; the colliding auto-derived name walks to
+    # `google_3`. Order is the sorted-entries order.
+    assert len(models) == 3
+    assert set(models.values()) == {"google_2/foo", "google/bar", "google/baz"}
+    assert allow_dup is False
+
+
+def test_parse_jury_models_rejects_empty_model_name():
+    """F3 RT m2 audit fix: trailing slash (``google/``) is rejected at
+    parse time so the JuryJudge thread doesn't surface it as a cryptic
+    judge_failure."""
+    import typer
+
+    from topofuzz.cli import _parse_jury_models
+
+    with pytest.raises(typer.BadParameter, match="empty provider or model"):
+        _parse_jury_models("google/,google/x,deepseek/y")
+
+
+def test_parse_jury_models_single_vendor_three_identical():
+    """F3 single-vendor jury: three identical model ids → vendor names
+    auto-suffix to `google` / `google_2` / `google_3`;
+    allow_duplicate_models=True so JuryJudge accepts. Sort step is a
+    no-op on identical entries."""
+    from topofuzz.cli import _parse_jury_models
+
+    models, allow_dup = _parse_jury_models(
+        "google/gemini-2.5-flash,google/gemini-2.5-flash,google/gemini-2.5-flash"
+    )
+    assert models == {
+        "google": "google/gemini-2.5-flash",
+        "google_2": "google/gemini-2.5-flash",
+        "google_3": "google/gemini-2.5-flash",
+    }
+    assert allow_dup is True
+
+
+def test_parse_jury_models_rejects_wrong_count():
+    """Anything other than 3 entries is a usage error."""
+    import typer
+
+    from topofuzz.cli import _parse_jury_models
+
+    with pytest.raises(typer.BadParameter, match="exactly 3"):
+        _parse_jury_models("google/gemini-2.5-pro,deepseek/deepseek-chat")
+    with pytest.raises(typer.BadParameter, match="exactly 3"):
+        _parse_jury_models("a/b,a/c,a/d,a/e")
+
+
+def test_parse_jury_models_rejects_missing_provider_prefix():
+    """A bare model name (no '/') isn't a LiteLLM id — reject."""
+    import typer
+
+    from topofuzz.cli import _parse_jury_models
+
+    with pytest.raises(typer.BadParameter, match="LiteLLM model id"):
+        _parse_jury_models(
+            "google/gemini-2.5-pro,bare-name,deepseek/deepseek-chat"
+        )
+
+
+def test_parse_jury_models_rejects_empty_entry():
+    """A stray comma (', ,') is treated as an empty entry → reject."""
+    import typer
+
+    from topofuzz.cli import _parse_jury_models
+
+    with pytest.raises(typer.BadParameter, match="empty entry"):
+        _parse_jury_models("google/gemini-2.5-pro,,deepseek/deepseek-chat")
+
+
+def test_run_jury_models_without_jury_of_3_warns_and_runs_single_judge(tmp_path):
+    """--jury-models without --jury-of-3 must NOT crash; it should warn
+    to stderr and proceed with the single-judge default."""
+    eval_path = tmp_path / "e.jsonl"
+    eval_path.write_text('{"id": "e1", "input": "x"}\n', encoding="utf-8")
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            "nonexistent/path.py:graph",
+            "--eval", str(eval_path),
+            "--jury-models",
+            "google/gemini-2.5-pro,google/gemini-2.5-flash,deepseek/deepseek-chat",
+        ],
+    )
+    # Still exits 2 on the missing fixture, NOT on the orphan --jury-models.
+    assert result.exit_code == 2
+    combined = result.output or ""
+    assert "only valid with --jury-of-3" in combined.lower()
+
+
+def test_run_jury_models_bad_value_exits_bad_usage(tmp_path):
+    """Bad --jury-models surfaces as a Typer BadParameter, exit != 0."""
+    eval_path = tmp_path / "e.jsonl"
+    eval_path.write_text('{"id": "e1", "input": "x"}\n', encoding="utf-8")
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            "nonexistent/path.py:graph",
+            "--eval", str(eval_path),
+            "--jury-of-3",
+            "--jury-models",
+            "only-two-entries,nope",
+        ],
+    )
+    assert result.exit_code != 0
+    # Typer surfaces the BadParameter message via its standard usage
+    # error reporter; the substring "exactly 3" is from our message.
+    assert "exactly 3" in (result.output or "")
+
+
+def test_run_jury_models_recorded_in_manifest(tmp_path):
+    """The verbatim --jury-models string lands in manifest.cli_args
+    so a repro run can rebuild the exact vendor trio."""
+    pytest.importorskip("langgraph")
+    fixture = tmp_path / "fx.py"
+    fixture.write_text(
+        "from langgraph.graph import END, START, StateGraph\n"
+        "from typing import TypedDict\n"
+        "from topofuzz.ir import LLMConfig\n"
+        "\n"
+        "class _S(TypedDict, total=False):\n"
+        "    x: str\n"
+        "\n"
+        "def _a(s): return s\n"
+        "\n"
+        "def build_graph():\n"
+        "    g = StateGraph(_S)\n"
+        "    g.add_node('a', _a)\n"
+        "    g.add_node('b', _a)\n"
+        "    g.add_edge(START, 'a')\n"
+        "    g.add_edge('a', 'b')\n"
+        "    g.add_edge('b', END)\n"
+        "    return g.compile()\n"
+        "\n"
+        "LLM_CONFIGS = {\n"
+        "    'a': LLMConfig(model='google/gemini-2.5-flash'),\n"
+        "    'b': LLMConfig(model='google/gemini-2.5-flash'),\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    eval_path = tmp_path / "e.jsonl"
+    eval_path.write_text(
+        '{"id": "e1", "input": "x", "ground_truth_decision": "approve"}\n',
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "runs"
+    # Run under --dry-run so no real LLM calls happen, no env keys needed.
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            f"{fixture}:build_graph",
+            "--eval", str(eval_path),
+            "--n", "1",
+            "--variants", "1",
+            "--jury-of-3",
+            "--jury-models",
+            "google/gemini-2.5-flash,google/gemini-2.5-flash,google/gemini-2.5-flash",
+            "--out", str(out_dir),
+            "--dry-run",
+            "--yes",
+        ],
+    )
+    # Dry-run path may still exit on metrics gating (status / cost), but
+    # the manifest must be written either way — the test cares about the
+    # CLI args round-trip, not the run's final §A status.
+    run_dirs = [p for p in out_dir.iterdir() if p.is_dir()]
+    assert len(run_dirs) == 1, (
+        f"expected one run dir; exit={result.exit_code} output={result.output}"
+    )
+    import json
+    manifest = json.loads((run_dirs[0] / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["cli_args"]["jury_of_3"] is True
+    assert manifest["cli_args"]["jury_models"] == (
+        "google/gemini-2.5-flash,google/gemini-2.5-flash,google/gemini-2.5-flash"
+    )
+    # F3 RT M2: post-parse provenance lands as a dict alongside the
+    # verbatim string — a repro tool can rebuild the vendor → model
+    # map without re-parsing the raw string.
+    assert manifest["cli_args"]["jury_models_resolved"] == {
+        "google": "google/gemini-2.5-flash",
+        "google_2": "google/gemini-2.5-flash",
+        "google_3": "google/gemini-2.5-flash",
+    }

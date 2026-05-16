@@ -413,6 +413,26 @@ def run_confirm_pass(
     judge = _build_judge(
         SingleJudge, rubric_path, effective_judge_model
     )
+    # F3 Fuzzer m1 audit fix: a jury-of-3 source run gets downgraded to
+    # a SingleJudge here on purpose (the confirm pass is a per-judgment
+    # K-repeat to bound judge noise, not a per-vendor repeat — that's
+    # what flip_confirmations dropping votes_json formalises). Surface
+    # that decision so a user expecting K × 3 vendor calls doesn't get
+    # surprised by the (cheaper) single-judge confirm.
+    if cli_args.get("jury_of_3"):
+        try:
+            import typer
+            typer.echo(
+                f"topofuzz confirm: source run used --jury-of-3, but "
+                f"confirm K-repeats with a SingleJudge ({effective_judge_model!r}) "
+                "by design — the noise-floor estimator measures per-judgment "
+                "variance, not per-vendor.",
+                err=True,
+            )
+        except ImportError:
+            # confirm is callable as a library too; if typer isn't
+            # available swallow the hint rather than failing the run.
+            pass
 
     # Candidate variant_ids that couldn't be matched to a regenerated
     # topology (fixture / rng_seed drift). They get zero repeats — and

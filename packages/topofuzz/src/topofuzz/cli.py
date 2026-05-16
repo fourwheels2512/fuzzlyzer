@@ -286,6 +286,104 @@ def _not_yet(command: str, lands: str) -> None:
     raise typer.Exit(code=_NOT_IMPLEMENTED_EXIT)
 
 
+# F3 jury size. Mirrors :data:`fuzzeval.judge._JURY_SIZE` (kept in two
+# places to avoid the CLI module importing the heavy fuzzeval.judge
+# stack at top-level — that would break the verify-only install guard).
+_JURY_SIZE = 3
+
+
+def _parse_jury_models(
+    raw: str,
+) -> tuple[dict[str, str], bool]:
+    """Parse ``--jury-models`` into ``(vendor_models, allow_duplicate_models)``.
+
+    Splits on commas, strips whitespace, rejects empty entries, requires
+    exactly :data:`_JURY_SIZE` entries. Vendor names are auto-derived
+    from the LiteLLM provider prefix (everything before the first ``/``)
+    lowercased; duplicate prefixes get ``_2`` / ``_3`` suffixes so the
+    JuryJudge's name-uniqueness invariant holds. Duplicate MODEL ids
+    flip the ``allow_duplicate_models`` flag — the JuryJudge needs that
+    permission to accept the trio.
+
+    Entries are sorted (case-folded) before vendor-name derivation per
+    Fuzzer M3 audit fix: a user re-typing the trio in a different order
+    (e.g. ``flash,pro,deepseek`` vs ``pro,flash,deepseek``) MUST produce
+    the same vendor → model map so the persisted ``votes_json`` key
+    order is stable across superficially-equivalent re-typings.
+
+    RT B1 audit fix: the auto-suffix walk now tracks every produced
+    vendor name in a set, and if ``{prefix}_{count}`` is already
+    present (because the user smuggled the suffix in as an earlier
+    raw input), we keep incrementing ``count`` until we land on an
+    unused name. Without this, ``"google_2/x,google/y,google/z"`` would
+    silently clobber entry 1 with the auto-generated ``google_2`` for
+    entry 3.
+
+    Raises:
+        typer.BadParameter: wrong number of entries; empty entry; model
+            id missing a ``/`` separator (LiteLLM ids require one);
+            empty provider prefix or empty model name within an entry.
+    """
+    entries = [tok.strip() for tok in raw.split(",")]
+    if any(not e for e in entries):
+        raise typer.BadParameter(
+            f"--jury-models has an empty entry: {raw!r}. "
+            f"Pass exactly {_JURY_SIZE} comma-separated LiteLLM model ids."
+        )
+    if len(entries) != _JURY_SIZE:
+        raise typer.BadParameter(
+            f"--jury-models expects exactly {_JURY_SIZE} comma-separated "
+            f"LiteLLM model ids; got {len(entries)}: {entries!r}."
+        )
+    for e in entries:
+        if "/" not in e:
+            raise typer.BadParameter(
+                f"--jury-models entry {e!r} is not a LiteLLM model id "
+                f"(expected '<provider>/<model>', e.g. 'google/gemini-2.5-flash')."
+            )
+        # RT m2 audit fix: a trailing slash ("google/") slips past the
+        # "/" check but leaves the model name empty — LiteLLM downstream
+        # would surface as a cryptic auth/model error in the JuryJudge
+        # thread, recorded as judge_failure. Reject at parse time.
+        provider, _, model_part = e.partition("/")
+        if not provider.strip() or not model_part.strip():
+            raise typer.BadParameter(
+                f"--jury-models entry {e!r} has an empty provider or "
+                "model name. Expected '<provider>/<model>'."
+            )
+    # Canonicalize order: sort entries case-folded BEFORE deriving vendor
+    # names. The persisted vendor-name map is therefore identical for
+    # any permutation of the same trio. Fuzzer M3 audit fix.
+    sorted_entries = sorted(entries, key=str.lower)
+    # Derive vendor names: provider prefix lowercased + numeric suffix
+    # on collisions. e.g. sorted input ['deepseek/...', 'google/flash',
+    # 'google/pro'] -> {'deepseek': '...', 'google': 'google/flash',
+    # 'google_2': 'google/pro'}.
+    name_seen: dict[str, int] = {}
+    produced: set[str] = set()
+    vendor_models: dict[str, str] = {}
+    for model_id in sorted_entries:
+        prefix = model_id.split("/", 1)[0].strip().lower()
+        # Already validated above, but assert as defense-in-depth.
+        assert prefix, "empty prefix passed the front-gate check"
+        count = name_seen.get(prefix, 0) + 1
+        name_seen[prefix] = count
+        # First occurrence stays bare; collisions get _2/_3/... If the
+        # user smuggled in `google_2/x` as one entry AND submitted two
+        # `google/...` entries, the auto-derived `google_2` for the
+        # second would collide with the user's literal. Keep
+        # incrementing until we land on a free name.
+        candidate = prefix if count == 1 else f"{prefix}_{count}"
+        while candidate in produced:
+            count += 1
+            name_seen[prefix] = count
+            candidate = f"{prefix}_{count}"
+        produced.add(candidate)
+        vendor_models[candidate] = model_id
+    allow_duplicate_models = len(set(sorted_entries)) != _JURY_SIZE
+    return vendor_models, allow_duplicate_models
+
+
 @app.command(
     context_settings={
         # Reserved-flag rejection (§16 #2) is a global policy. ``scan``
@@ -441,7 +539,19 @@ def run(
     jury_of_3: bool = typer.Option(
         False,
         "--jury-of-3",
-        help="Opt-in jury-of-3 judging. Requires Anthropic + OpenAI + Gemini keys. v0.5 default judge is single Gemini.",
+        help="Opt-in jury-of-3 judging. Default trio: Anthropic + OpenAI + Gemini. Override via --jury-models. v0.5 default judge is single Gemini.",
+    ),
+    jury_models: str | None = typer.Option(
+        None,
+        "--jury-models",
+        help=(
+            "Override the --jury-of-3 trio. Comma-separated LiteLLM "
+            "model ids (e.g. 'google/gemini-2.5-flash,google/gemini-2.5-pro,"
+            "deepseek/deepseek-chat'). Exactly 3 entries required. "
+            "Duplicate ids are accepted (single-vendor plumbing-validation "
+            "mode); vendor names auto-derive from the LiteLLM prefix with "
+            "_1/_2/_3 suffixes for duplicates. Ignored when --jury-of-3 is off."
+        ),
     ),
     out_dir: Path = typer.Option(
         Path("runs"),
@@ -541,6 +651,28 @@ def run(
     _reject_reserved_flags(list(ctx.args))
     _reject_unknown_extras(list(ctx.args))
 
+    # F3 fail-fast: --jury-models is only meaningful with --jury-of-3,
+    # and a malformed --jury-models value should error BEFORE the
+    # fixture/eval load so the user sees the parameter error first
+    # rather than a fixture-not-found exit obscuring it.
+    if jury_models is not None:
+        if not jury_of_3:
+            typer.echo(
+                "topofuzz: --jury-models is only valid with --jury-of-3; "
+                "ignoring.",
+                err=True,
+            )
+            # Don't raise — silently drop into single-judge mode so a
+            # user retrying a multi-judge invocation without --jury-of-3
+            # still gets a working single-judge run.
+            jury_models = None
+        else:
+            # Run the parser once now (its result is discarded — we
+            # re-call it at the JuryJudge construction site). The parse
+            # raises typer.BadParameter on bad input, which Typer
+            # surfaces as a usage error before any work happens.
+            _parse_jury_models(jury_models)
+
     if jury_of_3:
         # Step 12b: wire the opt-in jury per BLUEPRINT_v5plus.md §12b.
         # The runtime check that ANTHROPIC_API_KEY + OPENAI_API_KEY +
@@ -554,13 +686,21 @@ def run(
         # (BLUEPRINT line 445) explicitly allows jury infra to have
         # known issues without blocking ship — file a v0.5.1 issue
         # instead. Emitting the hint to stderr is the right surface.
-        typer.echo(
-            "topofuzz: --jury-of-3 invokes Anthropic + OpenAI + Gemini "
-            "judges per BLUEPRINT §6. Missing env keys "
-            "(ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY) will "
-            "surface as judge_failure cells, not a kickoff error.",
-            err=True,
-        )
+        if jury_models is None:
+            typer.echo(
+                "topofuzz: --jury-of-3 invokes Anthropic + OpenAI + Gemini "
+                "judges per BLUEPRINT §6. Missing env keys "
+                "(ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY) will "
+                "surface as judge_failure cells, not a kickoff error.",
+                err=True,
+            )
+        else:
+            typer.echo(
+                f"topofuzz: --jury-of-3 with --jury-models {jury_models!r}. "
+                "Missing provider env keys will surface as judge_failure "
+                "cells, not a kickoff error.",
+                err=True,
+            )
 
     try:
         topology = load_topology(fixture)
@@ -742,12 +882,27 @@ def run(
     effective_rubric_path = (
         rubric_path if rubric_path is not None else _packaged_default_rubric_path()
     )
+    # F3 audit fix (RT M1): the orphan-`--jury-models` warning lives at
+    # the top of the function (right after `_reject_unknown_extras`) and
+    # zeros `jury_models` there, so by the time we reach the JuryJudge
+    # branch jury_models is non-None ONLY when jury_of_3 is also True.
+    # No duplicate guard here.
+    resolved_vendor_models: dict[str, str] | None = None
     try:
         if jury_of_3:
-            judge = JuryJudge(
-                rubric_path=effective_rubric_path,
-                dry_run=dry_run,
-            )
+            jury_kwargs: dict[str, Any] = {
+                "rubric_path": effective_rubric_path,
+                "dry_run": dry_run,
+            }
+            if jury_models is not None:
+                # _parse_jury_models already exited on bad input via
+                # typer.BadParameter; if we get here the trio is shape-
+                # valid (3 ids, all <provider>/<model>).
+                vendor_models, allow_dup = _parse_jury_models(jury_models)
+                jury_kwargs["vendor_models"] = vendor_models
+                jury_kwargs["allow_duplicate_models"] = allow_dup
+                resolved_vendor_models = vendor_models
+            judge = JuryJudge(**jury_kwargs)
         else:
             judge = SingleJudge(
                 model=judge_model,
@@ -792,6 +947,18 @@ def run(
         "max_cost_usd": max_cost_usd,
         "judge": judge_model,
         "jury_of_3": jury_of_3,
+        # Verbatim --jury-models string (None when unset / no jury).
+        # Preserved so a repro run can rebuild the exact vendor trio
+        # without re-deriving it from the synthetic "jury_of_3:..."
+        # effective_judge_model id.
+        "jury_models": jury_models,
+        # Post-parse provenance (RT M2 audit fix). The verbatim string
+        # above carries any whitespace / capitalization the user typed;
+        # a repro tool re-parsing the manifest would normalize and
+        # produce different bytes. Persisting the resolved vendor →
+        # model dict alongside the raw string lets readers replay the
+        # canonical trio without re-parsing. Null when no jury.
+        "jury_models_resolved": resolved_vendor_models,
         "out": str(out_dir),
         "cache": str(effective_cache_dir) if effective_cache_dir else None,
         "no_cache": no_cache,

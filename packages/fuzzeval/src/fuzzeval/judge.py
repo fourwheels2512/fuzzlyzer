@@ -92,10 +92,20 @@ class ContinuousScore:
     (empty string when the judge gave none, or for the dry-run / pre-
     rationale-field cache entries). Defaulted so old pickled cache
     entries round-trip via the class-attribute fallback.
+
+    ``votes`` is the per-vendor vote breakdown when the judge is a
+    :class:`JuryJudge`; each tuple is ``(vendor_name, vendor_score,
+    vendor_rationale)`` with ``vendor_score`` in ``[0, 1]``. The order
+    mirrors :attr:`JuryJudge.vendors` (construction order). Empty for
+    :class:`SingleJudge` results — exactly the marker the persistence
+    + UI layers use to tell single from jury judgments without a side
+    channel. Defaulted (empty tuple) so old pickled cache entries
+    round-trip via the class-attribute fallback.
     """
 
     value: float
     rationale: str = ""
+    votes: tuple[tuple[str, float, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -637,6 +647,14 @@ _DEFAULT_JURY_VENDOR_MODELS: dict[str, str] = {
 _JURY_SIZE = 3
 
 
+# Per-vendor binarisation threshold used by the F3 majority-vote
+# aggregator. Pinned to ``binary_from_continuous``'s default (0.5) so
+# the jury verdict pill and per-vendor approve/deny tally use one
+# threshold; a v0.6 sliding-threshold experiment would only touch this
+# line and the public helper.
+_MAJORITY_THRESHOLD = 0.5
+
+
 # Sentinel-typed mapping for the optional per-vendor test injection. Each
 # value is the same ``SyncLLMCallable`` shape as ``SingleJudge``'s
 # ``llm_callable`` arg — supplied per-vendor so a test can simulate a
@@ -650,22 +668,36 @@ class JuryJudge:
 
     Fans one ``score(payload)`` call out to three single-vendor judges
     (default: Anthropic + OpenAI + Gemini per BLUEPRINT_v5plus.md §6
-    line 220), aggregates parseable continuous scores by **arithmetic
-    mean**, and exposes run-level accounting for the §12b DoD #14
+    line 220), aggregates parseable continuous scores by **majority
+    vote**, and exposes run-level accounting for the §12b DoD #14
     falsifiability targets.
 
-    Aggregation contract (handoff decision locked at step-12b kickoff):
+    Aggregation contract (F3 ship — supersedes the earlier mean-of-
+    continuous contract per `project_f3_f4_e2e_playwright_plan`):
 
-    * **Mean of parseable scores** in ``[0, 1]``. Each vendor's
-      :class:`SingleJudge` returns ``ContinuousScore``; we collect
-      ``.value`` from the calls that did not raise
-      :class:`JudgeUnparseableError`, then mean.
+    * **Majority-vote scalar** in ``{0.0, 1.0}``. Each parseable vendor
+      score is binarized at the default verdict threshold (``>= 0.5`` →
+      approve). The jury verdict is ``1.0`` when strictly more than half
+      of the surviving vendors approve; otherwise ``0.0``. Ties
+      (1/1 with one failed vendor; 1/2 with one failed vendor — both
+      have ``approve_count * 2 == total``) resolve to **DENY** as the
+      compliance-conservative default. The fuzzer pass-1 audit flagged
+      the prior mean-of-continuous behaviour as a sellability hole:
+      votes ``[0.4, 0.4, 0.85]`` mean to ``0.55`` (APPROVE under
+      ``>=0.5``) but the strict majority of binarized votes is
+      ``[0,0,1]`` (DENY). The cell-detail panel's per-vendor breakdown
+      and the headline verdict pill now agree by construction.
     * **UNPARSEABLE fallback.** If 1 or 2 vendors raise
-      ``JudgeUnparseableError``, drop their votes and mean the
-      survivors. If **all** vendors raise, re-raise
-      ``JudgeUnparseableError`` so the runner (:mod:`topofuzz.runner`)
-      marks the cell ``judge_failure=True`` (§8 ``judge_failure_rate >
-      5% → degraded`` accounting).
+      ``JudgeUnparseableError`` or any other vendor exception, drop
+      their votes and majority over the survivors. If **all** vendors
+      raise, re-raise ``JudgeUnparseableError`` so the runner
+      (:mod:`topofuzz.runner`) marks the cell ``judge_failure=True``
+      (§8 ``judge_failure_rate > 5% → degraded`` accounting).
+    * **Mean preserved in ``votes``.** The arithmetic mean is still
+      available — every per-vendor raw score lives in
+      ``ContinuousScore.votes``, so a downstream consumer who needs the
+      mean computes it from ``votes`` directly. No information loss vs
+      the prior contract; only the headline scalar's semantics shifted.
 
     Accounting (DoD #14, BLUEPRINT line 445 — INFORMATIONAL only at
     v0.5, promoted to HARD at TDS-Regulator):
@@ -705,10 +737,17 @@ class JuryJudge:
             mapping. Default is the BLUEPRINT trio. Pass-1 RT-M2 audit
             fix: vendor names are stripped and lowercased before the
             uniqueness check, so ``"  Anthropic "`` and ``"anthropic"``
-            collide and raise. Model VALUES must also be distinct
-            (three vendors pointing at the same LiteLLM model id
-            defeats the independence claim of
-            :attr:`judge_independence`).
+            collide and raise. Model VALUES must also be distinct UNLESS
+            ``allow_duplicate_models=True`` (the F3 single-vendor jury
+            mode — see below).
+        allow_duplicate_models: When ``True``, accept duplicate LiteLLM
+            model ids across vendors. F3 use case: a single-vendor
+            ``--jury-of-3`` (e.g. three Gemini-Flash calls) where the
+            point is plumbing-validation, not cross-vendor independence.
+            The judge_independence.vendor_overlap signal becomes weaker
+            in this mode — the caller has explicitly opted out of the
+            independence guarantee — and the docstring of
+            :attr:`judge_independence` documents that trade-off.
         dry_run: When ``True``, every vendor judge is dry-run
             (deterministic ``ContinuousScore(0.5)`` per
             :class:`SingleJudge.score`). The jury mean is therefore
@@ -742,6 +781,7 @@ class JuryJudge:
         dry_run: bool = False,
         llm_callables: LLMCallables | None = None,
         max_tokens: int = _DEFAULT_MAX_TOKENS,
+        allow_duplicate_models: bool = False,
     ) -> None:
         raw_models = (
             dict(_DEFAULT_JURY_VENDOR_MODELS)
@@ -785,11 +825,22 @@ class JuryJudge:
         # three set to "google/gemini-2.5-pro") would produce a "jury"
         # whose three votes are statistically dependent — the
         # judge_independence.vendor_overlap signal becomes a lie.
-        if len(set(models.values())) != _JURY_SIZE:
+        #
+        # F3 escape hatch: ``allow_duplicate_models=True`` opts the
+        # caller into the single-vendor jury (e.g. 3× Gemini-Flash for
+        # plumbing-validation). The caller has explicitly accepted that
+        # vendor_overlap becomes a weaker signal in that mode (it still
+        # reports the names, but they alias the same model).
+        if (
+            not allow_duplicate_models
+            and len(set(models.values())) != _JURY_SIZE
+        ):
             raise ValueError(
                 f"JuryJudge vendor models must be distinct; got duplicates in "
                 f"{models!r}. Three vendors pointing at the same model defeats "
-                "the independence claim of vendor_overlap."
+                "the independence claim of vendor_overlap. Pass "
+                "allow_duplicate_models=True to opt out of this check (single-"
+                "vendor jury / plumbing-validation mode)."
             )
 
         # Normalize llm_callables keys the same way so caller-side
@@ -927,6 +978,11 @@ class JuryJudge:
         # snapshots between the two ``+=`` statements.
         votes: list[float] = []
         vote_rationales: list[tuple[str, str]] = []
+        # Per-vendor breakdown for ContinuousScore.votes — populated only
+        # for vendors that produced a parseable ContinuousScore. Order
+        # mirrors construction-order iteration over self._judges so the
+        # persisted column is stable across runs.
+        vote_breakdown: list[tuple[str, float, str]] = []
         parseable_this_call: list[str] = []
         per_call_errors: list[tuple[str, str]] = []
         local_total = 0
@@ -987,6 +1043,7 @@ class JuryJudge:
                 continue
             votes.append(result.value)
             vote_rationales.append((vendor, result.rationale))
+            vote_breakdown.append((vendor, float(result.value), result.rationale))
             parseable_this_call.append(vendor)
 
         # Apply the per-call accumulator updates atomically.
@@ -1000,8 +1057,18 @@ class JuryJudge:
                 f"JuryJudge: all {len(self._judges)} vendors failed. "
                 f"Errors: {per_call_errors!r}"
             )
-        mean = sum(votes) / len(votes)
-        # Mean of values in [0, 1] is itself in [0, 1] — no clamp needed.
+        # F3 aggregation: strict-majority of per-vendor binarized votes.
+        # ``vote >= _MAJORITY_THRESHOLD`` is the same binarisation
+        # ``binary_from_continuous`` and the headline verdict pill use,
+        # so the panel's approve/deny tally and the cell-level verdict
+        # agree by construction. ``approve_count * 2 > total`` rejects
+        # ties — a 1-of-2 jury (one failed vendor) deadlocks to DENY,
+        # the compliance-conservative default. The raw per-vendor scores
+        # remain available via ``ContinuousScore.votes`` for any caller
+        # that needs the mean.
+        total = len(votes)
+        approve_count = sum(1 for v in votes if v >= _MAJORITY_THRESHOLD)
+        majority_value = 1.0 if approve_count * 2 > total else 0.0
         # Rationale aggregates only the parseable vendors that actually
         # emitted a Rationale: line, vendor-prefixed and joined. Vendors
         # with an empty rationale contribute nothing — so an all-empty
@@ -1013,7 +1080,11 @@ class JuryJudge:
         jury_rationale = " | ".join(
             f"{vendor}: {text}" for vendor, text in vote_rationales if text
         )[:_RATIONALE_MAX_CHARS]
-        return ContinuousScore(value=mean, rationale=jury_rationale)
+        return ContinuousScore(
+            value=majority_value,
+            rationale=jury_rationale,
+            votes=tuple(vote_breakdown),
+        )
 
     # ------------------------------------------------------------------
     # Run-level accounting — DoD #14 falsifiability surface.
@@ -1062,6 +1133,17 @@ class JuryJudge:
         BLUEPRINT line 445 makes this falsifiable: "includes
         'anthropic' if Claude is in the jury" — i.e., if the Anthropic
         single-judge parsed at least once, "anthropic" must appear.
+
+        **Single-vendor jury caveat.** When the JuryJudge was constructed
+        with ``allow_duplicate_models=True`` and the vendor models all
+        point at the same underlying LiteLLM model, vendor_overlap will
+        list the vendor *names* (e.g. ``["gemini_1", "gemini_2",
+        "gemini_3"]``) — but they are NOT statistically independent
+        votes; they're three calls to the same model. The caller opted
+        into this trade-off; the field shape preserves auditability
+        (you can tell from the names that they alias the same vendor),
+        but downstream consumers SHOULD NOT treat a single-vendor
+        overlap as cross-vendor agreement.
         """
         with self._accounting_lock:
             snapshot = sorted(self._parseable_vendors)

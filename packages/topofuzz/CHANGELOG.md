@@ -10,6 +10,38 @@ placeholder version and are not separately enumerated.
 
 ## [Unreleased]
 
+### Added
+
+- **F3 — `--jury-of-3` wired with per-vendor vote breakdown.**
+  The CLI flag was already present but defaulted to the BLUEPRINT trio
+  (Anthropic + OpenAI + Gemini) without a way to override the models.
+  This release wires `--jury-models <m1,m2,m3>` to override the trio
+  with any three LiteLLM model ids (e.g.
+  `google/gemini-2.5-flash,google/gemini-2.5-pro,deepseek/deepseek-chat`).
+  Duplicate model ids are accepted via the new
+  `JuryJudge(allow_duplicate_models=True)` opt-in — F3 single-vendor
+  plumbing-validation mode where three identical Gemini-Flash calls
+  exercise the majority-vote infrastructure without cross-vendor
+  independence guarantees. Per-vendor vote breakdowns now persist in
+  schema v6's new `judge_results.votes_json` column (forward-compat
+  with v5 readers via PRAGMA-probe fallback in `inspect._load_cell`).
+  The inspect view (`topofuzz inspect`) renders a "Jury vote
+  breakdown" sub-panel showing each vendor's score + verdict + own
+  rationale, with an explicit "TIE → DENY" pill for deadlocked juries
+  (compliance-conservative default per F3 Pass-2 dual-audit
+  M-Fuzzer-2). The headline `score_value` is the **majority-vote
+  scalar** (`1.0` if strict majority of binarized votes approve, else
+  `0.0`) — NOT the arithmetic mean — so the verdict pill and the
+  per-vendor approve/deny tally always agree by construction. Raw
+  per-vendor scores remain accessible via `ContinuousScore.votes` for
+  any consumer that needs the mean. Manifest provenance: both the
+  verbatim `--jury-models` string AND the post-parse
+  `{vendor: model}` dict land in `cli_args` so repro tools can rebuild
+  the trio without re-parsing. Schema bumped 5 → 6; idempotent
+  migration via `ALTER TABLE judge_results ADD COLUMN votes_json`.
+  DeepSeek added to `costest._RATE_USD_PER_1K` at `$0.001/1K` blended
+  (~43% overestimate vs real DeepSeek, intentionally safe-side).
+
 ### Changed
 
 - **`order_swap` is now edge-aware (BLUEPRINT §6 / BACKLOG Option B,

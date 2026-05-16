@@ -52,6 +52,15 @@ _RATE_USD_PER_1K = {
     "openai/gpt-5": 0.040,
     "google/gemini-2.5-pro": 0.020,
     "google/gemini-2.5-flash": 0.005,
+    # DeepSeek chat: ~$0.27 / 1M input + ~$1.10 / 1M output as of
+    # 2026-05. Blended-token shorthand for the static estimator: round
+    # the blend up to $0.001 / 1K (≈ $0.69 / 1M) so a 5K-token call
+    # estimates $0.005 — close enough for the §15 preflight which is
+    # itself a heuristic; real spend comes from the runner's per-call
+    # cost telemetry. Underestimating real DeepSeek cost slightly is
+    # the safer direction (the cap-trip behaviour bites EARLIER, not
+    # later, than the estimate).
+    "deepseek/deepseek-chat": 0.001,
 }
 _DEFAULT_RATE = 0.040
 

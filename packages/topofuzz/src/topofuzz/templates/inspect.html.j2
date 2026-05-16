@@ -208,6 +208,83 @@
     margin-bottom: 6px;
   }
 
+  /* Per-judge vote panel — only shown when --jury-of-3 fired. */
+  .jury {
+    background: var(--surface);
+    border: 1px solid var(--border-soft);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .jury-head {
+    padding: 10px 16px;
+    background: var(--surface-warm);
+    border-bottom: 1px solid var(--border-soft);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .jury-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .jury-summary {
+    font-family: var(--font-serif);
+    font-style: italic;
+    font-size: 13px;
+    color: var(--muted-soft);
+  }
+  .jury-summary strong { color: var(--ink-strong); font-style: normal; font-weight: 600; }
+  .jury-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    background: var(--border-soft);
+  }
+  .jury-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 70px 90px;
+    gap: 12px;
+    align-items: center;
+    padding: 10px 16px;
+    background: var(--surface);
+  }
+  .jury-row + .jury-row { /* SVG-less divider between rows */ }
+  .jury-vendor {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--ink-strong);
+    word-break: break-all;
+  }
+  .jury-score {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--muted-soft);
+    text-align: right;
+  }
+  .jury-verdict {
+    text-align: right;
+  }
+  .jury-verdict .verdict {
+    /* Smaller pill on the per-vendor row vs the headline pill. */
+    padding: 2px 9px;
+    font-size: 10px;
+  }
+  .jury-rationale {
+    grid-column: 1 / -1;
+    padding: 6px 0 0 0;
+    font-family: var(--font-serif);
+    font-size: 13px;
+    color: var(--muted-soft);
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
   .error-banner {
     background: var(--deny-bg);
     color: var(--deny);
@@ -377,6 +454,34 @@
           <div class="rationale">
             <div class="rationale-label">Judge rationale</div>
             {{ side.rationale_html }}
+          </div>
+        {% endif %}
+        {% if side.jury_votes %}
+          <div class="jury">
+            <div class="jury-head">
+              <span class="jury-label">Jury vote breakdown</span>
+              <span class="jury-summary">
+                {%- set jv = side.jury_votes -%}
+                <strong>{{ jv.approve_count }}</strong> approve &middot;
+                <strong>{{ jv.deny_count }}</strong> deny
+                &middot; {{ jv.total }} judges &middot;
+                <span class="verdict {{ jv.majority_class }}">{{ jv.majority_label }}</span>
+              </span>
+            </div>
+            <div class="jury-rows">
+              {% for row in side.jury_votes.rows %}
+                <div class="jury-row">
+                  <span class="jury-vendor">{{ row.vendor }}</span>
+                  <span class="jury-score">{{ row.score_value }} &middot; {{ row.score_pct }}</span>
+                  <span class="jury-verdict">
+                    <span class="verdict {{ row.verdict_class }}">{{ row.verdict_label }}</span>
+                  </span>
+                  {% if row.rationale_html %}
+                    <div class="jury-rationale">{{ row.rationale_html }}</div>
+                  {% endif %}
+                </div>
+              {% endfor %}
+            </div>
           </div>
         {% endif %}
         {% for agent in side.agents %}

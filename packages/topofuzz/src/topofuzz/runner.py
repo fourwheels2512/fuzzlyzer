@@ -930,7 +930,17 @@ async def _run_judge(
 # pre-existing user_version (0 for fresh DBs, 1 for legacy step-5 DBs,
 # 99+ for a hypothetical future DB) is observable when migrate decides
 # whether to ALTER or refuse.
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
+
+# Hard cap on the persisted ``judge_results.votes_json`` payload.
+# Per-vendor rationale is already _RATIONALE_MAX_CHARS=1000-bounded;
+# this is the trailing backstop against a future N-vendor jury that
+# inflates the column past sensible limits. When over budget, the
+# packer drops the rationale strings but preserves vendor + score so
+# the inspect panel still tallies the per-vendor verdict. 8 KB covers
+# any realistic 3-5 vendor jury at full rationale; tightens auditably
+# in v0.6 if the jury surface evolves.
+_VOTES_JSON_MAX_BYTES = 8192
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -967,6 +977,7 @@ CREATE TABLE IF NOT EXISTS judge_results (
     passed INTEGER,
     rationale TEXT,
     failure_reason TEXT,
+    votes_json TEXT,
     PRIMARY KEY (run_id, variant_id, eval_id)
 );
 CREATE TABLE IF NOT EXISTS flip_confirmations (
@@ -1074,14 +1085,33 @@ def _migrate(db: sqlite3.Connection) -> None:
     # _SCHEMA already created it for both fresh and legacy DBs — no ALTER
     # is needed here. The bump to _SCHEMA_VERSION=5 just records that a
     # v4 DB opened by v5 code is fully migrated once _SCHEMA has run.
+    if current < 6:
+        # v6: per-vendor jury vote breakdown. NULL for single-judge cells
+        # and for legacy jury runs that pre-date this column. Readers
+        # (inspect.py, report.py) treat NULL as "no jury breakdown
+        # available" rather than as "the jury voted zero times".
+        judge_cols_v6 = {
+            row[1]
+            for row in db.execute(
+                "PRAGMA table_info(judge_results)"
+            ).fetchall()
+        }
+        if "votes_json" not in judge_cols_v6:
+            db.execute("ALTER TABLE judge_results ADD COLUMN votes_json TEXT")
     db.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
     db.commit()
 
 
 def _judge_row(
     cell: Cell,
-) -> tuple[str, float | None, int | None, str | None, str | None]:
+) -> tuple[str, float | None, int | None, str | None, str | None, str | None]:
     """Pack a Cell's judge state into the judge_results column tuple.
+
+    Returns ``(judge_kind, score_value, passed, rationale,
+    failure_reason, votes_json)``. The trailing ``votes_json`` slot
+    carries the JuryJudge per-vendor breakdown when available — a JSON
+    array of ``{"vendor": str, "score": float, "rationale": str}``
+    objects — or ``None`` for SingleJudge / dry-run / failure rows.
 
     judge_kind:
         "continuous" — ContinuousScore
@@ -1090,23 +1120,56 @@ def _judge_row(
         "absent"     — no judge supplied
     """
     if cell.judge_failure:
-        return "failure", None, None, None, cell.judge_failure_reason
+        return "failure", None, None, None, cell.judge_failure_reason, None
     if isinstance(cell.judge_result, ContinuousScore):
         # Write rationale verbatim — including "" — matching the
         # BinaryScore branch below. Both judge kinds then use "" as the
         # single "no rationale" sentinel; collapsing to NULL here would
         # split the sentinel by judge_kind.
+        votes_json: str | None = None
+        if cell.judge_result.votes:
+            # JuryJudge populated per-vendor votes — persist as JSON for
+            # the inspect / report layers. Each entry preserves the
+            # construction-order vendor name + the [0, 1] score + the
+            # vendor's own rationale fragment. Empty rationale fragments
+            # are kept (vs filtered) so the persisted column can be
+            # round-tripped exactly.
+            votes_json = json.dumps(
+                [
+                    {"vendor": v, "score": s, "rationale": r}
+                    for v, s, r in cell.judge_result.votes
+                ],
+                ensure_ascii=False,
+            )
+            # F3 Fuzzer m4 audit fix: hard cap the persisted column.
+            # Each per-vendor rationale is already capped at
+            # _RATIONALE_MAX_CHARS=1000; the JOINED 3-vendor JSON at
+            # worst case is ~3.3 KB. A future 5-vendor jury or a
+            # pathological rationale would blow run.sqlite without this
+            # backstop. When over budget, drop the rationale strings
+            # but preserve vendor + score so the panel can still show
+            # the per-vendor verdict tally — the integrity-critical
+            # data.
+            if len(votes_json) > _VOTES_JSON_MAX_BYTES:
+                votes_json = json.dumps(
+                    [
+                        {"vendor": v, "score": s, "rationale": ""}
+                        for v, s, _r in cell.judge_result.votes
+                    ],
+                    ensure_ascii=False,
+                )
         return (
             "continuous",
             cell.judge_result.value,
             None,
             cell.judge_result.rationale,
             None,
+            votes_json,
         )
     if isinstance(cell.judge_result, BinaryScore):
         passed = 1 if cell.judge_result.passed else 0
-        return "binary", None, passed, cell.judge_result.rationale, None
-    return "absent", None, None, None, None
+        return "binary", None, passed, cell.judge_result.rationale, None, None
+    return "absent", None, None, None, None, None
 
 
 def _cell_cost_usd(cell: Cell) -> float | None:
@@ -1132,11 +1195,20 @@ def _judge_to_jsonable(cell: Cell) -> dict | None:
     if cell.judge_failure:
         return {"kind": "failure", "reason": cell.judge_failure_reason}
     if isinstance(cell.judge_result, ContinuousScore):
-        return {
+        record: dict[str, Any] = {
             "kind": "continuous",
             "value": cell.judge_result.value,
             "rationale": cell.judge_result.rationale,
         }
+        if cell.judge_result.votes:
+            # Mirror the SQLite votes_json column shape so traces.jsonl
+            # and run.sqlite agree byte-for-byte on the per-vendor
+            # breakdown (downstream replay tooling consumes either).
+            record["votes"] = [
+                {"vendor": v, "score": s, "rationale": r}
+                for v, s, r in cell.judge_result.votes
+            ]
+        return record
     if isinstance(cell.judge_result, BinaryScore):
         return {
             "kind": "binary",
@@ -1387,10 +1459,17 @@ class RunWriter:
                 cell_cost,
             ),
         )
-        kind, score_value, passed, rationale, failure_reason = _judge_row(cell)
+        (
+            kind,
+            score_value,
+            passed,
+            rationale,
+            failure_reason,
+            votes_json,
+        ) = _judge_row(cell)
         self._db.execute(
             "INSERT OR REPLACE INTO judge_results VALUES "
-            "(?, ?, ?, ?, ?, ?, ?, ?)",
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 self._run_id,
                 cell.variant_id,
@@ -1400,6 +1479,7 @@ class RunWriter:
                 passed,
                 rationale,
                 failure_reason,
+                votes_json,
             ),
         )
         self._db.commit()
@@ -1469,7 +1549,18 @@ class RunWriter:
         node_dicts = [asdict(o) for o in cell.node_outputs]
         node_outputs_json = json.dumps(node_dicts, ensure_ascii=False)
         cell_cost = _cell_cost_usd(cell)
-        kind, score_value, passed, rationale, failure_reason = _judge_row(cell)
+        # flip_confirmations doesn't carry the jury vote breakdown (the
+        # noise-floor pass is per-judgment K-repeat, not per-vendor) so
+        # ``votes_json`` from ``_judge_row`` is intentionally dropped
+        # here. The mean score still lands in ``score_value``.
+        (
+            kind,
+            score_value,
+            passed,
+            rationale,
+            failure_reason,
+            _votes_json,
+        ) = _judge_row(cell)
         # judge_results packs binary verdicts into ``passed``; the
         # flip_confirmations table has no ``passed`` column (the v0.5
         # confirm pass scores continuously), so fold a binary verdict

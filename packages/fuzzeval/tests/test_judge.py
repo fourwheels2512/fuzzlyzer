@@ -797,24 +797,60 @@ def test_jury_judge_render_prompt_matches_single_judge(tmp_path):
 # --- aggregation ---------------------------------------------------------
 
 
-def test_jury_judge_means_three_parseable_votes(tmp_path):
+def test_jury_judge_majority_of_three_parseable_votes(tmp_path):
+    """F3 contract: ``value`` is the majority-vote scalar, NOT the mean.
+    Per-vendor binarisation at >= 0.5: votes 0.4, 0.6, 0.8 → [0, 1, 1]
+    → 2-of-3 approve → ``value == 1.0``. The raw mean (0.6) remains
+    accessible via ``votes``."""
     stubs = _jury_stubs(
         {
-            "anthropic": _score_response(4),  # 0.4
-            "openai": _score_response(6),  # 0.6
-            "gemini": _score_response(8),  # 0.8
+            "anthropic": _score_response(4),  # 0.4 → deny
+            "openai": _score_response(6),  # 0.6 → approve
+            "gemini": _score_response(8),  # 0.8 → approve
         }
     )
     j = _make_jury(tmp_path, callables=stubs)
     result = j.score(_payload())
     assert isinstance(result, ContinuousScore)
-    # Mean of 0.4, 0.6, 0.8 == 0.6 (exact in float arithmetic for these
-    # decimals but use approx anyway for forward-compat).
-    assert result.value == pytest.approx(0.6)
+    assert result.value == pytest.approx(1.0)
+    # Mean still computable from the per-vendor breakdown.
+    raw_scores = [s for _v, s, _r in result.votes]
+    assert sum(raw_scores) / len(raw_scores) == pytest.approx(0.6)
     assert j.judge_failure_rate == 0.0
     assert j.judge_independence == {
         "vendor_overlap": ["anthropic", "gemini", "openai"],
     }
+
+
+def test_jury_judge_majority_deny_when_split_2_to_1(tmp_path):
+    """Votes 0.7, 0.2, 0.3 → [1, 0, 0] → 1-of-3 approve → DENY."""
+    stubs = _jury_stubs(
+        {
+            "anthropic": _score_response(7),
+            "openai": _score_response(2),
+            "gemini": _score_response(3),
+        }
+    )
+    j = _make_jury(tmp_path, callables=stubs)
+    result = j.score(_payload())
+    assert result.value == pytest.approx(0.0)
+
+
+def test_jury_judge_tie_resolves_to_deny(tmp_path):
+    """One vendor failed, surviving two split 1/1. ``approve_count * 2
+    == total`` is NOT strictly greater than ``total`` so majority falls
+    to DENY — the compliance-conservative default."""
+    stubs = _jury_stubs(
+        {
+            "anthropic": "no Score line here",  # unparseable → dropped
+            "openai": _score_response(8),  # 0.8 → approve
+            "gemini": _score_response(2),  # 0.2 → deny
+        }
+    )
+    j = _make_jury(tmp_path, callables=stubs)
+    result = j.score(_payload())
+    assert result.value == pytest.approx(0.0)
+    assert j.judge_failure_rate == pytest.approx(1 / 3)
 
 
 def test_jury_judge_aggregates_vendor_rationales(tmp_path):
@@ -886,22 +922,24 @@ def test_jury_judge_all_empty_rationales_yield_empty_string(tmp_path):
     )
     j = _make_jury(tmp_path, callables=stubs)
     result = j.score(_payload())
-    assert result.value == pytest.approx(0.6)
+    # Per-vendor binarised: [0, 1, 1] → 2-of-3 approve → 1.0.
+    assert result.value == pytest.approx(1.0)
     assert result.rationale == ""
 
 
-def test_jury_judge_drops_unparseable_vote_and_means_survivors(tmp_path):
+def test_jury_judge_drops_unparseable_vote_and_majority_of_survivors(tmp_path):
     stubs = _jury_stubs(
         {
             "anthropic": "I refuse to give a score (no Score: line)",
-            "openai": _score_response(6),  # 0.6
-            "gemini": _score_response(8),  # 0.8
+            "openai": _score_response(6),  # 0.6 → approve
+            "gemini": _score_response(8),  # 0.8 → approve
         }
     )
     j = _make_jury(tmp_path, callables=stubs)
     result = j.score(_payload())
-    # Mean of 0.6 and 0.8 == 0.7 — anthropic's vote dropped.
-    assert result.value == pytest.approx(0.7)
+    # Surviving 2/2 unanimous approve → 1.0 (NOT a tie, because both
+    # vendors agree; tie convention only kicks in on 1/1 splits).
+    assert result.value == pytest.approx(1.0)
     assert j.judge_failure_rate == pytest.approx(1 / 3)
     assert j.judge_independence == {
         "vendor_overlap": ["gemini", "openai"],
@@ -937,7 +975,9 @@ def test_jury_judge_treats_sdk_exception_as_failure(tmp_path):
     }
     j = _make_jury(tmp_path, callables=callables)
     result = j.score(_payload())
-    assert result.value == pytest.approx(0.7)
+    # Surviving votes [0.6, 0.8] both binarise to approve → 2-of-2
+    # unanimous → majority 1.0.
+    assert result.value == pytest.approx(1.0)
     assert j.judge_failure_rate == pytest.approx(1 / 3)
     assert "anthropic" not in j.judge_independence["vendor_overlap"]
 
@@ -957,7 +997,8 @@ def test_jury_judge_accounting_accumulates_across_calls(tmp_path):
     j = JuryJudge(rubric_path=rubric, llm_callables=callables)
     for _ in range(3):
         r = j.score(_payload())
-        assert r.value == pytest.approx(0.7)
+        # Surviving 2-of-2 vendors both approve at >= 0.5 → majority 1.0.
+        assert r.value == pytest.approx(1.0)
     assert j.judge_failure_rate == pytest.approx(3 / 9)
     assert j.judge_independence == {
         "vendor_overlap": ["gemini", "openai"],
@@ -987,7 +1028,11 @@ def test_jury_judge_vendor_overlap_records_any_parseable_vote(tmp_path):
 # --- dry-run -------------------------------------------------------------
 
 
-def test_jury_judge_dry_run_returns_half_with_no_llm(tmp_path):
+def test_jury_judge_dry_run_returns_majority_approve_with_no_llm(tmp_path):
+    """Dry-run path: each vendor returns ContinuousScore(0.5). Binarised
+    at the inclusive threshold (``>= 0.5``), every vote is APPROVE, so
+    the 3-of-3 unanimous jury verdict is 1.0. Per-vendor raw 0.5s
+    remain accessible via ``votes``."""
     def boom(**kwargs):
         raise AssertionError("dry-run must not call any LLM")
 
@@ -998,7 +1043,9 @@ def test_jury_judge_dry_run_returns_half_with_no_llm(tmp_path):
     }
     j = _make_jury(tmp_path, callables=callables, dry_run=True)
     r = j.score(_payload())
-    assert r.value == 0.5
+    assert r.value == pytest.approx(1.0)
+    # Raw per-vendor scores still recoverable from votes.
+    assert [s for _v, s, _r in r.votes] == [0.5, 0.5, 0.5]
     # Dry-run is parseable by construction — vendor_overlap has all three.
     assert j.judge_independence == {
         "vendor_overlap": ["anthropic", "gemini", "openai"],
@@ -1050,7 +1097,9 @@ def test_jury_judge_conforms_to_judge_protocol(tmp_path):
     )
     r = j.score(_payload())
     assert isinstance(r, ContinuousScore)
-    assert r.value == pytest.approx(0.5)
+    # Per-vendor 0.5 binarises to APPROVE (inclusive >= threshold);
+    # 3-of-3 → majority 1.0.
+    assert r.value == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1131,7 +1180,8 @@ def test_jury_judge_normalizes_callables_keys(tmp_path):
     }
     j = JuryJudge(rubric_path=rubric, llm_callables=stubs)
     result = j.score(_payload())
-    assert result.value == pytest.approx(0.6)
+    # Per-vendor binarised: [0, 1, 1] → 2-of-3 approve → 1.0.
+    assert result.value == pytest.approx(1.0)
     assert j.judge_failure_rate == 0.0
 
 
@@ -1202,10 +1252,9 @@ def test_jury_judge_accounting_is_consistent_under_threaded_score(tmp_path):
 
 
 def test_jury_judge_unanimous_low_score_is_legitimate(tmp_path):
-    """3 stubs all returning "Score: 0" → mean 0.0, vendor_overlap full,
-    judge_failure_rate 0. This is by-design per the mean-of-parseable
-    aggregation contract — unanimous consensus is a strong signal even
-    when the consensus value is low."""
+    """3 stubs all returning "Score: 0" → 0-of-3 approve → 0.0,
+    vendor_overlap full, judge_failure_rate 0. Unanimous DENY is a
+    legitimate jury verdict under the F3 majority-vote contract."""
     stubs = _jury_stubs(
         {
             "anthropic": _score_response(0),
@@ -1223,8 +1272,9 @@ def test_jury_judge_unanimous_low_score_is_legitimate(tmp_path):
 
 
 # RT-9 — BinaryScore from a vendor is treated as a failure (the
-# JuryJudge contract is mean-of-CONTINUOUS scores; a vendor returning a
-# different result type can't be aggregated into the mean).
+# JuryJudge contract is majority-of-CONTINUOUS scores; a vendor returning
+# a different result type can't participate in the per-vendor
+# binarisation that feeds the majority vote).
 
 
 def test_jury_judge_treats_non_continuous_score_as_failure(tmp_path):
@@ -1258,8 +1308,9 @@ def test_jury_judge_treats_non_continuous_score_as_failure(tmp_path):
         passed=True, rationale="off-protocol"
     )
     result = j.score(_payload())
-    # Mean of the surviving two parseable continuous votes: (0.7 + 0.9) / 2 = 0.8.
-    assert result.value == pytest.approx(0.8)
+    # Surviving two votes both binarise to approve (0.7 ≥ 0.5; 0.9 ≥ 0.5);
+    # 2-of-2 unanimous approve → 1.0.
+    assert result.value == pytest.approx(1.0)
     assert j.judge_failure_rate == pytest.approx(1 / 3)
     assert j.judge_independence == {
         "vendor_overlap": ["gemini", "openai"],
@@ -1289,3 +1340,103 @@ def test_jury_judge_does_not_swallow_keyboard_interrupt(tmp_path):
     # And: the partial state is NOT committed — total_vendor_calls
     # stays 0 because the lock-batched apply never ran.
     assert j.total_vendor_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# F3 — single-vendor jury (allow_duplicate_models) + per-vote breakdown
+# ---------------------------------------------------------------------------
+
+
+def test_jury_judge_accepts_duplicate_models_when_allowed(tmp_path):
+    """F3 single-vendor jury: three vendor names pointing at the same
+    LiteLLM model id are accepted when ``allow_duplicate_models=True``
+    is passed explicitly. The default (False) still rejects."""
+    rubric = _write_rubric(tmp_path / "r.txt")
+    same_model = "google/gemini-2.5-flash"
+    vendor_models = {
+        "gemini_1": same_model,
+        "gemini_2": same_model,
+        "gemini_3": same_model,
+    }
+    # Default still rejects so callers don't accidentally lose the
+    # cross-vendor independence guarantee.
+    with pytest.raises(ValueError, match="vendor models must be distinct"):
+        JuryJudge(rubric_path=rubric, vendor_models=vendor_models)
+    # Explicit opt-in works.
+    j = JuryJudge(
+        rubric_path=rubric,
+        vendor_models=vendor_models,
+        allow_duplicate_models=True,
+        llm_callables={
+            "gemini_1": _StubLLM([_score_response(7)]),
+            "gemini_2": _StubLLM([_score_response(8)]),
+            "gemini_3": _StubLLM([_score_response(6)]),
+        },
+    )
+    assert set(j.vendors) == {"gemini_1", "gemini_2", "gemini_3"}
+    result = j.score(_payload())
+    # Per-vendor binarised: 0.7→approve, 0.8→approve, 0.6→approve.
+    # 3-of-3 unanimous approve → majority scalar 1.0.
+    assert result.value == pytest.approx(1.0)
+    # All three counted as parseable, even though they share a model.
+    assert j.judge_independence == {
+        "vendor_overlap": ["gemini_1", "gemini_2", "gemini_3"],
+    }
+
+
+def test_jury_judge_populates_votes_field_on_continuous_score(tmp_path):
+    """F3 contract: ContinuousScore.votes carries the per-vendor breakdown
+    on the JuryJudge return value. Mirrors construction order."""
+    stubs = _jury_stubs(
+        {
+            "anthropic": _score_response(4, rationale="weak"),
+            "openai": _score_response(6, rationale="OK"),
+            "gemini": _score_response(8, rationale="strong"),
+        }
+    )
+    j = _make_jury(tmp_path, callables=stubs)
+    result = j.score(_payload())
+    assert result.votes == (
+        ("anthropic", pytest.approx(0.4), "weak"),
+        ("openai", pytest.approx(0.6), "OK"),
+        ("gemini", pytest.approx(0.8), "strong"),
+    )
+
+
+def test_jury_judge_votes_excludes_failed_vendor(tmp_path):
+    """A vendor that fails to parse contributes no entry to votes —
+    matches the rationale-aggregation behaviour (filtered, not blanked)."""
+    stubs = _jury_stubs(
+        {
+            "anthropic": "no Score line",  # unparseable
+            "openai": _score_response(6, rationale="adequate"),
+            "gemini": _score_response(8, rationale="strong"),
+        }
+    )
+    j = _make_jury(tmp_path, callables=stubs)
+    result = j.score(_payload())
+    vendors_in_votes = [v for v, _s, _r in result.votes]
+    assert vendors_in_votes == ["openai", "gemini"]
+
+
+def test_jury_judge_dry_run_populates_votes_with_uniform_half(tmp_path):
+    """Dry-run path: each vendor returns ContinuousScore(0.5, "[DRY-RUN]").
+    Per-vendor binarisation at >= 0.5 makes each a unanimous APPROVE; the
+    F3 majority scalar is 1.0. The per-vendor raw 0.5s are still
+    accessible via ``votes`` for any consumer that wanted the mean."""
+    j = _make_jury(tmp_path, dry_run=True)
+    result = j.score(_payload())
+    assert result.value == pytest.approx(1.0)
+    assert len(result.votes) == 3
+    for vendor, score, rationale in result.votes:
+        assert vendor in {"anthropic", "openai", "gemini"}
+        assert score == pytest.approx(0.5)
+        assert rationale == "[DRY-RUN]"
+
+
+def test_continuous_score_votes_defaults_to_empty_tuple():
+    """SingleJudge results never set ``votes``; the field defaults to
+    an empty tuple so the run-persistence layer can use ``if votes:``
+    as the "is jury" sentinel without a None branch."""
+    s = ContinuousScore(value=0.5, rationale="r")
+    assert s.votes == ()

@@ -704,3 +704,248 @@ def test_ui_app_has_no_flips_html_constant():
     assert "Content-Security-Policy" in _INSPECT_HEADERS
     # Same strict CSP posture as the report route.
     assert "default-src 'none'" in _INSPECT_HEADERS["Content-Security-Policy"]
+
+
+# ---------------------------------------------------------------------------
+# F3 — jury vote panel rendering
+# ---------------------------------------------------------------------------
+
+
+def _make_run_with_jury_votes(
+    tmp_path: Path,
+    *,
+    canonical_votes: list[dict] | None,
+    flipping_votes: list[dict] | None,
+    canonical_score: float = 0.8,
+    flipping_score: float = 0.2,
+) -> Path:
+    """Build a synthetic run dir whose judge_results carries votes_json.
+
+    Schema is the F3+ shape (v6) — votes_json is the 9th column.
+    """
+    run_dir = tmp_path / "synthetic-jury-run"
+    run_dir.mkdir()
+    manifest = {
+        "run_id": "synth-jury-0001",
+        "topology_canonical_hash": "h" * 64,
+        "topology_name": "synth",
+        "tds_version": "0.5.0",
+        "tenant_id": "local",
+        "n_variants": 2,
+        "n_eval_rows": 1,
+        "variant_canonical_hashes": [_CANONICAL_HASH, _FLIPPING_HASH],
+        "variant_orderings": [["n1", "n2"], ["n2", "n1"]],
+        "eval_ids": ["eval_001"],
+        "eval_ground_truth": [1],
+        "agent_vendors": ["google"],
+        "judge_model": "jury_of_3:deepseek+google+google_2",
+        "rubric_hash": "r" * 64,
+        "semaphore_size": 8,
+        "max_cost_usd": 1.0,
+        "cli_args": {"fixture": "x.py:build", "eval": "e.csv", "jury_of_3": True},
+        "kickoff_ts": 0,
+    }
+    (run_dir / "manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    db.execute(
+        "CREATE TABLE cells ("
+        "run_id TEXT, variant_id TEXT, eval_id TEXT, ir_canonical_hash TEXT, "
+        "node_outputs_json TEXT, error TEXT, cell_cost_usd REAL)"
+    )
+    db.execute(
+        "CREATE TABLE judge_results ("
+        "run_id TEXT, variant_id TEXT, eval_id TEXT, judge_kind TEXT, "
+        "score_value REAL, passed INTEGER, rationale TEXT, failure_reason TEXT, "
+        "votes_json TEXT)"
+    )
+    canonical_outputs = [
+        _node_output("n1", "underwriter", "Initial analysis: looks healthy."),
+        _node_output("n2", "policy_reviewer", "We recommend approving."),
+    ]
+    flipping_outputs = [
+        _node_output("n2", "policy_reviewer", "Pre-review: I see exceptions."),
+        _node_output("n1", "underwriter", "We must deny — concerning patterns."),
+    ]
+    db.executemany(
+        "INSERT INTO cells VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                "synth-jury-0001", _CANONICAL_HASH, "eval_001",
+                "ir-canonical-hash", json.dumps(canonical_outputs), None, 0.002,
+            ),
+            (
+                "synth-jury-0001", _FLIPPING_HASH, "eval_001",
+                "ir-canonical-hash-2", json.dumps(flipping_outputs), None, 0.002,
+            ),
+        ],
+    )
+    db.executemany(
+        "INSERT INTO judge_results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                "synth-jury-0001", _CANONICAL_HASH, "eval_001", "continuous",
+                canonical_score, None, "approve consensus", None,
+                json.dumps(canonical_votes) if canonical_votes is not None else None,
+            ),
+            (
+                "synth-jury-0001", _FLIPPING_HASH, "eval_001", "continuous",
+                flipping_score, None, "deny consensus", None,
+                json.dumps(flipping_votes) if flipping_votes is not None else None,
+            ),
+        ],
+    )
+    db.commit()
+    db.close()
+    return run_dir
+
+
+def test_inspect_renders_jury_panel_when_votes_json_present(tmp_path):
+    """Per-vendor votes from JuryJudge persistence path show up as a
+    jury panel in the inspect HTML; counts match the score-threshold
+    binarisation."""
+    canonical_votes = [
+        {"vendor": "google", "score": 0.85, "rationale": "Strong approve"},
+        {"vendor": "google_2", "score": 0.75, "rationale": "Approve"},
+        {"vendor": "deepseek", "score": 0.80, "rationale": "Approve"},
+    ]
+    flipping_votes = [
+        {"vendor": "google", "score": 0.25, "rationale": "Deny — risk"},
+        {"vendor": "google_2", "score": 0.30, "rationale": "Deny"},
+        # Lone dissenter approving for the flipping ordering.
+        {"vendor": "deepseek", "score": 0.65, "rationale": "Marginal approve"},
+    ]
+    run_dir = _make_run_with_jury_votes(
+        tmp_path,
+        canonical_votes=canonical_votes,
+        flipping_votes=flipping_votes,
+    )
+    html, _eid = build_inspect_html(run_dir)
+    # Panel label + per-vendor rows + APPROVE/DENY counts.
+    assert "Jury vote breakdown" in html
+    # Vendor names (rendered verbatim inside the .jury-vendor span).
+    for vendor in ("google", "google_2", "deepseek"):
+        assert vendor in html
+    # Canonical side: 3 approve / 0 deny.
+    assert "3</strong> approve" in html
+    # Flipping side: 1 approve / 2 deny (deepseek dissented).
+    assert "1</strong> approve" in html
+    assert "2</strong> deny" in html
+
+
+def test_inspect_omits_jury_panel_on_legacy_single_judge_run(tmp_path):
+    """Single-judge runs have NULL votes_json — the panel must be hidden,
+    not rendered with empty rows."""
+    run_dir = _make_run(tmp_path)  # legacy synthetic-run shape, no votes
+    html, _eid = build_inspect_html(run_dir)
+    assert "Jury vote breakdown" not in html
+
+
+def test_load_cell_falls_back_when_votes_json_column_absent(tmp_path):
+    """An older run.sqlite (schema v5, no votes_json column) must still
+    load cleanly — _load_cell's PRAGMA probe falls back to NULL."""
+    from topofuzz.inspect import _load_cell
+
+    run_dir = _make_run(tmp_path)  # uses the legacy 8-column schema
+    cell = _load_cell(run_dir, _CANONICAL_HASH, "eval_001")
+    assert cell["jury_votes"] is None
+
+
+def test_load_cell_parses_votes_json_when_present(tmp_path):
+    """When votes_json is populated, _load_cell returns the structured
+    list; entries with the wrong shape are filtered."""
+    from topofuzz.inspect import _load_cell
+
+    votes = [
+        {"vendor": "google", "score": 0.7, "rationale": "ok"},
+        # Malformed entry — missing score — must be filtered out.
+        {"vendor": "broken"},
+        {"vendor": "deepseek", "score": 0.4, "rationale": "no"},
+    ]
+    run_dir = _make_run_with_jury_votes(
+        tmp_path, canonical_votes=votes, flipping_votes=None
+    )
+    cell = _load_cell(run_dir, _CANONICAL_HASH, "eval_001")
+    assert cell["jury_votes"] == [
+        {"vendor": "google", "score": 0.7, "rationale": "ok"},
+        {"vendor": "deepseek", "score": 0.4, "rationale": "no"},
+    ]
+    # Flipping side intentionally has NULL votes_json — single-judge
+    # fallback works alongside jury cells in the same run.
+    flipping_cell = _load_cell(run_dir, _FLIPPING_HASH, "eval_001")
+    assert flipping_cell["jury_votes"] is None
+
+
+def test_jury_panel_n1_single_survivor_renders_no_tie(tmp_path):
+    """F3 RT m5 audit fix: when 2 of 3 vendors failed, the surviving
+    single vote renders without a tie label — its own verdict is the
+    majority by construction."""
+    # Single-survivor canonical vote that says APPROVE; flipping side
+    # has DENY so a flip exists for build_inspect_html to find.
+    canonical_votes = [
+        {"vendor": "google", "score": 0.85, "rationale": "approve"},
+    ]
+    flipping_votes = [
+        {"vendor": "google", "score": 0.20, "rationale": "deny"},
+    ]
+    run_dir = _make_run_with_jury_votes(
+        tmp_path,
+        canonical_votes=canonical_votes,
+        flipping_votes=flipping_votes,
+    )
+    html, _eid = build_inspect_html(run_dir)
+    # Canonical N=1 → 1 approve / 0 deny / 1 judge — strict majority, no tie.
+    assert "1</strong> approve" in html
+    assert "0</strong> deny" in html
+    assert "TIE" not in html
+
+
+def test_jury_panel_tie_renders_explicit_tie_label(tmp_path):
+    """F3 Fuzzer M2 audit fix: a deadlocked N=2 (1 approve / 1 deny)
+    jury surfaces a TIE → DENY label so the user understands the
+    headline pill came from the conservative tie default. The flipping
+    side is unanimous APPROVE so find_inspect_pair finds the flip."""
+    canonical_votes = [
+        {"vendor": "google", "score": 0.85, "rationale": "approve"},
+        {"vendor": "deepseek", "score": 0.20, "rationale": "deny"},
+    ]
+    flipping_votes = [
+        {"vendor": "google", "score": 0.85, "rationale": "approve"},
+        {"vendor": "deepseek", "score": 0.80, "rationale": "approve"},
+    ]
+    run_dir = _make_run_with_jury_votes(
+        tmp_path,
+        canonical_votes=canonical_votes,
+        flipping_votes=flipping_votes,
+        # Majority scalar matches what JuryJudge.score would persist:
+        # canonical tie → 0.0 (DENY); flipping unanimous → 1.0 (APPROVE).
+        canonical_score=0.0,
+        flipping_score=1.0,
+    )
+    html, _eid = build_inspect_html(run_dir)
+    # Canonical panel shows the TIE explicitly.
+    assert "TIE" in html
+
+
+def test_jury_votes_view_handles_n1_correctly(tmp_path):
+    """Unit test on the helper directly — N=1 strict approve produces
+    APPROVE majority_label (no tie even though total is small)."""
+    from topofuzz.inspect import _jury_votes_view
+
+    # Use markupsafe directly so we don't pull jinja2's escape.
+    pytest.importorskip("markupsafe")
+    from markupsafe import Markup, escape
+
+    view = _jury_votes_view(
+        [{"vendor": "x", "score": 0.7, "rationale": "ok"}],
+        threshold=0.5,
+        escape=escape,
+        Markup=Markup,
+    )
+    assert view is not None
+    assert view["approve_count"] == 1
+    assert view["deny_count"] == 0
+    assert view["total"] == 1
+    assert view["majority_label"] == "APPROVE"

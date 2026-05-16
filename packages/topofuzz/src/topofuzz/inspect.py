@@ -231,8 +231,15 @@ def _load_cell(
             "judge_passed": bool | None,
             "judge_score": float | None,
             "judge_rationale": str | None,
+            "jury_votes": list[dict] | None,
             "error": str | None,
         }
+
+    ``jury_votes`` is ``None`` for single-judge cells, or a list of
+    ``{"vendor": str, "score": float, "rationale": str}`` rows when the
+    judge was a :class:`JuryJudge`. The list mirrors the JuryJudge's
+    construction order; a vendor that failed to parse contributes no
+    row (the JuryJudge already filtered the unparseable ones).
 
     Raises:
         InspectError: cell missing — should never happen because the
@@ -248,8 +255,26 @@ def _load_cell(
             "WHERE variant_id=? AND eval_id=?",
             (variant_id, eval_id),
         ).fetchone()
+        # votes_json was added in schema v6 (F3 jury vote breakdown).
+        # `_load_cell` reads run.sqlite read-only — it never opens the
+        # write path that runs ``_migrate``, so a forward-compat
+        # legacy-v5 DB still has no votes_json column. Probe the column
+        # list and fall back to NULL when absent so this loader works
+        # against ANY supported schema version.
+        judge_cols = {
+            row[1]
+            for row in con.execute(
+                "PRAGMA table_info(judge_results)"
+            ).fetchall()
+        }
+        has_votes_json = "votes_json" in judge_cols
+        select_cols = (
+            "passed, score_value, rationale, votes_json"
+            if has_votes_json
+            else "passed, score_value, rationale, NULL"
+        )
         judge_row = con.execute(
-            "SELECT passed, score_value, rationale "
+            f"SELECT {select_cols} "
             "FROM judge_results "
             "WHERE variant_id=? AND eval_id=?",
             (variant_id, eval_id),
@@ -289,8 +314,9 @@ def _load_cell(
     judge_passed: bool | None = None
     judge_score: float | None = None
     judge_rationale: str | None = None
+    jury_votes: list[dict[str, Any]] | None = None
     if judge_row is not None:
-        passed_raw, score_raw, rationale_raw = judge_row
+        passed_raw, score_raw, rationale_raw, votes_json_raw = judge_row
         judge_passed = (
             bool(passed_raw) if passed_raw is not None else None
         )
@@ -300,12 +326,36 @@ def _load_cell(
         judge_rationale = (
             rationale_raw if isinstance(rationale_raw, str) else None
         )
+        if isinstance(votes_json_raw, str) and votes_json_raw:
+            try:
+                parsed = json.loads(votes_json_raw)
+            except json.JSONDecodeError:
+                # Persisted column malformed (shouldn't happen — the
+                # writer always JSON-dumps). Treat as a missing breakdown
+                # rather than failing the whole cell render — single-
+                # judge UX still works without the panel.
+                parsed = None
+            if isinstance(parsed, list):
+                # Defensive shape filter: keep only well-formed entries
+                # so a future schema drift doesn't crash the template.
+                jury_votes = [
+                    {
+                        "vendor": str(entry.get("vendor", "")),
+                        "score": float(entry.get("score", 0.0)),
+                        "rationale": str(entry.get("rationale", "")),
+                    }
+                    for entry in parsed
+                    if isinstance(entry, dict)
+                    and "vendor" in entry
+                    and "score" in entry
+                ] or None
 
     return {
         "node_outputs": node_outputs,
         "judge_passed": judge_passed,
         "judge_score": judge_score,
         "judge_rationale": judge_rationale,
+        "jury_votes": jury_votes,
         "error": cell_row[1],
     }
 
@@ -442,6 +492,93 @@ def _verdict_label(
     return "(no verdict)"
 
 
+def _jury_votes_view(
+    votes: list[dict[str, Any]] | None,
+    threshold: float,
+    escape: Any,
+    Markup: Any,
+) -> dict[str, Any] | None:
+    """Template-ready breakdown of a JuryJudge's per-vendor votes.
+
+    Returns ``None`` for single-judge cells (the template's ``{% if %}``
+    guard then hides the panel). For jury cells, returns::
+
+        {
+            "approve_count": int,
+            "deny_count": int,
+            "total": int,                 # surviving vendor count
+            "majority_label": "APPROVE" | "DENY" | "TIE",
+            "majority_class": str,         # CSS class for the badge
+            "rows": [{"vendor", "score_pct", "verdict_label",
+                      "verdict_class", "rationale_html"}, ...],
+        }
+
+    Per-vendor verdicts use the same ``score >= threshold`` binarisation
+    that drives the overall verdict pill, so the count of APPROVEs in
+    the rows matches the count the user sees in the panel header.
+
+    Fuzzer M2 audit fix: a deadlocked jury (``approve_count * 2 ==
+    total``, e.g. one vendor failed and the surviving 1/1 split) gets
+    a dedicated TIE label so the panel doesn't silently look like a
+    consensus. The headline `value` already resolved the tie to 0.0
+    (DENY) per the compliance-conservative convention; the panel just
+    spells out that the jury was deadlocked.
+
+    Rationales are escaped + risk-phrase-highlighted exactly like the
+    aggregate rationale block above so the same legend covers both.
+    """
+    if not votes:
+        return None
+    approve_count = 0
+    deny_count = 0
+    rows: list[dict[str, Any]] = []
+    for v in votes:
+        score = float(v.get("score", 0.0))
+        approved = score >= threshold
+        if approved:
+            approve_count += 1
+            verdict_class = "verdict-approve"
+            verdict_label = "APPROVE"
+        else:
+            deny_count += 1
+            verdict_class = "verdict-deny"
+            verdict_label = "DENY"
+        rationale_text = str(v.get("rationale", ""))
+        rationale_html = _render_rationale(
+            rationale_text or None, escape, Markup
+        )
+        rows.append({
+            "vendor": str(v.get("vendor", "")),
+            "score_pct": f"{score * 100:.0f}%",
+            "score_value": f"{score:.2f}",
+            "verdict_label": verdict_label,
+            "verdict_class": verdict_class,
+            "rationale_html": rationale_html,
+        })
+    total = len(rows)
+    if approve_count * 2 > total:
+        majority_label = "APPROVE"
+        majority_class = "verdict-approve"
+    elif approve_count * 2 == total:
+        # Deadlocked jury: 1/1 (one vendor failed), 1/2 (one failed),
+        # any even-total split. Resolves to DENY at the score level
+        # but the panel labels it explicitly so the user understands
+        # the headline pill came from the conservative-tie default.
+        majority_label = "TIE → DENY"
+        majority_class = "verdict-unknown"
+    else:
+        majority_label = "DENY"
+        majority_class = "verdict-deny"
+    return {
+        "approve_count": approve_count,
+        "deny_count": deny_count,
+        "total": total,
+        "majority_label": majority_label,
+        "majority_class": majority_class,
+        "rows": rows,
+    }
+
+
 def build_inspect_html(
     run_dir: Path,
     *,
@@ -531,6 +668,9 @@ def build_inspect_html(
         "rationale_html": _render_rationale(
             canonical_cell["judge_rationale"], escape, Markup
         ),
+        "jury_votes": _jury_votes_view(
+            canonical_cell["jury_votes"], threshold, escape, Markup
+        ),
         "agents": [
             {**a, "response_html": Markup(a["response_html"])}
             for a in canonical_agents
@@ -553,6 +693,9 @@ def build_inspect_html(
         ),
         "rationale_html": _render_rationale(
             flipping_cell["judge_rationale"], escape, Markup
+        ),
+        "jury_votes": _jury_votes_view(
+            flipping_cell["jury_votes"], threshold, escape, Markup
         ),
         "agents": [
             {**a, "response_html": Markup(a["response_html"])}

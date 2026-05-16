@@ -1363,7 +1363,7 @@ def test_run_writer_persists_schema_version_pragma(tmp_path):
         ver = db.execute("PRAGMA user_version").fetchone()[0]
     finally:
         db.close()
-    assert ver == 5  # v5: flip_confirmations table (noise-floor / `topofuzz confirm`)
+    assert ver == 6  # v6: judge_results.votes_json (per-vendor jury breakdown)
 
 
 def test_run_writer_resume_preserves_original_created_at(tmp_path):
@@ -2035,10 +2035,11 @@ def test_runwriter_migrates_v1_db_in_place(tmp_path):
 
     db = sqlite3.connect(str(db_path))
     try:
-        # Schema bumped v1 → v5 cascade: cost telemetry (v2) + §A runs
+        # Schema bumped v1 → v6 cascade: cost telemetry (v2) + §A runs
         # cols (v3) + rubric_hash on runs (v4 / step 9) + flip_confirmations
-        # table (v5 / noise-floor `topofuzz confirm`).
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 5
+        # table (v5 / noise-floor `topofuzz confirm`) + judge_results
+        # votes_json column (v6 / F3 jury vote breakdown).
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 6
         # v5: the flip_confirmations table exists post-migrate (created
         # by CREATE TABLE IF NOT EXISTS — no ALTER needed for a new table).
         legacy_tables = {
@@ -2048,6 +2049,15 @@ def test_runwriter_migrates_v1_db_in_place(tmp_path):
             ).fetchall()
         }
         assert "flip_confirmations" in legacy_tables
+        # v6: votes_json column landed on judge_results — NULL on legacy
+        # rows so single-judge cells from v1-v5 round-trip unchanged.
+        judge_cols_v6 = {
+            row[1]
+            for row in db.execute(
+                "PRAGMA table_info(judge_results)"
+            ).fetchall()
+        }
+        assert "votes_json" in judge_cols_v6
         # v3 + v4 runs columns landed. ``status`` defaults to
         # 'running', tenant_id to 'local', rubric_hash to ''.
         runs_cols = {
@@ -2217,7 +2227,8 @@ def _eval_row_with_truth():
 
 def test_runner_accepts_jury_judge_all_three_parse(tmp_path):
     """Soft DoD #14: a JuryJudge plugs into run_variant unchanged and the
-    Cell carries a ContinuousScore == mean of the 3 parseable votes."""
+    Cell carries a ContinuousScore. F3 majority-vote contract: votes
+    [0.4, 0.6, 0.8] binarise to [0, 1, 1] → 2-of-3 approve → 1.0."""
     topo = _toy_topology(n=1)
     judge = _stub_jury(
         tmp_path,
@@ -2239,7 +2250,7 @@ def test_runner_accepts_jury_judge_all_three_parse(tmp_path):
         )
     )
     assert isinstance(cell.judge_result, ContinuousScore)
-    assert cell.judge_result.value == pytest.approx(0.6)
+    assert cell.judge_result.value == pytest.approx(1.0)
     assert cell.judge_failure is False
     # DoD #14: vendor_overlap reflects all three vendors that produced a vote.
     assert judge.judge_independence == {
@@ -2250,7 +2261,8 @@ def test_runner_accepts_jury_judge_all_three_parse(tmp_path):
 
 def test_runner_accepts_jury_judge_one_unparseable(tmp_path):
     """1 of 3 vendors unparseable → Cell still gets a ContinuousScore
-    (mean of the surviving 2), judge_failure stays False, JuryJudge
+    (majority of the surviving 2 — both vote approve so unanimous
+    2-of-2 majority = 1.0), judge_failure stays False, JuryJudge
     accounting reflects the partial failure."""
     topo = _toy_topology(n=1)
     judge = _stub_jury(
@@ -2273,7 +2285,7 @@ def test_runner_accepts_jury_judge_one_unparseable(tmp_path):
         )
     )
     assert isinstance(cell.judge_result, ContinuousScore)
-    assert cell.judge_result.value == pytest.approx(0.7)
+    assert cell.judge_result.value == pytest.approx(1.0)
     assert cell.judge_failure is False
     assert judge.judge_failure_rate == pytest.approx(1 / 3)
     assert judge.judge_independence == {
@@ -2312,8 +2324,10 @@ def test_runner_marks_judge_failure_when_all_three_unparseable(tmp_path):
     assert judge.judge_failure_rate == 1.0
 
 
-def test_runner_jury_judge_dry_run_returns_half(tmp_path):
-    """Dry-run jury never calls any LLM — every cell gets ContinuousScore(0.5)."""
+def test_runner_jury_judge_dry_run_returns_majority_approve(tmp_path):
+    """Dry-run jury never calls any LLM. Each vendor returns
+    ContinuousScore(0.5); inclusive-threshold binarisation maps each
+    to APPROVE; 3-of-3 unanimous → majority scalar 1.0."""
     topo = _toy_topology(n=1)
 
     def boom(**_kwargs):
@@ -2345,7 +2359,7 @@ def test_runner_jury_judge_dry_run_returns_half(tmp_path):
         )
     )
     assert isinstance(cell.judge_result, ContinuousScore)
-    assert cell.judge_result.value == 0.5
+    assert cell.judge_result.value == 1.0
     assert cell.judge_failure is False
 
 
@@ -2402,7 +2416,9 @@ def test_runner_jury_judge_n10_accounting_accumulates(tmp_path):
             )
         )
         assert isinstance(cell.judge_result, ContinuousScore)
-        assert cell.judge_result.value == pytest.approx(0.7)
+        # Surviving 2/2 vendors both approve (0.6 + 0.8 each ≥ 0.5) →
+        # 2-of-2 unanimous → majority 1.0.
+        assert cell.judge_result.value == pytest.approx(1.0)
     assert judge.total_vendor_calls == 30
     assert judge.failed_vendor_calls == 10
     assert judge.judge_failure_rate == pytest.approx(1 / 3)
@@ -2460,3 +2476,146 @@ def test_litellm_model_id_non_string_passes_through() -> None:
     sentinel = object()
     assert _litellm_model_id(sentinel) is sentinel  # type: ignore[arg-type]
     assert _litellm_model_id(None) is None  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# F3 — jury votes persistence (votes_json column + traces.jsonl mirror)
+# ---------------------------------------------------------------------------
+
+
+def test_judge_row_packs_votes_json_when_continuous_score_carries_votes():
+    """``_judge_row`` returns 6 columns; the last is JSON when votes are
+    present, NULL otherwise."""
+    from topofuzz.runner import _judge_row
+
+    cell = _run(
+        run_variant(
+            _toy_topology(n=1), {"id": "e1", "input": "x"},
+            llm_callable=FakeLLM(),
+            judge=FakeJudge(
+                score_to_return=ContinuousScore(
+                    value=0.7,
+                    rationale="combined",
+                    votes=(
+                        ("gemini", 0.7, "approve"),
+                        ("deepseek", 0.6, "marginal"),
+                    ),
+                ),
+            ),
+        )
+    )
+    kind, score, passed, rationale, failure, votes_json = _judge_row(cell)
+    assert kind == "continuous"
+    assert score == pytest.approx(0.7)
+    assert passed is None
+    assert rationale == "combined"
+    assert failure is None
+    assert votes_json is not None
+    parsed = json.loads(votes_json)
+    assert parsed == [
+        {"vendor": "gemini", "score": 0.7, "rationale": "approve"},
+        {"vendor": "deepseek", "score": 0.6, "rationale": "marginal"},
+    ]
+
+
+def test_judge_row_returns_null_votes_json_for_single_judge_continuous():
+    """A ContinuousScore with the default ``votes=()`` (e.g. SingleJudge)
+    persists votes_json as NULL — readers use that as the "no jury
+    breakdown" sentinel."""
+    from topofuzz.runner import _judge_row
+
+    cell = _run(
+        run_variant(
+            _toy_topology(n=1), {"id": "e1", "input": "x"},
+            llm_callable=FakeLLM(),
+            judge=FakeJudge(
+                score_to_return=ContinuousScore(value=0.4, rationale="single"),
+            ),
+        )
+    )
+    _, _, _, _, _, votes_json = _judge_row(cell)
+    assert votes_json is None
+
+
+def test_run_writer_persists_votes_json_round_trip(tmp_path):
+    """End-to-end: write a Cell whose ContinuousScore carries votes, read
+    back the votes_json column, confirm the persisted JSON survives."""
+    topo = _toy_topology(n=1)
+    cell = _run(
+        run_variant(
+            topo, {"id": "e1", "input": "x"},
+            llm_callable=FakeLLM(),
+            judge=FakeJudge(
+                score_to_return=ContinuousScore(
+                    value=0.55,
+                    rationale="jury",
+                    votes=(
+                        ("gemini", 0.7, "ok"),
+                        ("gemini_2", 0.4, "concerns"),
+                        ("gemini_3", 0.55, "neutral"),
+                    ),
+                ),
+            ),
+        )
+    )
+    with RunWriter(tmp_path, "run-jury-1", topo) as w:
+        w.write(cell)
+    db = sqlite3.connect(str(tmp_path / "run.sqlite"))
+    try:
+        row = db.execute(
+            "SELECT score_value, votes_json FROM judge_results "
+            "WHERE run_id='run-jury-1'"
+        ).fetchone()
+    finally:
+        db.close()
+    assert row is not None
+    assert row[0] == pytest.approx(0.55)
+    parsed = json.loads(row[1])
+    assert [entry["vendor"] for entry in parsed] == [
+        "gemini", "gemini_2", "gemini_3",
+    ]
+    assert parsed[0]["score"] == pytest.approx(0.7)
+    assert parsed[2]["rationale"] == "neutral"
+
+    # And the traces.jsonl mirror carries the same data so off-line
+    # replay tooling can rebuild the breakdown without re-opening SQLite.
+    line = (tmp_path / "traces.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    record = json.loads(line)
+    assert record["judge_result"]["kind"] == "continuous"
+    assert record["judge_result"]["votes"] == parsed
+
+
+def test_judge_row_caps_votes_json_size():
+    """F3 Fuzzer m4 audit fix: when the per-vendor rationale × N pushes
+    the JSON column past _VOTES_JSON_MAX_BYTES, the packer drops the
+    rationale strings but keeps vendor + score intact — the
+    integrity-critical data."""
+    from topofuzz.runner import _VOTES_JSON_MAX_BYTES, _judge_row
+
+    huge = "x" * 20000  # well over the cap
+    cell = _run(
+        run_variant(
+            _toy_topology(n=1), {"id": "e1", "input": "x"},
+            llm_callable=FakeLLM(),
+            judge=FakeJudge(
+                score_to_return=ContinuousScore(
+                    value=1.0,
+                    rationale="joined",
+                    votes=(
+                        ("gemini", 0.7, huge),
+                        ("deepseek", 0.6, huge),
+                        ("openai", 0.55, huge),
+                    ),
+                ),
+            ),
+        )
+    )
+    _, _, _, _, _, votes_json = _judge_row(cell)
+    assert votes_json is not None
+    assert len(votes_json) <= _VOTES_JSON_MAX_BYTES
+    parsed = json.loads(votes_json)
+    # Vendor names + scores survive the trim; rationales are dropped to "".
+    assert [e["vendor"] for e in parsed] == ["gemini", "deepseek", "openai"]
+    assert [e["score"] for e in parsed] == [0.7, 0.6, 0.55]
+    for e in parsed:
+        assert e["rationale"] == ""
