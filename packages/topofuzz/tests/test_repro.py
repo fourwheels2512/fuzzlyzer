@@ -313,14 +313,14 @@ def test_cli_repro_writes_script_to_default_path(tmp_path):
 
 def test_cli_repro_no_flip_exits_1(tmp_path):
     run_dir = _make_synthetic_run(tmp_path, with_flip=False)
-    result = CliRunner(mix_stderr=False).invoke(app, ["repro", str(run_dir)])
+    result = CliRunner().invoke(app, ["repro", str(run_dir)])
     assert result.exit_code == 1
     assert "No verdict flip" in result.stderr
 
 
 def test_cli_repro_bad_run_dir_exits_2(tmp_path):
     nonexistent = tmp_path / "no-such-dir"
-    result = CliRunner(mix_stderr=False).invoke(app, ["repro", str(nonexistent)])
+    result = CliRunner().invoke(app, ["repro", str(nonexistent)])
     assert result.exit_code == 2
     assert "not a directory" in result.stderr
 
@@ -328,7 +328,7 @@ def test_cli_repro_bad_run_dir_exits_2(tmp_path):
 def test_cli_repro_reserved_flag_rejected(tmp_path):
     """Reserved-flag policy (§16 #2) applies to repro like every subcommand."""
     run_dir = _make_synthetic_run(tmp_path, with_flip=True)
-    result = CliRunner(mix_stderr=False).invoke(
+    result = CliRunner().invoke(
         app, ["repro", str(run_dir), "--sandbox", "foo"]
     )
     assert result.exit_code == 2
