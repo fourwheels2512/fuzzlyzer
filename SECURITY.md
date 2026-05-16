@@ -59,6 +59,59 @@ The DSSE envelope is byte-exact against the [`secure-systems-lab/dsse`](https://
 
 The signing-key rotation policy is published with the v0.6 key-store hardening release. Until then, the v0.5 dev-key posture is summarised inline below: a single Ed25519 key at `~/.topofuzz/dev.pem`, POSIX `chmod 0o600`, unencrypted PEM, with a `[DEV-KEY]` watermark printed by `topofuzz verify` so an operator never mistakes a local-signed attestation for a production-grade one. Production-grade key escrow (KMS / Sigstore) is a v1.0 milestone.
 
+## Standalone Reference Verifier
+
+`topofuzz verify` is the production verify path: it accepts both standard and URL-safe base64 (DSSE v1.0 MUST), re-canonicalises the parsed payload via RFC 8785 JCS, and re-binds the run directory by re-hashing `run.sqlite` and `manifest.json` against the envelope's signed copies. To verify a DSSE-signed attestation **without installing topofuzz at all**, the following script does the cryptographic core in stdlib + `cryptography`:
+
+```python
+#!/usr/bin/env python3
+# verify_dsse.py — v0.5 reference verifier for topofuzz attestations.
+# Standard base64 only; the DSSE v1.0 URL-safe MUST is handled in
+# `topofuzz verify`. No JCS round-trip; this script prints the
+# *authenticated* payload bytes for operator inspection only.
+# Deps: stdlib + cryptography. Exit 0 on first verifying signature.
+import base64, json, sys
+from pathlib import Path
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.serialization import load_pem_public_key
+
+if len(sys.argv) != 3:
+    sys.exit("usage: verify_dsse.py <envelope.json> <pubkey.pem>")
+env = json.loads(Path(sys.argv[1]).read_bytes())
+pub = load_pem_public_key(Path(sys.argv[2]).read_bytes())
+ptype = env["payloadType"].encode("utf-8")
+payload = base64.b64decode(env["payload"], validate=True)
+pae = (b"DSSEv1 " + str(len(ptype)).encode("ascii") + b" " + ptype + b" "
+       + str(len(payload)).encode("ascii") + b" " + payload)
+for s in env["signatures"]:
+    try:
+        pub.verify(base64.b64decode(s["sig"], validate=True), pae)
+    except InvalidSignature:
+        continue
+    sys.stdout.buffer.write(payload)
+    sys.exit(0)
+sys.exit(f"FAIL: no signature verified ({len(env['signatures'])} tried)")
+```
+
+What it does, in order: decodes the DSSE envelope JSON; loads a PEM public key via `cryptography.hazmat.primitives.serialization.load_pem_public_key`; reconstructs the DSSE v1.0 Pre-Authentication Encoding (`DSSEv1 SP len(type) SP type SP len(payload) SP payload`) byte-exactly; verifies each signature against the PAE and writes the authenticated payload bytes to stdout on the first match.
+
+What it deliberately omits relative to `topofuzz verify`: URL-safe base64 acceptance, the RFC 8785 JCS round-trip check, and the run-directory binding. These all live in `topofuzz verify`; the reference script keeps the cryptographic core inspectable in one screen.
+
+**Operator caveats** (the script is intentionally minimal; production verification belongs in `topofuzz verify`):
+
+- The script verifies the **first** signature in `signatures[]` that matches the supplied pubkey, without checking the signature's `keyid` field. On a multi-signer envelope this means "some signature by the supplied key passed" — not "the signer named *X* signed this." Topofuzz v0.5 emits single-signer envelopes, so this degenerates to "the published `keys/dev.pub.pem` signed this"; verify the keyid yourself before trusting an envelope you did not produce locally.
+- The script supplies the pubkey to `load_pem_public_key`, which accepts any PEM SPKI key type. Topofuzz signs with Ed25519; passing a non-Ed25519 PEM raises `TypeError` (not `InvalidSignature`) from `pub.verify(...)` and surfaces as a Python traceback. Likewise, envelopes missing `payloadType` / `payload` / `signatures` (or signature entries missing `sig`) raise `KeyError`, and a malformed base64 payload raises `binascii.Error`. **Treat any nonzero exit as verification failure** — distinguishing tamper from malformed input is out of scope for a reference verifier.
+
+To reproduce against the committed v0.5 fixture:
+
+```bash
+python verify_dsse.py \
+    packages/topofuzz/tests/fixtures/signed/attestation.json \
+    keys/dev.pub.pem | python -m json.tool
+```
+
+Exit 0 on the unmodified fixture; nonzero with no payload on stdout after flipping any byte of the envelope's base64 payload (`packages/topofuzz/tests/test_security_md_script.py` runs both paths in CI to keep this doc from drifting).
+
 ## Log Redaction
 
 Topofuzz auto-installs a redaction filter (`fuzzeval.log_redaction.SecretRedactionFilter`) on the root logger at `import fuzzeval` time. It scrubs the following patterns from log records before any handler sees them: `sk-…` (OpenAI / Anthropic / xAI dev-key formats), `xai-…`, `AKIA…` (AWS access key id), `AIza…` (Google AI Studio / Gemini), and `Bearer …` (RFC 6750 bearer tokens).
@@ -85,5 +138,6 @@ The claims above are load-bearing. Future contributors **must** keep this file i
 - The redaction filter (`packages/fuzzeval/src/fuzzeval/log_redaction.py`) — pattern additions or removals require updating **Log Redaction** above.
 - The BYO-only posture (any code in `packages/topofuzz/src/topofuzz/cli.py` that reads a credential from anywhere other than `os.environ` requires updating **API Key Handling**).
 - The on-disk secret list (any code that writes a secret to disk requires updating **API Key Handling**).
+- The DSSE PAE construction in `fuzzeval/attestation.py` — any change to envelope shape, PAE byte layout, accepted base64 alphabet, or signature algorithm (currently Ed25519 via `Ed25519Signer`; switching to Ed448 or hybrid silently breaks the reference verifier) must mirror into the **Standalone Reference Verifier** code block above (the block is content-anchored on `DSSEv1` and re-extracted by `packages/topofuzz/tests/test_security_md_script.py`).
 
 If you add any outbound HTTP path, you must also weaken the no-telemetry statement above to reflect what is now transmitted.
