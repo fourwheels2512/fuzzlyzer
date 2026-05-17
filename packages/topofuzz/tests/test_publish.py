@@ -3055,6 +3055,140 @@ def test_stage_a_extract_attribution_rows_rejects_nan_and_out_of_range():
     assert [r["name"] for r in rows] == ["good"]
 
 
+def test_stage_a_extract_attribution_rows_drops_zero_pct_rows():
+    """Pass-2 RT MAJOR M1 fold (2026-05-18 dual-audit): parseable-but-
+    zero attribution_pct rows must NOT lead the F8 consistency card
+    headline. The F7 fix established this gate for the counterfactual
+    card; the F8 surface needs the same posture so an all-zero ablation
+    (the post-Phase-2-cap-hit / all-unparseable-rejudge state) routes
+    to the vendor-concentration fallback rather than rendering
+    'The X role closed 0.0%' over a 0.0% stat."""
+    from topofuzz.publish import _extract_attribution_rows
+    rows = _extract_attribution_rows({
+        "by_node": {
+            "intake": {
+                "attribution_pct": 0.0, "is_terminal": False,
+                "flips_closed": 0, "total_meaningful": 1,
+            },
+            "risk": {
+                "attribution_pct": 0.0, "is_terminal": False,
+                "flips_closed": 0, "total_meaningful": 1,
+            },
+            "decision": {
+                "attribution_pct": 100.0, "is_terminal": True,
+                "flips_closed": 1, "total_meaningful": 1,
+            },
+        }
+    })
+    # Every non-terminal at 0% must drop; terminal is already filtered
+    # by is_terminal. Net effect: empty list → consumer falls back to
+    # vendor-concentration headline.
+    assert rows == [], (
+        f"all-zero non-terminal rows must drop from F8 attribution "
+        f"table; got: {rows!r}"
+    )
+
+
+def test_stage_a_consistency_card_surfaces_f4_attempted_but_zero_breadcrumb(
+    tmp_path,
+):
+    """Pass-2 RT MAJOR M1 fold (2026-05-18 dual-audit pass 2): when
+    ablation.json HAS a populated by_node block but every non-terminal
+    attribution_pct == 0 (so _extract_attribution_rows returns []),
+    the consistency card MUST surface a one-sentence note explaining
+    that F4 attribution ran-and-zeroed — not silently render pure
+    vendor-concentration as if F4 never ran. A CRO who opens the
+    source bundle and sees ablation.json with the same machinery
+    output would otherwise be able to point at the PDF and ask 'why
+    did you hide that?'"""
+    from topofuzz.publish import _build_consistency_card_context
+
+    ablation_zero = {
+        "n_flipping_pairs": 2,
+        "partial": False,
+        "by_node": {
+            "intake": {
+                "attribution_pct": 0.0, "is_terminal": False,
+                "flips_closed": 0, "total_meaningful": 2,
+            },
+            "risk": {
+                "attribution_pct": 0.0, "is_terminal": False,
+                "flips_closed": 0, "total_meaningful": 2,
+            },
+            "decision": {
+                "attribution_pct": 100.0, "is_terminal": True,
+                "flips_closed": 2, "total_meaningful": 2,
+            },
+        },
+    }
+    ctx = _build_consistency_card_context(
+        metadata={
+            "run_id": "stage-a-allzero-001",
+            "tds_version": "0.6.1",
+            "signed_at": "2026-05-17T16:00:00Z",
+        },
+        manifest={
+            "topology_name": "lending-4role",
+            "n_variants": 4,
+            "n_eval_rows": 1,
+            "cost_actual_usd": 3.07,
+            "cli_args": {"jury_of_3": True},
+        },
+        independence=_stage_a_independence_with_overlap() | {
+            "judge_protocol": "jury_of_3",
+        },
+        ablation=ablation_zero,
+        target_company=None,
+    )
+    # Headline falls back to vendor-concentration (because the
+    # attribution table is empty after the 0%-filter).
+    assert ctx["severity"] in {"concentrated", "stable", "degraded", "unknown"}, (
+        f"expected vendor-concentration severity; got {ctx['severity']!r}"
+    )
+    # And the F4-attempted-but-zero breadcrumb must be in
+    # vendor_independence_note.
+    note = ctx.get("vendor_independence_note") or ""
+    assert "F4 per-role attribution ran" in note, (
+        f"expected F4-attempted-but-zero breadcrumb in "
+        f"vendor_independence_note; got {note!r}"
+    )
+    assert "no non-terminal role with positive signal" in note, (
+        f"got note={note!r}"
+    )
+
+
+def test_stage_a_consistency_card_no_breadcrumb_when_ablation_absent(tmp_path):
+    """Counter-example to the M1 fold: when ablation is None / absent,
+    the F4-attempted-but-zero breadcrumb must NOT fire. Otherwise the
+    vendor-only mode lies about whether F4 ran."""
+    from topofuzz.publish import _build_consistency_card_context
+
+    ctx = _build_consistency_card_context(
+        metadata={
+            "run_id": "stage-a-no-ablation-001",
+            "tds_version": "0.6.1",
+            "signed_at": "2026-05-17T16:00:00Z",
+        },
+        manifest={
+            "topology_name": "lending-4role",
+            "n_variants": 4,
+            "n_eval_rows": 1,
+            "cost_actual_usd": 3.07,
+            "cli_args": {"jury_of_3": True},
+        },
+        independence=_stage_a_independence_with_overlap() | {
+            "judge_protocol": "jury_of_3",
+        },
+        ablation=None,
+        target_company=None,
+    )
+    note = ctx.get("vendor_independence_note") or ""
+    assert "F4 per-role attribution" not in note, (
+        f"breadcrumb must not fire when ablation is absent; got "
+        f"note={note!r}"
+    )
+
+
 def test_stage_a_build_pdf_e2e_reads_ablation_json(tmp_path):
     """build_consistency_card_pdf must auto-resolve run_dir/ablation.json
     and use it for the headline. Doesn't render Chromium (would require

@@ -1142,7 +1142,24 @@ def _extract_by_node_rows(
             continue
         if pct != pct:  # NaN
             continue
-        if pct < 0 or pct > 100:
+        if pct > 100:
+            continue
+        # Pass-2 RT MAJOR-3 fold (folded from 2026-05-18 dual-audit
+        # pass 2): the swap-pair extractor now warns on negative
+        # attribution_pct; mirror that posture here so a producer
+        # regression in the audit-wide by_node table surfaces in
+        # stderr / CI logs rather than disappearing into a silent
+        # drop. ``_extract_by_node_rows`` feeds the F7 headline picker,
+        # so a negative-pct producer bug that should have surfaced as
+        # a row could otherwise cause ``any_nonterminal_attribution``
+        # to silently flip to False and route the headline to the
+        # inconclusive branch when it shouldn't have.
+        if pct < 0:
+            _log.warning(
+                "publish: by_node[%s] has negative attribution_pct=%r; "
+                "dropping (producers should never emit negatives).",
+                name, pct,
+            )
             continue
         flips_closed = payload.get("flips_closed")
         total_meaningful = payload.get("total_meaningful")
@@ -1252,7 +1269,25 @@ def _extract_swap_pair_rows(
                 pct = pn.get("attribution_pct")
                 if isinstance(pct, bool) or not isinstance(pct, (int, float)):
                     continue
-                if pct != pct or pct < 0 or pct > 100:
+                if pct != pct or pct > 100:  # NaN or out-of-range high
+                    continue
+                # Pass-1 MINOR Mi3 fix (folded from 2026-05-18 dual-
+                # audit): emit a WARNING on negative attribution_pct
+                # before dropping, matching the existing
+                # ``negative flipping_pairs`` warning pattern at
+                # publish.py ~line 1572. Producers should never emit
+                # negative attribution_pct; logging at the dropped-row
+                # boundary lets a future producer regression surface
+                # in stderr / CI logs rather than disappearing into a
+                # silent drop.
+                if pct < 0:
+                    _log.warning(
+                        "publish: by_swap_pair[%s].by_node[%s] has "
+                        "negative attribution_pct=%r; dropping from "
+                        "drilldown (producers should never emit "
+                        "negatives).",
+                        flat_key, nid, pct,
+                    )
                     continue
                 # Pass-1 MINOR Mi5 fix: cross-reference audit-wide
                 # by_node to filter the experimental control out of
@@ -1268,6 +1303,15 @@ def _extract_swap_pair_rows(
                     continue
                 contrib_rows.append((nid, float(pct)))
         contrib_rows.sort(key=lambda x: (-x[1], x[0]))
+        # 2026-05-18 fix: drop 0% rows from the "top contributors"
+        # cell. A drilldown row of "intake 0% · risk 0%" reads to a
+        # buyer as "these agents contributed" when the truth is "no
+        # agent's removal closed any flip on this swap-pair". The
+        # by-agent attribution table on the same page still shows
+        # the same 0/0 numbers; this surface is for the buyer's "who
+        # do I look at first" eye, so it should be empty (the row's
+        # "—" sentinel) when no agent has a positive signal.
+        contrib_rows = [(n, p) for n, p in contrib_rows if p > 0.0]
         top_strs = [
             f"{_safe_dim_token(n)} {pct:.0f}%"
             for n, pct in contrib_rows[:2]
@@ -1339,6 +1383,8 @@ def _format_counterfactual_headline(
     n_canonical_pairs: int,
     topology_name: str,
     partial: bool,
+    n_ablation_points: int = 0,
+    n_ablation_points_meaningful: int = 0,
 ) -> tuple[str, str, str, str, str]:
     """Pick the headline tuple (title, lede, stat, stat_label, sub_line).
 
@@ -1346,6 +1392,16 @@ def _format_counterfactual_headline(
     LangFair / MALIBU) — NOT with the raw flip count. When attribution
     data is unavailable, falls back to a flip-rate-led headline so the
     card still renders cleanly on a degenerate / empty audit.
+
+    2026-05-18 fix: a top non-terminal agent at ``attribution_pct == 0%``
+    must NOT lead the headline as "agent X contributed most" — that
+    sentence is a buyer-visible contradiction with the 0% stat. The
+    first-branch gate now requires ``attribution_pct > 0`` to fire;
+    the all-zero subcase falls through to the inconclusive branch with
+    a lede that surfaces the inconclusive-rejudge rate when present
+    (the most common root cause: every Phase-2 leave-one-out re-judge
+    returned an unparseable verdict, e.g. ``Score: NONE`` on a HOLD
+    response, so attribution math has no usable evidence).
 
     Caveat (non-negotiable): no branch says "your model is biased".
     Copy describes signal magnitudes worth a follow-up audit.
@@ -1359,6 +1415,21 @@ def _format_counterfactual_headline(
 
     # The first swap-pair row is the most-flipping substitution.
     top_swap = swap_pair_rows[0] if swap_pair_rows else None
+
+    # 2026-05-18 fix: did any non-terminal agent close any flips at
+    # all? If every non-terminal row reports 0 attribution_pct, the
+    # leave-one-out pass produced NO usable evidence for which upstream
+    # agent drove the flip — usually because every Phase-2 re-judge
+    # returned an unparseable verdict (e.g. all 3 jury vendors emitted
+    # ``Score: NONE`` on a HOLD response). The card MUST NOT name a
+    # specific agent in that state.
+    any_nonterminal_attribution = any(
+        (not r.get("is_terminal"))
+        and isinstance(r.get("attribution_pct"), (int, float))
+        and not isinstance(r.get("attribution_pct"), bool)
+        and float(r["attribution_pct"]) > 0.0
+        for r in by_node_rows
+    )
 
     # Pass-1 MAJOR M3 fix: n_canonical_pairs == 0 means no demographic
     # markers were found in the eval set, so the generators returned
@@ -1394,7 +1465,31 @@ def _format_counterfactual_headline(
         sub_line = " · ".join(sub_parts)
         return title, lede, stat_headline, stat_label, sub_line
 
-    if top_agent and top_swap and n_flipping_pairs > 0:
+    # 2026-05-18 fix: REQUIRE top_agent attribution_pct > 0 before
+    # naming a specific agent in the headline. Without this gate, an
+    # audit where every non-terminal node closed 0 flips still selects
+    # ``by_node_rows[0]`` (sort is stable on attribution_pct desc,
+    # ties on name asc — so the alphabetically-first node wins on a
+    # full-zero tie) and renders "Agent X contributed most …" over a
+    # 0.0% stat panel. That contradiction was the buyer-PDF failure
+    # surfaced on the 2026-05-17 partial-Phase-2 lending bias run.
+    # Pass-1 MINOR Mi1 fix (folded from 2026-05-18 dual-audit):
+    # ``_extract_by_node_rows`` guarantees ``attribution_pct`` is a
+    # non-NaN float in [0, 100] on every row it returns (see lines
+    # 1141-1144 + 1158 in this file). The previous draft fold used
+    # ``... or 0.0`` to defensively coerce a hypothetical ``None``,
+    # but that short-circuit is dead code today AND silently coerces
+    # ``None`` → 0.0 if the extractor's contract ever weakens — quiet
+    # in exactly the way the 2026-05-17 buyer-PDF bug was quiet. Drop
+    # the ``or 0.0`` so a contract violation surfaces as TypeError
+    # rather than as a silent zero.
+    if (
+        top_agent
+        and top_swap
+        and n_flipping_pairs > 0
+        and any_nonterminal_attribution
+        and float(top_agent.get("attribution_pct", 0.0)) > 0.0
+    ):
         top_name = top_agent["name"]
         # Pass-1 MINOR Mi3 fix: rename ``top_pct`` → ``top_pct_str``.
         # The field carries the pre-formatted "%.1f%%" string (e.g.
@@ -1439,9 +1534,15 @@ def _format_counterfactual_headline(
         return title, lede, stat_headline, stat_label, sub_line
 
     if top_swap and n_flipping_pairs > 0:
-        # No usable by_node attribution (e.g. all meaningful results
-        # were on the terminal). Fall back to the flip-pair headline
-        # but still keep the by-agent framing in the lede.
+        # No usable by_node attribution. Two subcases:
+        #   (a) every non-terminal row had attribution_pct == 0%
+        #       (the post-2026-05-18 all-zero subcase — usually
+        #       every Phase-2 re-judge collapsed to unparseable);
+        #   (b) all meaningful results landed on the terminal node
+        #       (the original fall-through case before the all-zero
+        #       gate was added).
+        # Either way: surface the flip-pair as the headline metric
+        # and keep the by-agent framing in the lede.
         flipping_pairs = top_swap["flipping_pairs"]
         total_pairs = top_swap["total_pairs"]
         from_token = top_swap["from_token"]
@@ -1451,14 +1552,149 @@ def _format_counterfactual_headline(
             "verdict, but the leave-one-out pass did not isolate a "
             "single upstream agent."
         )
+        # 2026-05-18 fix (dual-audit pass-1 BLOCKER + MEDIUM M3 folded):
+        #
+        # The all-zero attribution branch must distinguish THREE
+        # subcases to be honest in the lede a buyer / opposing-counsel
+        # could cite:
+        #
+        # (1) ``nap > napm`` (some ablation re-judges did not produce a
+        #     usable verdict — n_ablation_points - n_ablation_points_meaningful):
+        #     attribution math has fewer signals than the per-swap-pair
+        #     flip count suggests; rerun would recover the missing
+        #     signal.
+        # (2) ``nap == napm > 0`` (every ablation re-judge WAS parseable
+        #     AND every non-terminal attribution_pct == 0): the math
+        #     ran cleanly and concluded no single non-terminal role's
+        #     removal closes any flip — responsibility likely sits on
+        #     the terminal node, is distributed below the per-role
+        #     detection floor, or genuinely cannot be attributed by
+        #     leave-one-out. NOT a tooling failure — a legitimate
+        #     finding. Buyer should NOT rerun chasing a wrong root
+        #     cause.
+        # (3) ``nap == 0`` (no ablation re-judges recorded at all,
+        #     e.g. Phase 2 cap-hit before any triple completed): the
+        #     attribution machinery never ran — different from (1) and
+        #     (2).
+        #
+        # The previous draft fold (the BLOCKER pass-1 found) overloaded
+        # all three into a single "unparseable verdict (most often a
+        # 'HOLD'-style response)" clause. That is a deposition-citation
+        # risk: ``audit.json.results[*].kind`` carries FOUR distinct
+        # non-meaningful kinds (``failed``, ``skip_no_canonical_output``,
+        # ``skip_no_counterfactual_output``, ``skip_downstream`` — see
+        # counterfactual_audit._KIND_*); only ``failed`` is an
+        # "unparseable verdict". The other three are skip-with-no-LLM-
+        # call states (canonical / CF / downstream output absent). A
+        # buyer-PDF that asserts "unparseable verdict" when the truth
+        # is "skipped because canonical output was missing" can be
+        # picked apart by a lawyer pulling the sidecar JSON.
+        inconclusive_clause = ""
+        n_inconclusive = 0
+        nap_napm_well_formed = (
+            isinstance(n_ablation_points, int)
+            and isinstance(n_ablation_points_meaningful, int)
+            and n_ablation_points >= 0
+            and n_ablation_points_meaningful >= 0
+            and n_ablation_points >= n_ablation_points_meaningful
+        )
+        if nap_napm_well_formed and n_ablation_points > 0:
+            n_inconclusive = n_ablation_points - n_ablation_points_meaningful
+            if n_inconclusive > 0:
+                inconclusive_clause = (
+                    f" {n_inconclusive} of {n_ablation_points} "
+                    "ablation re-judges did not produce a usable "
+                    "verdict (some skipped because canonical / "
+                    "counterfactual / downstream outputs never "
+                    "reached the verdict node; some returned text "
+                    "the jury could not score as approve/deny); the "
+                    "attribution math therefore has fewer signals "
+                    "than the per-swap-pair flip count suggests."
+                )
+        if not any_nonterminal_attribution and n_flipping_pairs > 0:
+            if n_inconclusive > 0:
+                # Subcase (1): math failed on some cells.
+                attribution_clause = (
+                    "By-agent attribution math could not isolate a "
+                    "single non-terminal role: every Phase-2 cell that "
+                    "DID produce a usable verdict left the flip open."
+                )
+            elif (
+                nap_napm_well_formed
+                and n_ablation_points > 0
+                and n_ablation_points_meaningful > 0
+            ):
+                # Subcase (2): math ran cleanly on every cell and
+                # produced a zero answer. This is a legitimate finding,
+                # NOT a tooling failure — the buyer should not rerun.
+                #
+                # Pass-2 RT MAJOR-2 fold (folded from 2026-05-18
+                # dual-audit pass 2): the previous draft asserted
+                # "responsibility likely sits on the terminal node"
+                # without inspecting whether the terminal row has
+                # positive attribution. When the terminal control row
+                # ALSO reports 0% (entirely non-attributable: every
+                # leave-one-out pivot left the flip open), the
+                # "terminal node" claim is unverifiable from
+                # ``audit.json.by_node`` and is a deposition-citation
+                # risk. Only surface the terminal-node hypothesis when
+                # a terminal row actually exists in by_node_rows with
+                # a positive attribution_pct; otherwise hedge cleanly
+                # on the remaining hypotheses ("distributed below the
+                # detection floor" / "non-attributable by leave-one-out
+                # on this fixture").
+                terminal_has_positive = any(
+                    r.get("is_terminal") is True
+                    and isinstance(r.get("attribution_pct"), (int, float))
+                    and not isinstance(r.get("attribution_pct"), bool)
+                    and float(r["attribution_pct"]) > 0.0
+                    for r in by_node_rows
+                )
+                if terminal_has_positive:
+                    attribution_clause = (
+                        "By-agent attribution ran on every ablation "
+                        "re-judge in this audit and no non-terminal "
+                        "role's removal closed any measured flip — "
+                        "responsibility likely sits on the terminal "
+                        "node, is distributed across roles below the "
+                        "per-role detection floor, or cannot be "
+                        "cleanly attributed by leave-one-out on this "
+                        "fixture."
+                    )
+                else:
+                    attribution_clause = (
+                        "By-agent attribution ran on every ablation "
+                        "re-judge in this audit and no non-terminal "
+                        "role's removal closed any measured flip — "
+                        "responsibility is likely distributed across "
+                        "roles below the per-role detection floor, or "
+                        "cannot be cleanly attributed by leave-one-out "
+                        "on this fixture."
+                    )
+            else:
+                # Subcase (3): nap == 0 — the attribution machinery
+                # never ran (most often Phase 2 cap-hit before any
+                # triple completed).
+                attribution_clause = (
+                    "By-agent attribution did not run on this audit "
+                    "(no ablation re-judges recorded — most often "
+                    "because Phase 2 hit `--max-cost-usd` before any "
+                    "triple completed)."
+                )
+        else:
+            attribution_clause = (
+                "By-agent attribution was inconclusive (no "
+                "non-terminal role closed enough flips to lead the "
+                "ranking)."
+            )
         # Pass-1 BLOCKER B1 fix: denominator wording per above.
         lede = (
             f"Swapping {from_token} → {to_token} flipped the verdict "
             f"{flipping_pairs} of {total_pairs} canonical attempts "
-            "across the audit. By-agent attribution was inconclusive "
-            "(no non-terminal role closed enough flips to lead the "
-            "ranking) — the drilldown table below scopes the "
-            "substitutions that did the most damage."
+            "across the audit. "
+            f"{attribution_clause}"
+            f"{inconclusive_clause} The drilldown table below scopes "
+            "the substitutions that did the most damage."
         )
         stat_headline = f"{flipping_pairs}/{total_pairs}"
         stat_label = (
@@ -1672,6 +1908,78 @@ def _build_counterfactual_card_context(
     swap_pair_rows = _extract_swap_pair_rows(audit)
     by_dim_rows = _extract_by_dim_rows(audit)
 
+    # 2026-05-18 fix: plumb the inconclusive-rejudge accounting into
+    # the headline picker so the all-zero attribution branch can
+    # surface WHY attribution is inconclusive. Both fields are
+    # already in audit.json (counterfactual_audit._write_audit_sidecar
+    # wrote ``n_ablation_points`` + ``n_ablation_points_meaningful``
+    # before 2026-05-18); read them defensively.
+    #
+    # Pass-2 RT MEDIUM-2 fold (folded from 2026-05-18 dual-audit
+    # pass 2): a missing field on an older sidecar degrades to 0
+    # (legitimate back-compat — pre-2026-05-18 producers didn't write
+    # them). But malformed types (string, float, dict, negative int)
+    # are PRODUCER BUGS and must NOT be silently coerced to 0 — that
+    # would let the subcase-3 lede ("attribution did not run; most
+    # often Phase 2 hit max-cost-usd") lie about the cause when the
+    # real cause is sidecar corruption. Match the existing
+    # ``napm > nap`` posture: corruption → render-stop with an
+    # actionable message.
+    raw_nap = audit.get("n_ablation_points")
+    raw_napm = audit.get("n_ablation_points_meaningful")
+
+    def _read_ablation_count(raw: Any, field_name: str) -> int:
+        if raw is None:
+            # Legitimate back-compat path for sidecars produced by a
+            # pre-2026-05-18 writer that never set the field.
+            return 0
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise PublishError(
+                f"audit.json[{field_name!r}] is {type(raw).__name__} "
+                f"({raw!r}); expected a non-negative int (or missing for "
+                "legacy sidecars). The sidecar was hand-edited or "
+                "produced by an incompatible writer — refusing to "
+                "publish. Rerun `topofuzz audit` against the source "
+                "run to regenerate a well-formed sidecar."
+            )
+        if raw < 0:
+            raise PublishError(
+                f"audit.json[{field_name!r}]={raw} is negative; ablation "
+                "counters are structurally non-negative. The sidecar "
+                "was hand-edited or produced by an incompatible writer "
+                "— refusing to publish. Rerun `topofuzz audit` against "
+                "the source run to regenerate a well-formed sidecar."
+            )
+        return raw
+
+    nap = _read_ablation_count(raw_nap, "n_ablation_points")
+    napm = _read_ablation_count(
+        raw_napm, "n_ablation_points_meaningful"
+    )
+    if napm > nap:
+        # Pass-1 RT MAJOR fix (folded from 2026-05-18 dual-audit):
+        # n_ablation_points_meaningful > n_ablation_points is
+        # structurally impossible from a well-formed writer — the
+        # producer at counterfactual_audit._aggregate computes
+        # n_meaningful as a count over a subset of ``results`` so by
+        # construction n_meaningful ≤ len(results) == n_ablation_points.
+        # The only way to reach this state is a hand-edited sidecar or
+        # a schema-incompatible writer. Match the F7 counter-mismatch
+        # guard pattern (see lines 1696-1723 in this file): a producer
+        # bug or sidecar corruption that mis-labels the buyer-PDF
+        # numbers must surface as a render-stop, NOT a silent log +
+        # clamp. _log.warning to stderr is invisible to a buyer reading
+        # the rendered PDF, so silently rendering would hide the
+        # corruption signal.
+        raise PublishError(
+            f"audit.json reports n_ablation_points_meaningful={napm} "
+            f"> n_ablation_points={nap}, which is structurally "
+            "impossible from a well-formed writer (meaningful is a "
+            "strict subset of total). The sidecar was hand-edited or "
+            "produced by an incompatible writer — refusing to "
+            "publish. Rerun `topofuzz audit` against the source run "
+            "to regenerate a well-formed sidecar."
+        )
     headline_title, headline_lede, stat_headline, stat_label, headline_sub = (
         _format_counterfactual_headline(
             by_node_rows=by_node_rows,
@@ -1680,6 +1988,8 @@ def _build_counterfactual_card_context(
             n_canonical_pairs=n_canonical_pairs,
             topology_name=topology_name,
             partial=partial,
+            n_ablation_points=nap,
+            n_ablation_points_meaningful=napm,
         )
     )
 
@@ -1926,7 +2236,47 @@ def _build_consistency_card_context(
                 distinct_vendor_count=distinct_vendor_count,
             )
         )
-        vendor_independence_note = ""
+        # Pass-2 RT MAJOR M1 fold (folded from 2026-05-18 dual-audit
+        # pass 2): the F7 pass-1 fold added a `pct <= 0.0` filter to
+        # ``_extract_attribution_rows`` to suppress the all-zero F4
+        # contradiction. Symmetric concern: when an ablation.json HAS
+        # a populated ``by_node`` block (non-terminal nodes present)
+        # but every parseable non-terminal attribution_pct is 0.0,
+        # the extractor returns ``[]`` → this fallback branch fires →
+        # the buyer sees a pure vendor-concentration narrative with
+        # no breadcrumb that F4 attribution ran-and-zeroed. A CRO
+        # later opens the source files, sees ``ablation.json`` with
+        # attribution machinery output, and the PDF pretends it
+        # doesn't exist — silent demotion of a signal an opposing
+        # counsel can pull from the audit bundle. Surface a single
+        # honest sentence so the buyer-PDF tracks the source state.
+        f4_attempted_but_zero = False
+        if (
+            ablation
+            and isinstance(ablation, dict)
+            and not attribution_rows
+        ):
+            ab_by_node = ablation.get("by_node")
+            if isinstance(ab_by_node, dict):
+                # Did the ablation file carry non-terminal data we
+                # could have read? Distinguishes "F4 ran and zeroed"
+                # from "F4 didn't run / by_node entirely absent".
+                f4_attempted_but_zero = any(
+                    isinstance(v, dict)
+                    and v.get("is_terminal") is not True
+                    and isinstance(v.get("attribution_pct"), (int, float))
+                    and not isinstance(v.get("attribution_pct"), bool)
+                    for v in ab_by_node.values()
+                )
+        if f4_attempted_but_zero:
+            vendor_independence_note = (
+                "F4 per-role attribution ran on this audit and "
+                "produced no non-terminal role with positive "
+                "signal — see ablation.json. The headline below is "
+                "the vendor-concentration finding."
+            )
+        else:
+            vendor_independence_note = ""
         headline_sub_line = f"Jury-vote failure rate: {failure_rate_str}"
 
     # F8 RT pass-1 M10: whitelist the CSS class to a known severity
@@ -2079,7 +2429,20 @@ def _extract_attribution_rows(
         # mis-emitted attribution value that would render as "nan%".
         if pct != pct:  # NaN
             continue
-        if pct < 0 or pct > 100:
+        if pct > 100:
+            continue
+        # Pass-2 RT MAJOR-3 fold (folded from 2026-05-18 dual-audit
+        # pass 2): mirror the swap-pair extractor's warn-on-negative
+        # posture so a producer regression that mis-signs F4
+        # attribution surfaces in stderr / CI rather than being
+        # silently dropped into the vendor-concentration fallback.
+        if pct < 0:
+            _log.warning(
+                "publish: ablation.by_node[%s] has negative "
+                "attribution_pct=%r; dropping from F8 attribution "
+                "table (producers should never emit negatives).",
+                name, pct,
+            )
             continue
         flips_closed = payload.get("flips_closed")
         total_meaningful = payload.get("total_meaningful")
@@ -2092,6 +2455,26 @@ def _extract_attribution_rows(
             and not isinstance(total_meaningful, bool)
             and total_meaningful == 0
         ):
+            continue
+        # Pass-1 RT MAJOR M1 fix (folded from 2026-05-18 dual-audit
+        # silent-failure-hunter): the F7 counterfactual card just
+        # gained an all-zero attribution gate (line ~1442) because a
+        # parseable-but-zero attribution_pct rendering as "the X agent
+        # contributed most …" over a "0.0%" stat is a buyer-visible
+        # contradiction. The F8 Stage A consistency card has the
+        # IDENTICAL silent-failure shape via this extractor: if every
+        # ablation.by_node row has parseable-but-zero attribution_pct
+        # (the post-Phase-2-cap-hit / all-rejudges-unparseable state),
+        # the row list stays non-empty, the F4 attribution headline
+        # wins in _build_consistency_card_context, and the consistency
+        # card PDF renders e.g. "The intake role closed 0 of 1
+        # ablation-eligible verdict flips (0.0%)" with the actually-
+        # informative vendor-concentration narrative demoted to a
+        # notes block. Drop 0%-attribution rows here so the consumer
+        # falls back to the vendor-concentration headline whenever no
+        # non-terminal role has a positive signal — same posture as
+        # the F7 fix.
+        if float(pct) <= 0.0:
             continue
         rows.append({
             "name": _safe_role_name(name),

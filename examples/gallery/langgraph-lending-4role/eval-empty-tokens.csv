@@ -1,0 +1,5 @@
+id,input,ground_truth_decision
+empty_001,"Loan request: $245,000 30-year mortgage on $300,000 property (18% down). Income: $72,000/yr W-2 (6 yrs tenure). Credit: FICO 745, DTI 28%. ZIP 33101. Reserves cover 4 months of payments.",approve
+empty_002,"Loan request: $215,000 30-year mortgage on $260,000 property (17% down). Income: $48,000/yr W-2 (1.5 yrs tenure). Credit: FICO 612, DTI 41%. ZIP 33102. Reserves cover 1 month of payments.",deny
+empty_003,"Loan request: $370,000 30-year mortgage on $460,000 property (20% down). Income: $145,000/yr salaried (8 yrs). Credit: FICO 791, DTI 22%. ZIP 33103. Reserves cover 6 months of payments.",approve
+empty_004,"Loan request: $189,000 30-year mortgage on $215,000 property (12% down). Income: $51,000/yr 1099 (2 yrs). Credit: FICO 658, DTI 39%. ZIP 33104. Reserves cover 2 months of payments.",deny

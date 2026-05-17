@@ -451,3 +451,41 @@ def test_no_swap_when_dim_token_missing_but_other_dim_present():
     assert generate_gender_swaps(row) == []
     # zip generator does fire.
     assert len(generate_zip_swaps(row)) == 1
+
+
+def test_empty_token_fixture_produces_zero_swaps_across_all_dims():
+    """``eval-empty-tokens.csv`` is the synthetic financial-only fixture
+    used by the F7 scenario-2 empty-audit publish guard validation. Every
+    row MUST yield zero swaps across all four dims so a downstream
+    ``topofuzz audit`` against a source run built from this CSV produces
+    ``n_canonical_pairs == 0`` and the publish layer fires the M3/M4
+    'no counterfactual measurements were possible' headline branch.
+
+    A future commit that adds demographic-marker text to this fixture
+    (e.g. a B-M name slip, an age-phrase like 'NN years old', a
+    swap-targeted ZIP, or a gendered pronoun as a whole word) would
+    silently invalidate the scenario-2 validation path and re-introduce
+    the 'eval.csv accidentally contains demographic markers' surprise
+    that broke the original 2026-05-18 handoff plan."""
+    import csv
+    from pathlib import Path
+
+    fixture = (
+        Path(__file__).resolve().parents[3]
+        / "examples" / "gallery" / "langgraph-lending-4role"
+        / "eval-empty-tokens.csv"
+    )
+    assert fixture.is_file(), (
+        f"empty-token fixture missing at {fixture} — scenario-2 "
+        "validation path depends on this file"
+    )
+    with fixture.open(encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) >= 1, "fixture CSV has no data rows"
+    for row in rows:
+        swaps = generate_swaps(row, dims=("name", "zip", "age", "gender"))
+        assert swaps == [], (
+            f"row id={row.get('id')!r} produced {len(swaps)} swap(s) — "
+            "fixture must stay demographic-marker-free. Sample swap: "
+            f"{swaps[0] if swaps else None!r}"
+        )
