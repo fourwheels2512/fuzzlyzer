@@ -314,7 +314,7 @@ def test_prompt_summary_contains_key_terms(
     assert "Business Source License" in text
     assert "USD $100,000" in text
     assert "four years" in text
-    assert "licensing-TBD@modelbrew.ai" in text
+    assert "kiran@modelbrew.ai" in text
     assert PROMPT in text
 
 

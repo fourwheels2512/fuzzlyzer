@@ -40,7 +40,7 @@ LICENSE_SUMMARY: str = (
     "small-scale use (annual revenue under USD $100,000 from any use of\n"
     "Topofuzz) are permitted without charge. Production use above this\n"
     "threshold, or offering Topofuzz as a managed service, requires a\n"
-    "commercial license — contact licensing-TBD@modelbrew.ai.\n"
+    "commercial license — contact kiran@modelbrew.ai.\n"
     "Each version converts to the Apache License 2.0 four years after\n"
     "its release date. Full license text in the LICENSE file in your\n"
     "installation directory.\n"

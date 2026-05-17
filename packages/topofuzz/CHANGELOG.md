@@ -19,7 +19,7 @@ placeholder version and are not separately enumerated.
   Licensed Work) remain permitted without charge. Production use
   beyond that threshold, or offering Topofuzz as a managed service,
   requires a commercial license — contact
-  `licensing-TBD@modelbrew.ai`. Each release auto-converts to Apache
+  `kiran@modelbrew.ai`. Each release auto-converts to Apache
   2.0 four years after publication. Full terms in `LICENSE` (root and
   per-package).
   Historical 0.5.x versions (including `0.5.0rc1`) were released under

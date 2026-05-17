@@ -16,7 +16,7 @@ academic research, and small-scale commercial use (annual revenue
 under USD $100,000) are **permitted without charge**. Production use
 beyond that threshold, or offering `fuzzeval` as a managed service,
 requires a commercial license — contact
-**licensing-TBD@modelbrew.ai**. Each release converts to Apache 2.0
+**kiran@modelbrew.ai**. Each release converts to Apache 2.0
 four years after publication. Full terms in [LICENSE](LICENSE).
 
 ## API Keys (BYO)

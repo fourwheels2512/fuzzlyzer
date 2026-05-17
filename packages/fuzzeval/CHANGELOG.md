@@ -17,7 +17,7 @@ placeholder version and are not separately enumerated.
   Same terms as topofuzz: non-production / academic / small-scale
   commercial use (under USD $100,000 annual gross revenue) remain
   permitted without charge; production-scale use requires a commercial
-  license — contact `licensing-TBD@modelbrew.ai`. Each release
+  license — contact `kiran@modelbrew.ai`. Each release
   auto-converts to Apache 2.0 four years after publication. Full
   terms in `LICENSE`. Version 0.1.0 was released under the Apache
   License, Version 2.0, and remains under that license as published —

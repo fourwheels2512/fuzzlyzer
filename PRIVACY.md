@@ -25,4 +25,4 @@ You can verify this posture yourself:
 
 ## Contact
 
-**privacy-TBD@modelbrew.ai**
+**kiran@modelbrew.ai**

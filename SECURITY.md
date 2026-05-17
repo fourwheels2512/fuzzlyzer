@@ -13,11 +13,11 @@ Security fixes are published only for the current release line. At any given tim
 
 ## Reporting a Vulnerability
 
-Email: **security-TBD@modelbrew.ai**
+Email: **kiran@modelbrew.ai**
 
 Response SLA: acknowledge within 72 hours; coordinated-disclosure window 90 days from acknowledgment.
 
-PGP key: **[TBD — fingerprint will be published here]**
+PGP key: Available on request via **kiran@modelbrew.ai**
 
 Please include: topofuzz version, affected component (`topofuzz`, `fuzzeval`, `topofuzz publish`, `topofuzz verify`, etc.), reproduction steps, and a suggested fix if you have one.
 
