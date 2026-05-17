@@ -533,7 +533,7 @@ def test_audit_async_flipping_triple_runs_leave_one_out(tmp_path):
     judge = MockJuryJudge(scores_queue=[0.0, 1.0, 0.0, 1.0])
     fake_llm = FakeLLM(response_text="HYBRID APPROVE")
 
-    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge):
+    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         from topofuzz.runner import Cell, NodeOutput
         nodes = [
             NodeOutput(
@@ -648,7 +648,7 @@ def test_audit_async_non_flipping_triple_skips_leave_one_out(tmp_path):
     judge = MockJuryJudge(scores_queue=[0.9])
     fake_llm = FakeLLM()
 
-    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge):
+    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         from topofuzz.runner import Cell, NodeOutput
         nodes = [
             NodeOutput(
@@ -738,7 +738,7 @@ def test_audit_async_max_canonical_evals_truncates(tmp_path):
     judge = MockJuryJudge(scores_queue=[0.9, 0.9, 0.9, 0.9])
     fake_llm = FakeLLM()
 
-    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge):
+    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         from topofuzz.runner import Cell, NodeOutput
         nodes = [
             NodeOutput(
@@ -833,7 +833,7 @@ def test_audit_async_dry_run_writes_sidecar_without_llm(tmp_path):
         llm_was_called = True
         raise AssertionError("dry-run path must not call LLM")
 
-    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge):
+    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         # Dry-run: caller passes our explode_llm; we just don't invoke
         # it. Produce canonical-aligned outputs + a 0.9 judge score so
         # no flip triggers.
@@ -931,7 +931,7 @@ def test_audit_async_consecutive_failures_abort(tmp_path):
     async def always_boom(**kwargs):
         raise RuntimeError("simulated programmer bug")
 
-    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge):
+    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         from topofuzz.runner import Cell, NodeOutput
         nodes = [
             NodeOutput(
@@ -1020,7 +1020,7 @@ def test_audit_async_cancellation_propagates(tmp_path):
     async def cancel_llm(**kwargs):
         raise asyncio.CancelledError()
 
-    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge):
+    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         from topofuzz.runner import Cell, NodeOutput
         nodes = [
             NodeOutput(
@@ -1114,7 +1114,7 @@ def test_audit_async_cost_cap_soft_warn_and_hard_stop(tmp_path, caplog):
     # Need 5 phase-1 judgments. All non-flipping (so no phase-2).
     judge = MockJuryJudge(scores_queue=[0.9] * 5)
 
-    async def expensive_run_variant(variant_ir, eval_row, *, llm_callable, judge):
+    async def expensive_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         # Each node reports a high cost so cap trips quickly.
         from topofuzz.runner import Cell, NodeOutput
         nodes = [
@@ -1587,7 +1587,7 @@ def test_pass1_b1_flip_rate_denominator_uses_phase1_attempts(tmp_path):
     )
     fake_llm = FakeLLM(response_text="HYBRID")
 
-    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge):
+    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         from topofuzz.runner import Cell, NodeOutput
         nodes = [
             NodeOutput(
@@ -1655,7 +1655,7 @@ def test_pass1_b2_cost_cap_trips_mid_triple(tmp_path):
     judge = MockJuryJudge(scores_queue=[0.0, 1.0, 1.0, 1.0, 1.0])
     fake_llm = FakeLLM(response_text="HYBRID")
 
-    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge):
+    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         from topofuzz.runner import Cell, NodeOutput
         nodes = [
             NodeOutput(
@@ -1749,7 +1749,7 @@ def test_pass1_b3_phase1_jury_cost_charged(tmp_path):
     cf_row = {"id": "x", "input": "Greg Walsh applied."}
     topo = _toy_topology(n_nodes=3)
 
-    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge):
+    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         nodes = tuple(
             NodeOutput(
                 node_id=n.id, role=n.role, response_text="x",
@@ -1797,7 +1797,7 @@ def test_pass1_b4_unpriced_call_tracked_and_floor_applied(tmp_path):
     judge = MockJuryJudge(scores_queue=[0.0, 1.0, 1.0])
     fake_llm = FakeLLM(response_text="HYBRID")
 
-    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge):
+    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         from topofuzz.runner import Cell, NodeOutput
         nodes = [
             NodeOutput(
@@ -1963,7 +1963,7 @@ def test_pass1_m8_terminal_substitute_skips_jury(tmp_path):
     judge = MockJuryJudge(scores_queue=[0.0, 1.0])
     fake_llm = FakeLLM(response_text="HYBRID")
 
-    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge):
+    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         from topofuzz.runner import Cell, NodeOutput
         nodes = [
             NodeOutput(
@@ -2081,7 +2081,7 @@ def test_pass1_m10_empty_canonical_response_skipped(tmp_path):
     judge = MockJuryJudge(scores_queue=[0.0, 1.0])
     fake_llm = FakeLLM(response_text="HYBRID")
 
-    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge):
+    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         from topofuzz.runner import Cell, NodeOutput
         nodes = [
             NodeOutput(
@@ -2191,7 +2191,7 @@ def test_audit_async_substituted_input_reaches_run_variant(tmp_path):
     # one of these; we assert the swapped name shows up in its input.
     captured_eval_rows: list[dict[str, Any]] = []
 
-    async def recording_run_variant(variant_ir, eval_row, *, llm_callable, judge):
+    async def recording_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         from topofuzz.runner import Cell, NodeOutput
         captured_eval_rows.append(dict(eval_row))
         nodes = [
@@ -2304,7 +2304,7 @@ def test_audit_async_substituted_input_byte_distinct_from_canonical(tmp_path):
     fake_llm = FakeLLM()
     captured_eval_rows: list[dict[str, Any]] = []
 
-    async def recording_run_variant(variant_ir, eval_row, *, llm_callable, judge):
+    async def recording_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         from topofuzz.runner import Cell, NodeOutput
         captured_eval_rows.append(dict(eval_row))
         nodes = [
@@ -2517,7 +2517,7 @@ def test_pass2_m2a_generate_swaps_value_error_skips_only_offending_row(
 
     monkeypatch.setattr(ca_mod, "generate_swaps", selective_boom)
 
-    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge):
+    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         from topofuzz.runner import Cell, NodeOutput
         nodes = [
             NodeOutput(
@@ -2627,7 +2627,7 @@ def test_pass2_m2b_run_counterfactual_cell_vendor_flake_recoverable(
 
     call_count = {"n": 0}
 
-    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge):
+    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         call_count["n"] += 1
         if call_count["n"] <= 2:
             raise RuntimeError("vendor flake")
@@ -2728,7 +2728,7 @@ def test_pass2_m2b_run_counterfactual_cell_sustained_outage_aborts(
         for eid in eval_ids
     }
 
-    async def always_boom(variant_ir, eval_row, *, llm_callable, judge):
+    async def always_boom(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         raise RuntimeError("vendor outage")
 
     import topofuzz.runner as runner_mod
@@ -2780,7 +2780,7 @@ def test_pass2_rt_m3_phase2_unpriced_uses_higher_fallback(tmp_path):
     judge = MockJuryJudge(scores_queue=[0.0, 1.0, 1.0])
     fake_llm = FakeLLM(response_text="HYBRID")
 
-    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge):
+    async def fake_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
         from topofuzz.runner import Cell, NodeOutput
         nodes = [
             NodeOutput(
@@ -2838,3 +2838,302 @@ def test_pass2_rt_m3_phase2_unpriced_uses_higher_fallback(tmp_path):
             f"{_PHASE2_TERMINAL_REEXEC_FALLBACK_USD + _JURY_COST_FALLBACK_FLOOR_USD:.4f} "
             f"(Phase-2 fallback $0.05 + jury floor $0.03)."
         )
+
+
+# ---------------------------------------------------------------------------
+# F7 Phase-2 cache-architecture fix (BACKLOG BLOCKER, 2026-05-17)
+#
+# Phase-1 path: prior implementation called ``run_variant`` without
+# ``model_served_version_resolver=default_resolver`` — every Phase-1
+# cell against a Gemini-canonical model logged a
+# ``model_served_version_resolver returned ... but provider served ...``
+# warning AND cache-missed because the cache was keyed on the canonical
+# ID while the response was served under the bare ID.
+#
+# Phase-2 path: ``_leave_one_out_for_triple`` called ``_call_llm``
+# directly with no LLMCache plumbing — every Phase-2 terminal re-exec
+# was full-priced on every warm rerun. A ``--max-cost-usd 6`` budget
+# spent ~$4 on Phase-2 with zero re-run amortization.
+#
+# These two tests pin the fix in place: Phase-1 emits zero
+# resolver-mismatch warnings on a Gemini happy path, AND Phase-2's
+# terminal re-exec cache-hits on a warm rerun against the same source
+# run identity.
+# ---------------------------------------------------------------------------
+
+
+def _setup_audit_run_for_cache_tests(
+    tmp_path: Path,
+    *,
+    canonical_id: str,
+    eval_id: str = "eval_001",
+) -> Path:
+    """Lay down a minimal source run dir that drives a single Phase-1
+    counterfactual cell + one Phase-2 LOO triple. Canonical row's score
+    is 0.9 (APPROVE); the Phase-1 judge stub will return 0.0 (DENY) on
+    the counterfactual to force a flip; the Phase-2 jury will return
+    1.0 to close the flip.
+    """
+    run_dir = tmp_path / "cache-run"
+    run_dir.mkdir()
+    (run_dir / "manifest.json").write_text(json.dumps({
+        "run_id": "cache-001",
+        "variant_canonical_hashes": [canonical_id],
+        "variant_orderings": [["n0", "n1", "n2"]],
+        "eval_ids": [eval_id],
+        "cli_args": {
+            "fixture": "x.py:build_graph", "eval": "e.csv",
+            "rng_seed": 0, "variants": 1, "jury_of_3": True,
+            "rubric": "rubric.txt",
+        },
+    }), encoding="utf-8")
+    canonical_outputs = [
+        _make_node_output_dict("n0", response_text="canonical n0"),
+        _make_node_output_dict("n1", response_text="canonical n1"),
+        _make_node_output_dict("n2", response_text="canonical APPROVE"),
+    ]
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    db.execute(
+        "CREATE TABLE judge_results ("
+        "run_id TEXT, variant_id TEXT, eval_id TEXT, judge_kind TEXT, "
+        "score_value REAL, passed INTEGER, rationale TEXT, "
+        "failure_reason TEXT, votes_json TEXT)"
+    )
+    db.execute(
+        "CREATE TABLE cells ("
+        "run_id TEXT, variant_id TEXT, eval_id TEXT, "
+        "ir_canonical_hash TEXT, node_outputs_json TEXT, error TEXT, "
+        "cell_cost_usd REAL)"
+    )
+    db.execute(
+        "INSERT INTO judge_results VALUES ('cache-001', ?, ?, "
+        "'continuous', 0.9, NULL, NULL, NULL, NULL)",
+        (canonical_id, eval_id),
+    )
+    db.execute(
+        "INSERT INTO cells VALUES ('cache-001', ?, ?, '', ?, NULL, NULL)",
+        (canonical_id, eval_id, json.dumps(canonical_outputs)),
+    )
+    db.commit()
+    db.close()
+    return run_dir
+
+
+def test_audit_phase1_uses_default_resolver_no_mismatch_warning_on_gemini(
+    tmp_path, caplog,
+):
+    """Phase-1 regression: with the F7 cache-architecture fix in place,
+    Phase-1 counterfactual cells call ``run_variant`` with
+    ``model_served_version_resolver=default_resolver``. A 1-cell audit
+    against a Gemini-canonical model whose provider serves the bare ID
+    must produce ZERO ``model_served_version_resolver returned ...
+    but provider served ...`` warnings.
+
+    Mirrors :func:`test_runner_with_default_resolver_emits_no_mismatch_warning_on_gemini`
+    one layer up; the prior implementation hardcoded
+    ``_identity_resolver`` at the Phase-1 site, so the warning fired
+    once per Phase-1 cell (a 50-cell sweep produced 50 identical
+    warning lines).
+    """
+    import logging
+
+    canonical_id = "c" * 64
+    run_dir = _setup_audit_run_for_cache_tests(
+        tmp_path, canonical_id=canonical_id
+    )
+    topo = _toy_topology(n_nodes=3)  # uses google/gemini-2.5-flash
+    canonical_row = {"id": "eval_001", "input": "Greg Walsh applied."}
+
+    # Phase-1 judge: 0.0 forces a flip (canonical was 0.9 APPROVE → cf
+    # is 0.0 DENY). Phase-2 jury: 1.0 closes the flip on each upstream
+    # re-exec.
+    judge = MockJuryJudge(scores_queue=[0.0, 1.0, 1.0])
+    # FakeLLM responds with the bare gemini ID — the canonical/served
+    # mismatch case the resolver was added to fix.
+    fake_llm = FakeLLMServingBareGeminiID(response_text="HYBRID approve")
+
+    with caplog.at_level(logging.WARNING, logger="topofuzz.runner"):
+        summary = asyncio.run(_audit_async(
+            run_dir=run_dir,
+            run_id="cache-001",
+            variant_ids=[canonical_id],
+            by_hash={canonical_id: topo},
+            canonical_eval_rows_by_id={"eval_001": canonical_row},
+            dims=("name",),
+            max_cost_usd=None,
+            max_canonical_evals=None,
+            judge=judge,
+            llm_callable=fake_llm,
+            dry_run=False,
+        ))
+
+    mismatch_warnings = [
+        rec for rec in caplog.records
+        if (
+            "but provider served" in rec.getMessage()
+            and "resolver" in rec.getMessage().lower()
+        )
+    ]
+    assert mismatch_warnings == [], (
+        "Phase-1 audit cell must propagate default_resolver — saw "
+        f"{len(mismatch_warnings)} resolver-mismatch warning(s):\n"
+        + "\n".join(rec.getMessage() for rec in mismatch_warnings)
+    )
+
+    # Sanity: the Phase-1 cell actually ran (so we know the absence of
+    # warnings isn't because no LLM call happened).
+    assert summary.n_canonical_pairs == 1
+    assert summary.n_flipping_pairs == 1
+
+
+def test_audit_phase2_leave_one_out_caches_terminal_reexec(tmp_path):
+    """Phase-2 regression: when an LLMCache is supplied, the second
+    audit invocation against the same source run AND the same cache
+    must cache-hit on the Phase-2 terminal re-execution. Pre-fix:
+    ``_leave_one_out_for_triple`` called ``_call_llm`` directly with
+    no cache plumbing, so warm reruns billed every Phase-2 call again.
+
+    The test counts FakeLLM.calls before and after the second
+    invocation; with caching the count must NOT increase across the
+    second pass (Phase-2 LLM calls cache-hit).
+    """
+    pytest.importorskip("diskcache")
+    from fuzzeval.cache import LLMCache
+
+    canonical_id = "c" * 64
+    run_dir = _setup_audit_run_for_cache_tests(
+        tmp_path, canonical_id=canonical_id
+    )
+    topo = _toy_topology(n_nodes=3)
+    canonical_row = {"id": "eval_001", "input": "Greg Walsh applied."}
+
+    cache_dir = tmp_path / "audit-cache"
+    cache = LLMCache(cache_dir)
+    try:
+        # First invocation: cold cache. Phase-1 + Phase-2 both call
+        # the LLM fresh.
+        judge1 = MockJuryJudge(scores_queue=[0.0, 1.0, 1.0])
+        fake_llm = FakeLLMServingBareGeminiID(response_text="HYBRID approve")
+        summary1 = asyncio.run(_audit_async(
+            run_dir=run_dir,
+            run_id="cache-001",
+            variant_ids=[canonical_id],
+            by_hash={canonical_id: topo},
+            canonical_eval_rows_by_id={"eval_001": canonical_row},
+            dims=("name",),
+            max_cost_usd=None,
+            max_canonical_evals=None,
+            judge=judge1,
+            llm_callable=fake_llm,
+            dry_run=False,
+            llm_cache=cache,
+        ))
+        cold_call_count = len(fake_llm.calls)
+        assert summary1.n_flipping_pairs == 1
+        assert cold_call_count > 0, "cold pass must have made LLM calls"
+
+        # How many of those are Phase-2 terminal re-execs? With a 3-node
+        # topology, Phase-2 walks (n0, n1) as reexecute_terminal AND n2
+        # as substitute_terminal (no LLM call). So Phase-2 produces 2
+        # terminal re-exec LLM calls.
+        n_phase2_reexec_cold = sum(
+            1 for r in summary1.results
+            if r.kind == "reexecute_terminal"
+        )
+        assert n_phase2_reexec_cold == 2, (
+            f"test setup wrong: expected 2 reexec_terminal rows, got "
+            f"{n_phase2_reexec_cold}"
+        )
+
+        # Second invocation: warm cache. Phase-1 cells cache-hit (via
+        # run_variant's existing cache path). Phase-2 LOO cache-hits
+        # via the new wrapper. Use a fresh judge queue (jury is NOT
+        # cached by this fix — out of scope per BACKLOG entry).
+        judge2 = MockJuryJudge(scores_queue=[0.0, 1.0, 1.0])
+        # Reset the LLM-call counter so we measure ONLY the warm pass.
+        fake_llm.calls.clear()
+        summary2 = asyncio.run(_audit_async(
+            run_dir=run_dir,
+            run_id="cache-001",
+            variant_ids=[canonical_id],
+            by_hash={canonical_id: topo},
+            canonical_eval_rows_by_id={"eval_001": canonical_row},
+            dims=("name",),
+            max_cost_usd=None,
+            max_canonical_evals=None,
+            judge=judge2,
+            llm_callable=fake_llm,
+            dry_run=False,
+            llm_cache=cache,
+        ))
+
+        warm_call_count = len(fake_llm.calls)
+        assert summary2.n_flipping_pairs == 1
+        assert warm_call_count == 0, (
+            "F7 Phase-2 cache regression: warm rerun produced "
+            f"{warm_call_count} LLM calls; expected 0. The cache "
+            "plumbing in _leave_one_out_for_triple is broken — "
+            "Phase-2 terminal re-execs are being billed on every "
+            "warm pass instead of hitting the LLMCache."
+        )
+
+        # Each warm-pass Phase-2 reexec row's cost_usd must equal the
+        # jury-floor exactly: exec_cost is $0 on cache hit (we didn't
+        # pay the vendor again), so the only contribution is the
+        # ``_JURY_COST_FALLBACK_FLOOR_USD`` charged in the per-row
+        # bookkeeping. NOT comparing total_cost_usd across passes —
+        # Phase-1 cache-hits fall back to the per-node $0.01 floor in
+        # ``_run_counterfactual_cell`` (cell.node_outputs[*].cost_usd
+        # is None on cache hit, so the per-cell summation hits the
+        # fallback path), which can make the warm total higher than
+        # the cold total for trivially-cheap FakeLLM token counts.
+        # That's a Phase-1 accounting quirk unrelated to this fix.
+        from topofuzz.counterfactual_audit import _JURY_COST_FALLBACK_FLOOR_USD
+
+        warm_reexec_rows = [
+            r for r in summary2.results if r.kind == "reexecute_terminal"
+        ]
+        assert warm_reexec_rows, "warm pass produced no reexec rows"
+        for r in warm_reexec_rows:
+            assert r.cost_usd == pytest.approx(
+                _JURY_COST_FALLBACK_FLOOR_USD
+            ), (
+                f"F7 Phase-2 cache regression: warm-pass reexec row "
+                f"cost_usd=${r.cost_usd:.4f}; expected exactly "
+                f"${_JURY_COST_FALLBACK_FLOOR_USD:.4f} (jury floor only, "
+                "exec_cost=$0 on cache hit). A non-zero exec_cost "
+                "means the cache was missed on the warm pass."
+            )
+    finally:
+        cache.close()
+
+
+@dataclass
+class FakeLLMServingBareGeminiID:
+    """Like FakeLLM but the served ``model`` field is the bare ID.
+
+    Google AI Studio's real behavior: the request goes out as
+    ``google/gemini-2.5-flash`` but the response's ``model`` field
+    carries just ``gemini-2.5-flash``. This is the exact shape that
+    the resolver-mismatch warning fires on with ``_identity_resolver``
+    and gets silenced with ``default_resolver``.
+    """
+
+    response_text: str = "[MOCK terminal output]"
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    async def __call__(self, **kwargs: Any) -> dict:
+        self.calls.append(kwargs)
+        requested = kwargs.get("model", "")
+        # Strip the canonical ``google/`` prefix to mimic AI Studio's
+        # served-id behavior. If a different vendor's prefix shows up,
+        # passthrough.
+        served = (
+            requested[len("google/"):]
+            if requested.startswith("google/") else requested
+        )
+        return {
+            "choices": [{"message": {"content": self.response_text}}],
+            "model": served,
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }

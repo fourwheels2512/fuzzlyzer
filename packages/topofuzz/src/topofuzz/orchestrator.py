@@ -91,22 +91,40 @@ class _ResolverMismatchDedupFilter(logging.Filter):
 
 
 def install_resolver_mismatch_dedup() -> _ResolverMismatchDedupFilter:
-    """Attach (or reset) the dedup filter on the runner's logger.
+    """Attach (or reset) the dedup filter on the runner + audit loggers.
 
     Returns the filter so a caller (typically tests) can detach it.
     On every call the filter's ``_seen`` set is cleared so back-to-back
-    ``execute_run`` invocations in the same process don't inherit each
-    other's deduped messages (audit m-2). The runner logger is module-
-    scoped (``topofuzz.runner``) so the filter does not leak to
-    unrelated loggers.
+    ``execute_run`` / ``run_audit_pass`` invocations in the same
+    process don't inherit each other's deduped messages (audit m-2).
+
+    Pass-2 RT M-A fix: the F7 audit Phase-2 path emits the same
+    resolver-mismatch warning shape on a different logger
+    (``topofuzz.counterfactual_audit``) — Python logging filters are
+    attached per-logger, NOT inherited by parent/child, so installing
+    only on the runner's logger let the audit path emit
+    ``n_flipping_triples × upstream_nodes`` worth of un-deduped spam
+    against a stale-resolver-map vendor. Attach the SAME filter
+    instance to both loggers so ``_seen`` is shared across phases.
     """
-    runner_log = logging.getLogger("topofuzz.runner")
-    for existing in runner_log.filters:
-        if isinstance(existing, _ResolverMismatchDedupFilter):
-            existing._seen.clear()
-            return existing
     f = _ResolverMismatchDedupFilter()
-    runner_log.addFilter(f)
+    targets = (
+        logging.getLogger("topofuzz.runner"),
+        logging.getLogger("topofuzz.counterfactual_audit"),
+    )
+    for target_log in targets:
+        existing_filter: _ResolverMismatchDedupFilter | None = None
+        for existing in target_log.filters:
+            if isinstance(existing, _ResolverMismatchDedupFilter):
+                existing_filter = existing
+                break
+        if existing_filter is not None:
+            existing_filter._seen.clear()
+            # Reuse the already-attached filter so the shared ``_seen``
+            # set spans whichever logger gets the warning first.
+            f = existing_filter
+        else:
+            target_log.addFilter(f)
     return f
 
 

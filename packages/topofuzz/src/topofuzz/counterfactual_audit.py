@@ -61,13 +61,18 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from fuzzeval.canonical import canonical_hash
 
 from topofuzz.counterfactual import (
     ALL_DIMS,
     CounterfactualSwap,
     generate_swaps,
 )
+
+if TYPE_CHECKING:  # pragma: no cover — type-only import
+    from fuzzeval.cache import LLMCache
 
 _log = logging.getLogger(__name__)
 
@@ -515,6 +520,7 @@ def run_audit_pass(
     llm_callable: Any = None,
     fixture_override: str | None = None,
     dry_run: bool = False,
+    llm_cache: LLMCache | None = None,
 ) -> CounterfactualAuditSummary:
     """Run the counterfactual audit on a source run.
 
@@ -538,6 +544,14 @@ def run_audit_pass(
             counterfactual run becomes a no-op (same outputs as canonical
             → no flips), so dry-run cannot exercise the leave-one-out
             path. Use for plumbing tests + cost preflight only.
+        llm_cache: Optional :class:`fuzzeval.cache.LLMCache` consulted by
+            BOTH Phase-1 (via ``run_variant``) and Phase-2 (around the
+            terminal re-execution ``_call_llm`` site). Caller is
+            responsible for opening AND closing the cache — the CLI
+            wraps both in a ``try/finally`` block; tests construct
+            fresh per-tmp_path caches. Defaults to ``None`` (no
+            caching, every call hits the vendor), which preserves the
+            historical behavior for callers that haven't been updated.
 
     Raises:
         AuditError: manifest / run.sqlite missing / malformed; the source
@@ -650,6 +664,7 @@ def run_audit_pass(
             judge=judge,
             llm_callable=llm_callable,
             dry_run=dry_run,
+            llm_cache=llm_cache,
         )
     )
 
@@ -761,8 +776,18 @@ async def _audit_async(
     judge: Any,
     llm_callable: Any,
     dry_run: bool,
+    llm_cache: LLMCache | None = None,
 ) -> CounterfactualAuditSummary:
-    """Phase-1: run counterfactual cells; Phase-2: leave-one-out per flip."""
+    """Phase-1: run counterfactual cells; Phase-2: leave-one-out per flip.
+
+    F7 Phase-2 cache-architecture fix (BACKLOG BLOCKER): when
+    ``llm_cache`` is supplied, both Phase-1 (via ``run_variant``) and
+    Phase-2 (via the wrapped ``_call_llm`` site) consult it under the
+    §7 6-tuple identity. ``default_resolver`` is wired automatically so
+    Phase-1 cells cache under the resolver-predicted served version
+    (eliminating the canonical/served mismatch warning + cache miss
+    that the prior implementation logged on every Gemini call).
+    """
     from fuzzeval.costest import cost_for_call
 
     from topofuzz.runner import (
@@ -771,6 +796,8 @@ async def _audit_async(
         _default_prompt,
         _extract_text_and_served,
         _extract_usage,
+        _safe_resolve,
+        default_resolver,
         run_variant,
     )
 
@@ -804,6 +831,20 @@ async def _audit_async(
     # sidecar can warn that total_cost_usd is a lower bound.
     n_unpriced_calls = 0
     unpriced_models: set[str] = set()
+    # F7 Phase-2 cache-architecture fix: track Phase-2 LLM cache hit /
+    # miss counts so the CLI / future PDF builder can disclose cache
+    # effectiveness. Only the Phase-2 terminal re-exec site is wrapped
+    # in this fix; Phase-1 caching is delegated to runner.py's cache
+    # accounting (cell.node_outputs[*].cache_hit) and isn't aggregated
+    # here. Surfaced via log line at end of pass.
+    # Pass-2 RT M3 fix: ``defaultdict(int)`` instead of read-then-write
+    # dict so the in-driver increments at the cache-hit / cache-miss
+    # sites are single-op (``cache_stats["hits"] += 1``) — read-once
+    # semantics make the intent obvious and survive a future
+    # ``asyncio.gather`` parallelization of Phase-2 triples without
+    # silent undercount on contention.
+    from collections import defaultdict
+    cache_stats: dict[str, int] = defaultdict(int)
 
     # Pass-1 BLOCKER B2 fix: cost tracker is a mutable list (1-element)
     # so closures over it see the LIVE total. The prior implementation
@@ -952,6 +993,8 @@ async def _audit_async(
                             llm_callable=llm_callable,
                             dry_run=dry_run,
                             run_variant=run_variant,
+                            llm_cache=llm_cache,
+                            model_served_version_resolver=default_resolver,
                         )
                     except (
                         KeyboardInterrupt,
@@ -1084,12 +1127,16 @@ async def _audit_async(
                 _default_prompt=_default_prompt,
                 _extract_text_and_served=_extract_text_and_served,
                 _extract_usage=_extract_usage,
+                _safe_resolve=_safe_resolve,
                 NodeOutput=NodeOutput,
                 cost_for_call=cost_for_call,
                 consecutive_failures=consecutive_failures,
                 cap_hit_cb=_cap_hit,
                 cost_tracker=cost_tracker,
                 unpriced_state=unpriced_state,
+                llm_cache=llm_cache,
+                model_served_version_resolver=default_resolver,
+                cache_stats=cache_stats,
             )
         )
         n_unpriced_calls = unpriced_state["count"]
@@ -1101,6 +1148,23 @@ async def _audit_async(
         # cap, mark partial — same shape as the prior implementation.
         if _cap_hit():
             partial = True
+
+    # F7 Phase-2 cache-architecture fix: log cache effectiveness once
+    # per pass so operators can see whether warm reruns are actually
+    # amortizing. Skipped when no cache is wired (the historical
+    # behavior; nothing to report).
+    if llm_cache is not None:
+        total_lookups = cache_stats["hits"] + cache_stats["misses"]
+        if total_lookups > 0:
+            hit_rate_pct = (cache_stats["hits"] / total_lookups) * 100.0
+            _log.info(
+                "audit: Phase-2 terminal re-exec cache — %d hits, %d "
+                "misses (%.1f%% hit rate across %d lookups).",
+                cache_stats["hits"],
+                cache_stats["misses"],
+                hit_rate_pct,
+                total_lookups,
+            )
 
     summary = _aggregate(
         results=tuple(results),
@@ -1151,6 +1215,8 @@ async def _run_counterfactual_cell(
     llm_callable: Any,
     dry_run: bool,
     run_variant: Any,
+    llm_cache: LLMCache | None = None,
+    model_served_version_resolver: Any = None,
 ) -> tuple[Any, float]:
     """Run the variant against ``cf_row`` and return (Cell, total_cost_usd).
 
@@ -1169,12 +1235,42 @@ async def _run_counterfactual_cell(
     FLOOR_USD`` per cell whose ``judge_result`` is populated so the
     cost cap accounts for jury spend at the same order of magnitude
     F4 ablation does.
+
+    Phase-2 cache-architecture fix (BACKLOG BLOCKER): thread
+    ``llm_cache`` + ``model_served_version_resolver`` into ``run_variant``
+    so Phase-1 cells (a) cache-hit on warm reruns against the same source
+    run, and (b) cache under the resolver-predicted served version
+    (e.g. ``gemini-2.5-flash`` rather than ``google/gemini-2.5-flash``)
+    so subsequent lookups against the bare ID Google AI Studio actually
+    serves don't mismatch and re-call. Both kwargs are optional —
+    callers that don't supply them keep the historical "every call
+    hits the vendor" behavior. Resolver kwarg is only propagated when
+    non-None so tests that monkey-patch ``run_variant`` with a fake
+    signature continue to work via the absorbed ``**_kwargs``.
+
+    Monkey-patch contract (pass-2 RT N3): :func:`_audit_async` imports
+    ``default_resolver`` at function-call time from
+    :mod:`topofuzz.runner`. A test that does
+    ``monkeypatch.setattr(runner_mod, "default_resolver", None)`` will
+    cause this function to call ``run_variant`` without the resolver
+    kwarg — equivalent to the pre-fix behavior. That is by design
+    (the audit cache key set always uses ``_safe_resolve`` with a
+    bare-identity fallback at the Phase-2 site, so audit + runner
+    keys stay aligned in either monkey-patched state).
     """
+    extra: dict[str, Any] = {}
+    if llm_cache is not None:
+        extra["llm_cache"] = llm_cache
+    if model_served_version_resolver is not None:
+        extra["model_served_version_resolver"] = (
+            model_served_version_resolver
+        )
     cell = await run_variant(
         variant_topology,
         cf_row,
         llm_callable=llm_callable,
         judge=judge,
+        **extra,
     )
     cost = 0.0
     for o in cell.node_outputs:
@@ -1203,12 +1299,16 @@ async def _leave_one_out_for_triple(
     _default_prompt: Any,
     _extract_text_and_served: Any,
     _extract_usage: Any,
+    _safe_resolve: Any,
     NodeOutput: Any,
     cost_for_call: Any,
     consecutive_failures: int,
     cap_hit_cb: Any,
     cost_tracker: list[float],
     unpriced_state: dict[str, Any],
+    llm_cache: LLMCache | None = None,
+    model_served_version_resolver: Any = None,
+    cache_stats: dict[str, int] | None = None,
 ) -> tuple[list[CounterfactualAuditResult], int]:
     """Run leave-one-out for one (variant, canonical_eval, cf_eval) triple.
 
@@ -1432,13 +1532,109 @@ async def _leave_one_out_for_triple(
             prompt = _default_prompt(
                 terminal_node, cf_row, tuple(hybrid_prior)
             )
+            # F7 Phase-2 cache-architecture fix (BACKLOG BLOCKER):
+            # build a §7-shape identity for the terminal re-exec and
+            # try the LLMCache before billing the vendor. The prior
+            # implementation called ``_call_llm`` directly with no
+            # cache plumbing, so EVERY warm rerun against the same
+            # source run was full-priced — a ``--max-cost-usd 6``
+            # budget on a 4-row × 2-variant × 4-dim audit spent
+            # ~$4 on Phase-2 terminal re-execs alone, with zero
+            # amortization across reruns. Identity slot semantics
+            # mirror :func:`topofuzz.runner.run_variant` so a cell
+            # cached by the source run path round-trips on the
+            # audit Phase-2 path when the hybrid-prior happens to
+            # match the source's prior verbatim (rare, but free
+            # when it does). Cache is OFF when ``llm_cache is None``
+            # (the historical behavior; preserved for tests +
+            # callers that explicitly want every call live).
+            ir_hash = variant_topology.canonical_hash()
+            prompt_hash = canonical_hash(prompt)
+            # Pass-2 CR-M1 fix: always route through ``_safe_resolve``
+            # — when no resolver is supplied, fall back to the runner's
+            # ``_identity_resolver`` shape so the audit cache key matches
+            # the runner cache key bit-for-bit. The prior direct read
+            # of ``terminal_node.llm_config.model`` was equivalent in
+            # the happy path but diverged from runner.py:512-518's path
+            # the moment a model field carried surprising content
+            # (whitespace, leading slash, empty string) — silent key
+            # drift without ``_safe_resolve``'s string-shape guard.
+            effective_resolver = (
+                model_served_version_resolver
+                if model_served_version_resolver is not None
+                else (lambda m: m)
+            )
+            predicted_served = _safe_resolve(
+                effective_resolver,
+                terminal_node.llm_config.model,
+            )
+            identity = {
+                "ir_canonical_hash": ir_hash,
+                "node_id": terminal_node.id,
+                "llm_config_hash": (
+                    terminal_node.llm_config.canonical_hash()
+                ),
+                "prompt_hash": prompt_hash,
+                "model_served_version": predicted_served,
+            }
+            # Pass-2 RT MAJOR M1 fix: a corrupt diskcache row OR an
+            # OSError from a full disk during ``llm_cache.get(identity)``
+            # used to propagate uncaught — aborting the audit with a
+            # bare traceback at 0 % progress on a real-money pass.
+            # Narrow-except + "treat as miss" mirrors the spirit of
+            # :func:`topofuzz.runner._safe_resolve` (degrade-loudly).
+            cached_bytes: bytes | None = None
+            if llm_cache is not None and not dry_run:
+                try:
+                    cached_bytes = llm_cache.get(identity)
+                except (OSError, sqlite3.DatabaseError, TypeError) as e:
+                    _log.warning(
+                        "audit: Phase-2 cache read failed for "
+                        "(variant=%s, eval=%s, dim=%s, node=%s) — "
+                        "treating as miss: %s: %s",
+                        variant_id[:8], cf_eval_id, dim, node_id,
+                        type(e).__name__, e,
+                    )
+                    cached_bytes = None
+
             try:
                 if dry_run:
+                    # Pass-2 RT MINOR M5 note: Phase-2 is unreachable
+                    # under dry_run today (Phase-1 cf cells are no-ops
+                    # → no flips → no triple → no LOO). The branch is
+                    # defensive: pins the contract so a future dry_run
+                    # refactor can't silently re-introduce billed calls
+                    # through this site.
                     new_terminal_text = (
                         "[DRY-RUN] terminal re-executed under audit"
                     )
                     exec_cost = 0.0
+                elif cached_bytes is not None:
+                    # Cache hit: the source run (or a prior audit
+                    # invocation under the same identity) already
+                    # paid for this call. exec_cost stays $0; the
+                    # jury still runs because JudgeCache plumbing
+                    # is out of scope for this fix (the BACKLOG
+                    # entry targets the dominant ``_call_llm``
+                    # cost specifically). unpriced_state is not
+                    # touched on cache hit — the original call
+                    # priced itself.
+                    new_terminal_text = cached_bytes.decode("utf-8")
+                    exec_cost = 0.0
+                    if cache_stats is not None:
+                        cache_stats["hits"] += 1
                 else:
+                    # Pass-2 CR-pass2-M1 fix: bump misses at the
+                    # lookup-decision point so the end-of-pass
+                    # "Phase-2 terminal re-exec cache — X hits, Y
+                    # misses" log line stays honest about cache
+                    # effectiveness even when the subsequent
+                    # ``llm_cache.set`` write fails (B1 path). The
+                    # write-failure path is then a "billed, not
+                    # cached" hint surfaced in the warning, NOT
+                    # silently dropped from the hit-rate metric.
+                    if cache_stats is not None:
+                        cache_stats["misses"] += 1
                     started = time.monotonic()
                     response = await _call_llm(
                         terminal_node, prompt, llm_callable
@@ -1446,9 +1642,32 @@ async def _leave_one_out_for_triple(
                     _latency_ms = int(
                         (time.monotonic() - started) * 1000
                     )
-                    new_terminal_text, _served = _extract_text_and_served(
-                        response
+                    new_terminal_text, actual_served = (
+                        _extract_text_and_served(response)
                     )
+                    # Pass-2 RT MAJOR M2 fix: Phase-2 had no
+                    # resolver-mismatch surface. Mirror runner.py
+                    # ~line 550-560: warn when the resolver's
+                    # predicted served-version disagrees with what
+                    # the provider actually served. Without this,
+                    # a stale ``_ANTHROPIC_SERVED_MAP`` silently
+                    # caches under the wrong key forever on the
+                    # audit path while the runner path correctly
+                    # surfaces the staleness. The dedup filter
+                    # installed at the CLI entrypoint
+                    # (:func:`install_resolver_mismatch_dedup`)
+                    # drops duplicates within the same process.
+                    if actual_served and actual_served != predicted_served:
+                        _log.warning(
+                            "model_served_version_resolver returned "
+                            "%r for request %r but provider served %r "
+                            "(Phase-2 audit re-exec). Cache is keyed on "
+                            "the resolver's prediction; update the "
+                            "resolver to return the actual served id.",
+                            predicted_served,
+                            terminal_node.llm_config.model,
+                            actual_served,
+                        )
                     inp, out = _extract_usage(response)
                     # Pass-1 BLOCKER B4 fix: distinguish "unpriced
                     # model" (cost_for_call returns None because rate
@@ -1476,6 +1695,63 @@ async def _leave_one_out_for_triple(
                         exec_cost = _PHASE2_TERMINAL_REEXEC_FALLBACK_USD
                     else:
                         exec_cost = float(priced)
+                    # Store the response under the §7-shape identity
+                    # so the next audit against this source run hits.
+                    # Pass-2 CR-M2 fix: skip the cache write on an
+                    # empty response_text (vendor timeout / quota
+                    # blip) so the next audit gets another chance at
+                    # a real response — caching empty would produce a
+                    # misleading "hit" on retry that the M10 upstream
+                    # guard already handles only on the canonical
+                    # side, not the Phase-2 re-exec side.
+                    # ``isinstance(... , str)`` is a defense-in-depth
+                    # guard — :func:`topofuzz.runner._extract_text_
+                    # and_served` already raises TypeError on non-str
+                    # content, but pinning the check here means a
+                    # future upstream contract change can't silently
+                    # poison the cache.
+                    # Pass-2 RT BLOCKER B1 fix: a successful billed
+                    # LLM call followed by a cache-write failure
+                    # (disk-full, sqlite3 lock, corrupt key)
+                    # previously fell through the broad ``except
+                    # Exception`` below and got logged as "terminal
+                    # re-exec failed" + counted against the
+                    # consecutive-failure abort gate. Real money had
+                    # already been spent; the audit incorrectly
+                    # aborted. Narrow-except + "billed result NOT
+                    # cached; rerun will re-bill" warning keeps the
+                    # audit moving and is honest about what
+                    # happened.
+                    if (
+                        llm_cache is not None
+                        and isinstance(new_terminal_text, str)
+                        and new_terminal_text
+                    ):
+                        try:
+                            llm_cache.set(
+                                identity,
+                                new_terminal_text.encode("utf-8"),
+                            )
+                        except (
+                            OSError,
+                            sqlite3.DatabaseError,
+                            TypeError,
+                        ) as e:
+                            _log.warning(
+                                "audit: Phase-2 cache write failed "
+                                "for (variant=%s, eval=%s, dim=%s, "
+                                "node=%s) — billed LLM result NOT "
+                                "cached; rerun will re-bill: %s: %s",
+                                variant_id[:8], cf_eval_id, dim,
+                                node_id, type(e).__name__, e,
+                            )
+                        # Note: ``cache_stats["misses"]`` was already
+                        # bumped at the lookup-decision point above
+                        # (CR-pass2-M1 fix), so a successful write
+                        # here is a no-op for that counter. The miss
+                        # represents "we looked up and didn't find
+                        # it", independent of whether the subsequent
+                        # write succeeded.
             except (
                 KeyboardInterrupt,
                 SystemExit,

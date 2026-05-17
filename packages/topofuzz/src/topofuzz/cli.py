@@ -2400,6 +2400,25 @@ def audit(
         "-y",
         help="Skip the confirmation prompt (the audit pass bills real LLM calls).",
     ),
+    cache_dir: Path | None = typer.Option(
+        None,
+        "--cache",
+        help=(
+            "LLMCache root. Defaults to .cache/topofuzz/audit when "
+            "omitted. Phase-1 + Phase-2 LLM calls cache-key on the §7 "
+            "6-tuple identity so warm reruns against the same source "
+            "run amortize cost. Pass --no-cache to disable."
+        ),
+    ),
+    no_cache: bool = typer.Option(
+        False,
+        "--no-cache",
+        help=(
+            "Disable Phase-1 + Phase-2 LLM caches (every call hits the "
+            "provider). Use when comparing two audits at the vendor "
+            "byte level or chasing non-determinism upstream."
+        ),
+    ),
 ) -> None:
     """Run eval-axis counterfactual audit on a source run's flips.
 
@@ -2465,6 +2484,20 @@ def audit(
         )
 
     from topofuzz.counterfactual_audit import AuditError, run_audit_pass
+    from topofuzz.orchestrator import install_resolver_mismatch_dedup
+
+    # Pass-2 RT M-A fix: install the same dedup filter the ``run``
+    # command uses. The audit path emits resolver-mismatch warnings
+    # on TWO loggers — ``topofuzz.runner`` (during Phase-1 cells'
+    # ``run_variant`` invocation) and ``topofuzz.counterfactual_audit``
+    # (during Phase-2 terminal re-execs). Without the filter a stale
+    # ``_ANTHROPIC_SERVED_MAP`` produces one warning per
+    # ``(triple, upstream_node)`` iteration — easily 60+ warning lines
+    # on a 4-row × 2-variant × 4-dim audit. ``install_resolver_mismatch_
+    # dedup`` was extended in pass-2 to attach the filter to BOTH
+    # loggers + reuse a shared ``_seen`` set so a single mismatch dedups
+    # across phases.
+    install_resolver_mismatch_dedup()
 
     # Pass-1 MAJOR M6 fix: a sub-$1 cap is itself the safeguard — the
     # cap trips before the second cell runs, so the "bills real LLM
@@ -2491,19 +2524,76 @@ def audit(
             typer.echo("Aborted.")
             raise typer.Exit(code=0)
 
-    try:
-        summary = run_audit_pass(
-            run_dir_path,
-            dims=dims,
-            max_cost_usd=max_cost_usd,
-            max_variants=max_variants,
-            max_canonical_evals=max_canonical_evals,
-            fixture_override=fixture,
-            dry_run=dry_run,
+    # F7 Phase-2 cache-architecture fix: resolve + open an LLMCache that
+    # both Phase-1 (Phase-1 counterfactual cells via ``run_variant``) and
+    # Phase-2 (terminal re-exec at ``_call_llm``) consult. Lifetime is
+    # bounded by this CLI invocation: opened here, closed in the
+    # ``finally`` block so a SIGINT mid-audit doesn't leak a diskcache
+    # handle. Dry-run + ``--no-cache`` both short-circuit cache
+    # construction; lookups against ``None`` are no-ops in the audit
+    # driver so the runtime behavior is identical to pre-fix.
+    # Pass-2 RT M4 fix: surface the ``--no-cache`` + ``--cache <path>``
+    # asymmetry the same way the ``run`` command does. A user who
+    # passes BOTH flags is expressing two intents at once; silently
+    # discarding the cache_dir value is the kind of "did the user
+    # know?" surprise that bites operators reviewing copy-pasted
+    # invocations. Mirror cli.py's ``run`` warning shape.
+    user_supplied_cache = cache_dir is not None
+    if (no_cache or dry_run) and user_supplied_cache:
+        reason = "dry_run" if dry_run else "--no-cache"
+        typer.echo(
+            f"INFO: {reason} disables Phase-1 + Phase-2 caches; the "
+            f"--cache {str(cache_dir)!r} you supplied is ignored.",
+            err=True,
         )
-    except AuditError as e:
-        typer.echo(f"topofuzz audit: {e}", err=True)
-        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+    effective_cache_dir = (
+        None
+        if (no_cache or dry_run)
+        else (cache_dir if cache_dir is not None else Path(".cache/topofuzz/audit"))
+    )
+    llm_cache_obj = None
+    if effective_cache_dir is not None:
+        from fuzzeval.cache import LLMCache
+
+        # Pass-2 CR-m3 fix: ensure the cache parent exists so a fresh
+        # checkout's first ``topofuzz audit`` doesn't crash inside
+        # diskcache trying to open a non-existent path. diskcache's
+        # ``Cache.__init__`` auto-creates leaf dirs but the parent
+        # tree (e.g. ``.cache/topofuzz/audit/``) must exist first.
+        effective_cache_dir.mkdir(parents=True, exist_ok=True)
+        llm_cache_obj = LLMCache(effective_cache_dir / "llm")
+
+    try:
+        try:
+            summary = run_audit_pass(
+                run_dir_path,
+                dims=dims,
+                max_cost_usd=max_cost_usd,
+                max_variants=max_variants,
+                max_canonical_evals=max_canonical_evals,
+                fixture_override=fixture,
+                dry_run=dry_run,
+                llm_cache=llm_cache_obj,
+            )
+        except AuditError as e:
+            typer.echo(f"topofuzz audit: {e}", err=True)
+            raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+    finally:
+        # Pass-2 RT hidden-error fix: a faulty ``LLMCache.close()`` (rare
+        # — diskcache can raise OSError on a corrupt cache db at close
+        # time) must NOT shadow an in-flight AuditError / typer.Exit
+        # from the try-block, or the operator sees "close() failed"
+        # instead of the real cause. Wrap close in narrow-except.
+        if llm_cache_obj is not None:
+            try:
+                llm_cache_obj.close()
+            except Exception as e:  # noqa: BLE001 — close-best-effort
+                logging.getLogger(__name__).warning(
+                    "audit: LLMCache.close() raised %s: %s — cache "
+                    "may have leaked file handles; subsequent audit "
+                    "invocations should still work.",
+                    type(e).__name__, e,
+                )
 
     # Pass-1 MAJOR M3 fix: when no demographic markers were found in
     # the eval set the audit is a no-op AND the per-dim summary below
