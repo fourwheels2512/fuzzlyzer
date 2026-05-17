@@ -3073,7 +3073,7 @@ wheels = [
 
 [[package]]
 name = "topofuzz"
-version = "0.5.0rc1"
+version = "1.0.0"
 source = { editable = "packages/topofuzz" }
 dependencies = [
     { name = "cryptography" },

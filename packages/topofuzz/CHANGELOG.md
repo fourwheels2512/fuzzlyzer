@@ -8,12 +8,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases prior to `0.5.0rc1` were development drops on the `0.5.0.dev0`
 placeholder version and are not separately enumerated.
 
-## [Unreleased]
+## [1.0.0] — 2026-05-17
+
+First production-stable release. Engineering surface (DSSE attestation
+byte-exact against the secure-systems-lab reference, dual-audit-every-
+step discipline, 1595-test suite, F1-F8 features all shipped) earns
+the 1.0 tag. The 0.x line was a pre-release iteration; on this release
+the Trove classifier moves to `Development Status :: 5 -
+Production/Stable` and SECURITY.md `Supported Versions` table is
+rebuilt around 1.0.x.
+
+### Added
+
+- **F8 — `topofuzz publish --consistency-card OUT.pdf`.** 1-page
+  procurement-flavoured derivative of the F5 PDF / F6 CEO card. Pure
+  replay over `report.json` — no LLM spend, no `run.sqlite` required.
+  Auto-resolves `run_dir/ablation.json`: when present the headline
+  leads with **F4 per-agent attribution** (e.g., "The risk role
+  closed 7 of 11 ablation-eligible verdict flips on lending-4role
+  (63.6%)"), and the vendor-concentration narrative demotes to a
+  "Vendor independence check" notes block. When absent, the
+  vendor-concentration headline is preserved byte-for-byte for
+  back-compat. New severity `attribution` (neutral blue chip) joins
+  concentrated/degraded/stable/unknown. Dual-audit 2 passes (45
+  tests for F8 + Stage A; 1595 pass total). Leave-one-out overlap
+  semantics disclosed in the body paragraph so the demo's
+  63.6 + 60 + 54.5 = 178% does not pattern-match to "numbers don't
+  add up." `ablation.partial: true` surfaces in lede + chip sub-line
+  so a CRO who opens the source file does not catch a silent drop.
 
 ### Changed
 
+- **Version bump 0.6.0 → 1.0.0.** Engineering rigor (dual-audit-every-
+  step, DSSE byte-exact, F4 attribution validated against real
+  Gemini/DeepSeek spend, F3 jury-aware VOO, F5+F6+F8 publish surface)
+  earns the 1.0 tag. KMS-backed signing, Sigstore production keys,
+  and the GH Pages activation are explicit **v1.1** milestones — the
+  v1.0 `[DEV-KEY]` watermark on every `topofuzz verify` output is
+  honest disclosure that the local-signed attestation is not
+  production-grade. `Development Status` classifier moves Alpha → 5 -
+  Production/Stable. `SECURITY.md` `Supported Versions` table moves
+  0.5.x → 1.0.x; pre-1.0 lines marked unsupported.
+- **Contact email cleanup.** All `-TBD@modelbrew.ai` placeholders
+  (licensing / security / privacy) collapse to a single working alias
+  `kiran@modelbrew.ai` across `SECURITY.md`, `PRIVACY.md`, both
+  `LICENSE` files, `license_check.py`, and the test that pins its
+  text. PGP fingerprint `[TBD]` now reads "Available on request via
+  `kiran@modelbrew.ai`".
+- **Root LICENSE removed.** Root `/LICENSE` was an Apache 2.0 orphan
+  inherited from the deleted pramana-eval package; deleting it
+  resolves the license-declaration contradiction with the BUSL-1.1
+  `packages/*/LICENSE` files. Both packages remain BUSL-1.1 per
+  their own LICENSE files; the change is a removal of a stale file,
+  not a license change.
 - **License change from Apache 2.0 to Business Source License 1.1
-  (BUSL-1.1), effective v0.6.0.** Non-production use, internal
+  (BUSL-1.1), effective v1.0.0.** Non-production use, internal
   development, academic research, and small-scale commercial use
   (annual gross revenue under USD $100,000 from any use of the
   Licensed Work) remain permitted without charge. Production use

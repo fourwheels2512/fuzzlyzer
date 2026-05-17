@@ -32,7 +32,7 @@ other than your declared vendor API calls. See
 
 ## Status
 
-**v0.6.0.** Single-judge by default (Gemini); opt-in jury-of-3
+**v1.0.0.** Single-judge by default (Gemini); opt-in jury-of-3
 (Anthropic + OpenAI + Gemini) lives behind `--jury-of-3` and is wired
 end-to-end through the CLI, manifest, runner, and report with
 jury-aware VOO and Wilson 95% CIs.
@@ -98,10 +98,10 @@ this package.
 
 ```bash
 # Full install: LangGraph adapter + LLM SDKs + plotting + signing (~400 MB).
-pip install "topofuzz[full]==0.6.0"
+pip install "topofuzz[full]==1.0.0"
 
 # Verify-only install: cryptography + rfc8785 only — no LLM stack (~15 MB).
-pip install "topofuzz==0.6.0"
+pip install "topofuzz==1.0.0"
 ```
 
 Python 3.11+ on macOS, Linux, and Windows. Use a virtualenv.
@@ -221,7 +221,7 @@ the Python stdlib + the `cryptography` package (no `rfc8785`, no
 Pass `--jury-of-3` to fan each judge call out to Anthropic + OpenAI +
 Gemini, take the mean of parseable scores, and report
 `judge_failure_rate` + `judge_independence.vendor_overlap` separately.
-The schema is INFORMATIONAL in v0.6.0; the v1.0 promotion to a HARD
+The schema is INFORMATIONAL in v1.0.0; the v1.1 promotion to a HARD
 gate is a gate-logic change, not a schema bump.
 
 ```bash
@@ -300,7 +300,7 @@ today: `--conformance`, `--signoff`, `--judge-pool`, `--sandbox`,
   author = {Nayudu, Kiran},
   year   = {2026},
   url    = {https://github.com/kirannayudu/topofuzz},
-  version = {0.6.0}
+  version = {1.0.0}
 }
 ```
 

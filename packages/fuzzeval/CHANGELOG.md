@@ -13,7 +13,7 @@ placeholder version and are not separately enumerated.
 ### Changed
 
 - **License change from Apache 2.0 to Business Source License 1.1
-  (BUSL-1.1), effective v0.2.0 (ships alongside topofuzz v0.6.0).**
+  (BUSL-1.1), effective v0.2.0 (ships alongside topofuzz v1.0.0).**
   Same terms as topofuzz: non-production / academic / small-scale
   commercial use (under USD $100,000 annual gross revenue) remain
   permitted without charge; production-scale use requires a commercial

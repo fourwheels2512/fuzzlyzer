@@ -1,8 +1,6 @@
 [project]
 name = "topofuzz"
-# Soft launch as 0.5.0rc1; promote to 0.5.0 after smoke-test feedback per
-# project_step12b_handoff.md's lockdown decisions (2026-05-13).
-version = "0.6.0"
+version = "1.0.0"
 description = "topofuzz™: Topology Safety Fuzzer for multi-agent LLM systems"
 readme = "README.md"
 license = { text = "BUSL-1.1" }
@@ -11,7 +9,7 @@ requires-python = ">=3.11"
 authors = [{ name = "Kiran Nayudu" }]
 keywords = ["langgraph", "llm", "evaluation", "multi-agent", "topology", "fuzzing"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: Other/Proprietary License",
     "Operating System :: MacOS",

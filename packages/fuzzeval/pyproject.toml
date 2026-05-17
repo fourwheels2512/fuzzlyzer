@@ -1,8 +1,11 @@
 [project]
 name = "fuzzeval"
-# Ride alongside topofuzz v0.5.0rc1 — fuzzeval is the verify-path
-# substrate, so its 0.1.0 release covers DSSE primitives + judge
-# (single + jury) + stats + cache + costest + keys API surface.
+# Ride alongside topofuzz v1.0.0 — fuzzeval is the verify-path
+# substrate (DSSE primitives + judge (single + jury) + stats +
+# cache + costest + keys API surface). Held at 0.2.0 with its own
+# cycle because the verify-only API may still evolve as topofuzz's
+# needs do; the topofuzz v1.0 surface depends only on the stable
+# subset that fuzzeval 0.2.0 ships.
 version = "0.2.0"
 description = "fuzzeval™: shared eval infrastructure for topofuzz™ and other multi-agent eval tools"
 readme = "README.md"
@@ -12,7 +15,7 @@ requires-python = ">=3.11"
 authors = [{ name = "Kiran Nayudu" }]
 keywords = ["llm", "evaluation", "dsse", "attestation", "judge", "statistics"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: Other/Proprietary License",
     "Operating System :: MacOS",

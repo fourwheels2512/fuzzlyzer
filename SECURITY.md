@@ -6,10 +6,10 @@ Security fixes are published only for the current release line. At any given tim
 
 | Topofuzz version | Status |
 |---|---|
-| 0.5.x (current pre-release: `0.5.0rc1`) | Supported — security fixes published as point releases on this line |
-| < 0.5 | Unsupported |
+| 1.0.x | Supported — security fixes published as point releases on this line |
+| < 1.0 | Unsupported (the 0.x line was a pre-release iteration; upgrade to 1.0.x for security fixes) |
 
-(Once v0.6 ships, this table is updated in the same commit to mark v0.6.x supported and v0.5.x end-of-life.)
+(On v1.1 ship, this table is updated in the same commit to mark v1.1.x supported and v1.0.x EOL per the one-line-supported policy.)
 
 ## Reporting a Vulnerability
 
@@ -57,7 +57,7 @@ Topofuzz signs every run bundle with DSSE (Dead Simple Signing Envelope, an in-t
 
 The DSSE envelope is byte-exact against the [`secure-systems-lab/dsse`](https://github.com/secure-systems-lab/dsse) v1.0.0 reference vectors. Verification depends only on `cryptography + rfc8785` and does not require the LLM runtime stack.
 
-The signing-key rotation policy is published with the v0.6 key-store hardening release. Until then, the v0.5 dev-key posture is summarised inline below: a single Ed25519 key at `~/.topofuzz/dev.pem`, POSIX `chmod 0o600`, unencrypted PEM, with a `[DEV-KEY]` watermark printed by `topofuzz verify` so an operator never mistakes a local-signed attestation for a production-grade one. Production-grade key escrow (KMS / Sigstore) is a v1.0 milestone.
+The current v1.0 dev-key posture is summarised inline below: a single Ed25519 key at `~/.topofuzz/dev.pem`, POSIX `chmod 0o600`, unencrypted PEM, with a `[DEV-KEY]` watermark printed by `topofuzz verify` so an operator never mistakes a local-signed attestation for a production-grade one. Production-grade key escrow (KMS / Sigstore) is a v1.1 milestone with its own rotation policy ship.
 
 ## Standalone Reference Verifier
 
@@ -126,7 +126,7 @@ Log-redaction test coverage: 24 tests in `packages/fuzzeval/tests/test_log_redac
 
 None. Topofuzz transmits no acceptance event to any server.
 
-A first-run CLI click-through ships in v0.6 and will create a local-only flag file at `~/.topofuzz/license-accepted`; that file is never transmitted, and no telemetry surrounds it. Until v0.6 ships, no acceptance flag is written or read.
+A first-run CLI click-through (shipped in v1.0) creates a local-only flag file at `~/.topofuzz/license-accepted`; that file is never transmitted, and no telemetry surrounds it.
 
 ---
 
