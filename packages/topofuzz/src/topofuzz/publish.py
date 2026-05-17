@@ -904,6 +904,7 @@ def build_counterfactual_card_pdf(
     # corrupt / partially uninstalled.
     try:
         from topofuzz.counterfactual_audit import (
+            AUDIT_SIDECAR_FILENAME,
             AuditError,
             read_audit_sidecar,
         )
@@ -944,6 +945,25 @@ def build_counterfactual_card_pdf(
             "carry different denominator semantics (v1 quoted Phase-2 "
             "flipping triples; v2 quotes Phase-1 attempts) — rerun "
             "`topofuzz audit` against the source run to regenerate."
+        )
+
+    # Pass-RT-B1 fix (dual-audit, 2026-05-17): refuse to render a
+    # procurement-grade PDF off a dry-run sidecar. Under ``topofuzz
+    # audit --dry-run`` every Phase-1 agent call + jury vote is
+    # stubbed, jury verdicts pin to 0.5, and per-dim flip rates
+    # become an artifact of the source run's canonical scores rather
+    # than measured disparate-impact signal. A buyer who screenshots
+    # the resulting PDF and emails it to compliance is shipping
+    # fiction. Refuse loudly with a clear remediation path.
+    if audit.get("dry_run", False):
+        raise PublishError(
+            f"{AUDIT_SIDECAR_FILENAME} was produced by `topofuzz "
+            "audit --dry-run` (every LLM call was stubbed; per-dim "
+            "flip rates and per-node attribution are NOT measured "
+            "signal). Refusing to render a procurement-grade PDF "
+            "off stub data. Re-run `topofuzz audit <run_dir>` "
+            "without --dry-run to regenerate the sidecar before "
+            "publishing."
         )
 
     ctx = _build_counterfactual_card_context(

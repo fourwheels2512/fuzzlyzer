@@ -45,11 +45,13 @@ from topofuzz.counterfactual_audit import (  # noqa: E402
     AuditError,
     CounterfactualAuditResult,
     CounterfactualAuditSummary,
+    _DRY_RUN_STUB_RESPONSE_TEXT,
     _MAX_CONSECUTIVE_FAILURES,
     _RESPONSE_TEXT_CAP,
     _aggregate,
     _atomic_write_text,
     _audit_async,
+    _dry_run_llm_callable,
     _swap_pair_key,
     _truncate_response,
     _write_audit_sidecar,
@@ -312,6 +314,79 @@ def test_audit_sidecar_atomic_write_preserves_prior_on_crash(tmp_path, monkeypat
 
 
 # ---------------------------------------------------------------------------
+# dry_run sidecar round-trip + overwrite guard (RT-B1, 2026-05-17)
+# ---------------------------------------------------------------------------
+
+
+def _zero_summary(*, dry_run: bool) -> CounterfactualAuditSummary:
+    """Minimal zero-flips summary; used by the B1 tests below."""
+    return CounterfactualAuditSummary(
+        n_canonical_pairs=0, n_flipping_pairs=0, n_ablation_points=0,
+        n_ablation_points_meaningful=0, dims=("name",),
+        total_cost_usd=0.0, partial=False,
+        by_dim={}, by_swap_pair={}, by_node={},
+        unpriced_call_count=0, unpriced_models=(),
+        results=(), dry_run=dry_run,
+    )
+
+
+def test_dry_run_summary_writes_dry_run_field_in_sidecar(tmp_path):
+    """``dry_run`` round-trips as a top-level boolean in audit.json."""
+    _write_audit_sidecar(tmp_path, _zero_summary(dry_run=True))
+    data = read_audit_sidecar(tmp_path)
+    assert data is not None
+    assert data["dry_run"] is True
+
+
+def test_real_summary_writes_dry_run_false(tmp_path):
+    """Real audits emit ``dry_run: false``; the field is always present."""
+    _write_audit_sidecar(tmp_path, _zero_summary(dry_run=False))
+    data = read_audit_sidecar(tmp_path)
+    assert data is not None
+    assert data["dry_run"] is False
+
+
+def test_dry_run_refuses_to_overwrite_real_sidecar(tmp_path):
+    """Deposition-killer guard: a dry-run sidecar must not clobber a
+    real-money sidecar — otherwise a subsequent `topofuzz publish` would
+    render procurement-grade PDF off stub data. Path documented in the
+    2026-05-17 RT audit handoff."""
+    _write_audit_sidecar(tmp_path, _zero_summary(dry_run=False))
+    with pytest.raises(AuditError, match="real-money"):
+        _write_audit_sidecar(tmp_path, _zero_summary(dry_run=True))
+
+
+def test_real_audit_can_overwrite_dry_run_sidecar(tmp_path):
+    """The reverse direction is allowed: a buyer who preflighted with
+    --dry-run and then exports keys should be able to run the real pass
+    without manually deleting the preflight sidecar."""
+    _write_audit_sidecar(tmp_path, _zero_summary(dry_run=True))
+    _write_audit_sidecar(tmp_path, _zero_summary(dry_run=False))  # no raise
+    data = read_audit_sidecar(tmp_path)
+    assert data is not None
+    assert data["dry_run"] is False
+
+
+def test_dry_run_overwriting_dry_run_is_allowed(tmp_path):
+    """Repeated dry-run smokes against the same run_dir don't trip the
+    guard — the guard only fires when the existing sidecar is REAL."""
+    _write_audit_sidecar(tmp_path, _zero_summary(dry_run=True))
+    _write_audit_sidecar(tmp_path, _zero_summary(dry_run=True))  # no raise
+
+
+def test_dry_run_overwrites_corrupt_existing_sidecar(tmp_path):
+    """If the existing audit.json is corrupt (unparseable JSON), the
+    guard cannot read its dry_run flag — we treat that as "unknown
+    provenance" and ALLOW the overwrite, mirroring the principle that a
+    corrupt sidecar already needs regeneration. The opposite stance
+    (refuse) would brick a recovery workflow."""
+    (tmp_path / AUDIT_SIDECAR_FILENAME).write_text(
+        "{ malformed", encoding="utf-8"
+    )
+    _write_audit_sidecar(tmp_path, _zero_summary(dry_run=True))  # no raise
+
+
+# ---------------------------------------------------------------------------
 # _swap_pair_key
 # ---------------------------------------------------------------------------
 
@@ -467,6 +542,183 @@ def test_run_audit_rejects_empty_variant_hashes(tmp_path, monkeypatch):
     )
     with pytest.raises(AuditError, match="empty"):
         run_audit_pass(run_dir)
+
+
+# ---------------------------------------------------------------------------
+# dry-run is vendor-key-free (gap surfaced in 2026-05-17 E2E validation)
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_llm_callable_is_litellm_shaped_and_costless():
+    """The stub returns a LiteLLM-compatible dict that ``_extract_text_and_
+    served`` + ``_extract_usage`` parse without raising. Zero usage tokens
+    so cost-accounting stays at $0 even if a future refactor stops zeroing
+    cost at the ``_run_counterfactual_cell`` site."""
+    from topofuzz.runner import _extract_text_and_served, _extract_usage
+
+    resp = asyncio.run(
+        _dry_run_llm_callable(
+            model="google/gemini-2.5-flash",
+            messages=[{"role": "user", "content": "x"}],
+            temperature=0.0,
+            max_tokens=128,
+        )
+    )
+    text, served = _extract_text_and_served(resp)
+    in_toks, out_toks = _extract_usage(resp)
+    assert text == _DRY_RUN_STUB_RESPONSE_TEXT
+    assert served == "google/gemini-2.5-flash"
+    assert in_toks == 0
+    assert out_toks == 0
+
+
+def test_dry_run_llm_callable_constant_across_kwargs():
+    """Constant output across distinct kwargs is the invariant the Phase-2
+    dry-run short-circuit relies on (no flips → no leave-one-out work)."""
+    a = asyncio.run(
+        _dry_run_llm_callable(model="m1", messages=[], temperature=0.0)
+    )
+    b = asyncio.run(
+        _dry_run_llm_callable(
+            model="m2", messages=[{"role": "user", "content": "z"}],
+            temperature=0.7, max_tokens=999,
+        )
+    )
+    assert a["choices"][0]["message"]["content"] == b["choices"][0]["message"]["content"]
+
+
+def test_run_audit_pass_injects_dry_run_stub_when_llm_callable_is_none(
+    tmp_path, monkeypatch
+):
+    """Regression: ``topofuzz audit --dry-run`` used to fail with
+    "GEMINI_API_KEY missing / invalid" because ``run_variant`` fell back
+    to LiteLLM when ``llm_callable=None``. The fix injects
+    ``_dry_run_llm_callable`` at the ``run_audit_pass`` entry so the
+    contract ("every LLM call short-circuits to a stub") holds for every
+    caller, not just CLI."""
+    run_dir = _write_manifest_run(tmp_path, hashes=["a" * 64])
+
+    captured: dict[str, Any] = {}
+
+    async def fake_audit_async(**kwargs):
+        captured["llm_callable"] = kwargs.get("llm_callable")
+        captured["dry_run"] = kwargs.get("dry_run")
+        # Return a minimal summary so run_audit_pass returns cleanly.
+        return CounterfactualAuditSummary(
+            n_canonical_pairs=0, n_flipping_pairs=0, n_ablation_points=0,
+            n_ablation_points_meaningful=0, dims=("name",),
+            total_cost_usd=0.0, partial=False,
+            by_dim={}, by_swap_pair={}, by_node={},
+            unpriced_call_count=0, unpriced_models=(),
+            results=(),
+        )
+
+    # Bypass fixture + eval recon so we land at the _audit_async call site.
+    monkeypatch.setattr(
+        "topofuzz.confirm._reconstruct_variants",
+        lambda m, **kw: {"a" * 64: _toy_topology()},
+    )
+    monkeypatch.setattr(
+        "topofuzz.confirm._load_eval_rows_by_id",
+        lambda c, r: {"eval_001": {"id": "eval_001", "input": "x"}},
+    )
+    # Bypass JuryJudge construction (real one reads packaged rubric);
+    # not exercising the judge here.
+    monkeypatch.setattr(
+        "topofuzz.counterfactual_audit._build_jury",
+        lambda cli_args, *, dry_run: object(),
+    )
+    monkeypatch.setattr(
+        "topofuzz.counterfactual_audit._audit_async", fake_audit_async
+    )
+
+    # Clear every vendor key so a regression would surface as a
+    # vendor-auth error rather than passing silently.
+    for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
+
+    summary = run_audit_pass(run_dir, dry_run=True)
+    assert summary.n_canonical_pairs == 0  # fake_audit_async did return
+    assert captured["dry_run"] is True
+    assert captured["llm_callable"] is _dry_run_llm_callable
+
+
+def test_run_audit_pass_preserves_caller_llm_callable_under_dry_run(
+    tmp_path, monkeypatch
+):
+    """If the caller (tests, programmatic users) DOES supply an
+    llm_callable under dry_run, ``run_audit_pass`` must respect it. The
+    stub is a fallback, not an override."""
+    run_dir = _write_manifest_run(tmp_path, hashes=["a" * 64])
+    captured: dict[str, Any] = {}
+
+    async def fake_audit_async(**kwargs):
+        captured["llm_callable"] = kwargs.get("llm_callable")
+        return CounterfactualAuditSummary(
+            n_canonical_pairs=0, n_flipping_pairs=0, n_ablation_points=0,
+            n_ablation_points_meaningful=0, dims=("name",),
+            total_cost_usd=0.0, partial=False,
+            by_dim={}, by_swap_pair={}, by_node={},
+            unpriced_call_count=0, unpriced_models=(),
+            results=(),
+        )
+
+    caller_llm = FakeLLM()
+    monkeypatch.setattr(
+        "topofuzz.confirm._reconstruct_variants",
+        lambda m, **kw: {"a" * 64: _toy_topology()},
+    )
+    monkeypatch.setattr(
+        "topofuzz.confirm._load_eval_rows_by_id",
+        lambda c, r: {"eval_001": {"id": "eval_001", "input": "x"}},
+    )
+    monkeypatch.setattr(
+        "topofuzz.counterfactual_audit._build_jury",
+        lambda cli_args, *, dry_run: object(),
+    )
+    monkeypatch.setattr(
+        "topofuzz.counterfactual_audit._audit_async", fake_audit_async
+    )
+    run_audit_pass(run_dir, dry_run=True, llm_callable=caller_llm)
+    assert captured["llm_callable"] is caller_llm
+
+
+def test_run_audit_pass_non_dry_run_does_not_inject_stub(tmp_path, monkeypatch):
+    """The stub injection only fires under dry_run — a real audit must
+    surface the missing-callable failure at the vendor (or rely on
+    runner.py's default LiteLLM path) rather than silently returning
+    stub responses and producing fake numbers."""
+    run_dir = _write_manifest_run(tmp_path, hashes=["a" * 64])
+    captured: dict[str, Any] = {}
+
+    async def fake_audit_async(**kwargs):
+        captured["llm_callable"] = kwargs.get("llm_callable")
+        return CounterfactualAuditSummary(
+            n_canonical_pairs=0, n_flipping_pairs=0, n_ablation_points=0,
+            n_ablation_points_meaningful=0, dims=("name",),
+            total_cost_usd=0.0, partial=False,
+            by_dim={}, by_swap_pair={}, by_node={},
+            unpriced_call_count=0, unpriced_models=(),
+            results=(),
+        )
+
+    monkeypatch.setattr(
+        "topofuzz.confirm._reconstruct_variants",
+        lambda m, **kw: {"a" * 64: _toy_topology()},
+    )
+    monkeypatch.setattr(
+        "topofuzz.confirm._load_eval_rows_by_id",
+        lambda c, r: {"eval_001": {"id": "eval_001", "input": "x"}},
+    )
+    monkeypatch.setattr(
+        "topofuzz.counterfactual_audit._build_jury",
+        lambda cli_args, *, dry_run: object(),
+    )
+    monkeypatch.setattr(
+        "topofuzz.counterfactual_audit._audit_async", fake_audit_async
+    )
+    run_audit_pass(run_dir, dry_run=False)
+    assert captured["llm_callable"] is None
 
 
 # ---------------------------------------------------------------------------

@@ -2653,18 +2653,39 @@ def audit(
         )
     if dry_run:
         typer.echo(
-            "DRY-RUN: every counterfactual cell and jury vote was "
-            "stubbed. No flips are produced in dry-run, so the per-"
-            "node attribution table is empty by construction. Re-run "
-            "without --dry-run for measured percentages."
+            "DRY-RUN: every Phase-1 agent call and jury vote was "
+            "stubbed (no vendor keys required). Counterfactual jury "
+            "verdicts are pinned at 0.5 — any nonzero flip counts "
+            "are an artifact of the source run's canonical verdicts "
+            "that fell below the 0.5 threshold (the stub at 0.5 "
+            "reads as approve). The audit.json sidecar carries "
+            "`dry_run: true`; `topofuzz publish --counterfactual-"
+            "card` refuses to render it. Re-run without --dry-run "
+            "for measured percentages + a publishable sidecar."
         )
 
+    # Pass-RT-M1 fix (dual-audit, 2026-05-17): suppress the per-dim
+    # flip-rate table and per-node attribution table under dry-run.
+    # The RT auditor surfaced this as the screenshot vector: a buyer
+    # `tee`-ing terminal output sees four "12.50%" rows before reaching
+    # the banner caveat and reads them as measured signal. Under dry-
+    # run those rows are an artifact of canonical_score < 0.5 in the
+    # source run vs. the 0.5 stub, NOT disparate-impact measurement.
+    # Replace both tables with a single-line note.
+    if dry_run:
+        typer.echo("")
+        typer.echo(
+            "  (per-dim flip-rate and per-node attribution tables "
+            "suppressed in --dry-run; numbers would be construction "
+            "artifacts. Re-run without --dry-run for measured "
+            "percentages.)"
+        )
     # Per-dim disparate-impact summary — the lead signal for a buyer.
     # Pass-1 BLOCKER B1 fix: per-dim total_pairs is now the Phase-1
     # ATTEMPT count (every cell run), not the Phase-2 triple count.
     # Wording reads "flipped K/N (M.MM%)" so the denominator semantics
     # are unambiguous on the terminal.
-    if summary.by_dim:
+    if summary.by_dim and not dry_run:
         typer.echo("")
         typer.echo("Per-dim flip rate (flipped / canonical attempts):")
         for dim_name, slot in summary.by_dim.items():
@@ -2683,6 +2704,7 @@ def audit(
         summary.n_flipping_pairs > 0
         and not by_node_non_terminal
         and summary.by_node
+        and not dry_run
     ):
         typer.echo("")
         typer.echo(
@@ -2692,7 +2714,7 @@ def audit(
             "below is the terminal-substitution baseline (control "
             "column), not an attribution signal."
         )
-    if summary.by_node:
+    if summary.by_node and not dry_run:
         typer.echo("")
         typer.echo(
             "Per-node attribution "

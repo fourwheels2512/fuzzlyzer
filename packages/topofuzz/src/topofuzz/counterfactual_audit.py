@@ -137,6 +137,41 @@ _PHASE2_TERMINAL_REEXEC_FALLBACK_USD = 0.05
 _RESPONSE_TEXT_CAP = 8192
 
 
+# Stub response text returned by :func:`_dry_run_llm_callable` for every
+# Phase-1 agent rollout under ``dry_run=True``. Constant across all nodes,
+# variants, and swaps so every counterfactual cell produces an identical
+# terminal response — which is exactly the "no flips" invariant the
+# Phase-2 dry_run short-circuit (audit_async ~line 1601) relies on.
+_DRY_RUN_STUB_RESPONSE_TEXT = "[topofuzz audit --dry-run stub response]"
+
+
+async def _dry_run_llm_callable(**kwargs: Any) -> dict[str, Any]:
+    """LiteLLM-shaped stub injected into ``run_variant`` under dry_run.
+
+    The audit CLI's ``--dry-run`` flag is documented as "every LLM call
+    short-circuits to a stub" so a buyer can preflight the audit
+    plumbing without exporting any vendor API key. The Phase-2 terminal
+    re-exec path already short-circuits at ``_audit_async``; Phase-1
+    agent rollouts went through :func:`topofuzz.runner.run_variant`,
+    which fell back to LiteLLM when ``llm_callable=None`` — that
+    fallback is what hit Gemini and broke the contract.
+
+    Returns a dict shaped exactly like ``_extract_text_and_served`` +
+    ``_extract_usage`` expect (LiteLLM ModelResponse-compatible). Zero
+    usage tokens so cost accounting stays at $0 even before the
+    ``_run_counterfactual_cell`` ``dry_run`` overwrite (defense-in-depth:
+    if that overwrite is ever refactored out, the stub still won't
+    inflate billing).
+    """
+    return {
+        "choices": [
+            {"message": {"content": _DRY_RUN_STUB_RESPONSE_TEXT}}
+        ],
+        "model": str(kwargs.get("model", "")),
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+    }
+
+
 class AuditError(ValueError):
     """Raised when an audit pass cannot run."""
 
@@ -244,6 +279,12 @@ class CounterfactualAuditSummary:
             call fallback. Surfaced to the PDF + CLI so operators
             know which vendor's rate table needs adding to
             ``fuzzeval.costest``.
+        dry_run: True when the audit pass ran with ``--dry-run``. Serialized
+            into ``audit.json`` so downstream consumers (``topofuzz publish
+            --counterfactual-card`` first; later: in-memory dashboards)
+            can refuse to render procurement-grade artifacts off
+            stub data. Defaults to False on existing v2 sidecars (the
+            field is additive — schema_version stays at 2).
         results: per-experiment rows.
     """
 
@@ -260,6 +301,12 @@ class CounterfactualAuditSummary:
     unpriced_call_count: int
     unpriced_models: tuple[str, ...]
     results: tuple[CounterfactualAuditResult, ...]
+    # Pass-RT-B1 fix (dual-audit, 2026-05-17): carry the dry_run flag
+    # through to the sidecar so ``publish`` can refuse to render a
+    # procurement PDF off stub data. Defaulted False to keep the
+    # constructor signature backward-compatible for existing call sites
+    # that don't yet supply the flag (test helpers, in-memory callers).
+    dry_run: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +414,36 @@ def _swap_pair_key(dim: str, from_token: str, to_token: str) -> str:
 
 
 def _write_audit_sidecar(run_dir: Path, summary: CounterfactualAuditSummary) -> None:
+    # Pass-RT-B1 fix (dual-audit, 2026-05-17): refuse to overwrite a
+    # real-money sidecar with a dry-run one. Scenario the RT auditor
+    # surfaced: a buyer runs ``topofuzz audit`` (real, $4 spend, clean
+    # audit.json), then later runs ``topofuzz audit --dry-run`` (demo,
+    # forgotten-key retry, etc.). Without this gate the real sidecar
+    # gets clobbered with stub data and a subsequent ``topofuzz
+    # publish --counterfactual-card`` renders procurement-grade PDF
+    # off the stub. The guard mirrors v2 sidecars that pre-date the
+    # ``dry_run`` field by defaulting ``dry_run=False`` on missing —
+    # they were always real audits, so treating them as real here is
+    # safe. The reverse direction (real over dry-run) is always
+    # allowed: a buyer who exports keys after a dry-run preflight
+    # should be able to run the real pass without manually deleting
+    # the preflight sidecar.
+    target_path = Path(run_dir) / AUDIT_SIDECAR_FILENAME
+    if summary.dry_run and target_path.exists():
+        try:
+            existing = json.loads(target_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = None
+        if isinstance(existing, dict) and not existing.get("dry_run", False):
+            raise AuditError(
+                "audit refuses to overwrite an existing real-money "
+                f"{AUDIT_SIDECAR_FILENAME} with a --dry-run sidecar. "
+                "A subsequent `topofuzz publish` would render a "
+                "procurement PDF off stub data. Delete the existing "
+                "sidecar manually if you really want to clobber it, "
+                "or omit --dry-run to re-run the audit for real."
+            )
+
     payload = {
         "schema_version": _AUDIT_SIDECAR_SCHEMA_VERSION,
         "n_canonical_pairs": summary.n_canonical_pairs,
@@ -376,6 +453,11 @@ def _write_audit_sidecar(run_dir: Path, summary: CounterfactualAuditSummary) -> 
         "dims": list(summary.dims),
         "total_cost_usd": summary.total_cost_usd,
         "partial": summary.partial,
+        # Pass-RT-B1 fix: dry_run is an additive field — schema_version
+        # stays at 2 (v2 readers default ``data.get("dry_run", False)``
+        # to False, which is correct for any pre-fix sidecar since
+        # those were always produced by real audit runs).
+        "dry_run": summary.dry_run,
         "by_dim": summary.by_dim,
         "by_swap_pair": summary.by_swap_pair,
         "by_node": summary.by_node,
@@ -540,10 +622,19 @@ def run_audit_pass(
             in the variant; Phase-2 calls only the terminal.
         fixture_override: Path that wins over ``cli_args.fixture`` when
             the fixture has moved on disk.
-        dry_run: When True, every LLM call short-circuits to a stub. The
-            counterfactual run becomes a no-op (same outputs as canonical
-            → no flips), so dry-run cannot exercise the leave-one-out
-            path. Use for plumbing tests + cost preflight only.
+        dry_run: When True, every Phase-1 agent rollout and every jury
+            vote is stubbed (Phase-2 terminal re-execs are also stubbed
+            at the ``_audit_async`` site). Stays vendor-key-free: if the
+            caller doesn't supply ``llm_callable``, a deterministic
+            constant-response stub is injected at the
+            :func:`run_audit_pass` entry. Counterfactual jury scores
+            are pinned at 0.5 by the JuryJudge dry-run contract, so a
+            Phase-1 "flip" appears whenever the source run's stored
+            canonical_score was below the 0.5 verdict threshold (the
+            stub at 0.5 reads as approve). The leave-one-out path is
+            not meaningfully exercised — per-node attribution rows
+            other than the terminal baseline are zero by construction.
+            Use for plumbing tests + cost preflight only.
         llm_cache: Optional :class:`fuzzeval.cache.LLMCache` consulted by
             BOTH Phase-1 (via ``run_variant``) and Phase-2 (around the
             terminal re-execution ``_call_llm`` site). Caller is
@@ -651,6 +742,17 @@ def run_audit_pass(
 
     judge = _build_jury(cli_args, dry_run=dry_run)
 
+    # Dry-run contract: every LLM call short-circuits to a stub (matches
+    # the CLI flag's docstring + ``run_audit_pass``'s own ``dry_run``
+    # docstring). Phase-2 already short-circuits inside ``_audit_async``;
+    # Phase-1 agent rollouts traveled through ``run_variant`` which fell
+    # back to LiteLLM when ``llm_callable=None``, hitting the vendor and
+    # demanding a key. Inject the stub only when the caller didn't already
+    # supply one — tests passing fake LLMs keep priority.
+    effective_llm_callable = llm_callable
+    if dry_run and effective_llm_callable is None:
+        effective_llm_callable = _dry_run_llm_callable
+
     return asyncio.run(
         _audit_async(
             run_dir=run_dir,
@@ -662,7 +764,7 @@ def run_audit_pass(
             max_cost_usd=max_cost_usd,
             max_canonical_evals=max_canonical_evals,
             judge=judge,
-            llm_callable=llm_callable,
+            llm_callable=effective_llm_callable,
             dry_run=dry_run,
             llm_cache=llm_cache,
         )
@@ -1187,6 +1289,9 @@ async def _audit_async(
         # Pass-1 BLOCKER B4 fix: thread unpriced-call accounting.
         unpriced_call_count=n_unpriced_calls,
         unpriced_models=tuple(sorted(unpriced_models)),
+        # Pass-RT-B1 fix: persist dry_run into the sidecar so publish
+        # can refuse to render procurement PDFs off stub data.
+        dry_run=dry_run,
     )
     _write_audit_sidecar(run_dir, summary)
     return summary
@@ -1974,6 +2079,7 @@ def _aggregate(
     n_flipping_pairs_by_dim: dict[str, int] | None = None,
     unpriced_call_count: int = 0,
     unpriced_models: tuple[str, ...] = (),
+    dry_run: bool = False,
 ) -> CounterfactualAuditSummary:
     """Aggregate per-result rows into by_node / by_dim / by_swap_pair tables.
 
@@ -2233,4 +2339,5 @@ def _aggregate(
         unpriced_call_count=unpriced_call_count,
         unpriced_models=unpriced_models,
         results=results,
+        dry_run=dry_run,
     )

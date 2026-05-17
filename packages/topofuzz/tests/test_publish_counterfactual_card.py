@@ -365,6 +365,55 @@ def test_build_counterfactual_card_pdf_rejects_corrupt_audit_json(tmp_path):
         )
 
 
+def test_build_counterfactual_card_pdf_refuses_dry_run_sidecar(tmp_path):
+    """Pass-RT-B1 (2026-05-17): a sidecar produced by ``topofuzz audit
+    --dry-run`` carries ``dry_run: true``. publish must refuse to render a
+    procurement-grade PDF off stub data — the deposition-killer surfaced
+    in the dual-audit handoff. Re-inject the flag into the helper's
+    audit.json so the test exercises only the publish-side gate."""
+    from topofuzz.publish import PublishError, build_counterfactual_card_pdf
+
+    run_dir = _make_run_dir_with_audit(tmp_path)
+    audit_path = run_dir / "audit.json"
+    payload = json.loads(audit_path.read_text(encoding="utf-8"))
+    payload["dry_run"] = True
+    audit_path.write_text(
+        json.dumps(payload, indent=2), encoding="utf-8"
+    )
+    with pytest.raises(PublishError, match="--dry-run"):
+        build_counterfactual_card_pdf(
+            run_dir, out_path=tmp_path / "card.pdf",
+        )
+
+
+def test_build_counterfactual_card_pdf_accepts_real_sidecar_without_dry_run_field(tmp_path):
+    """Back-compat: a pre-RT-B1 sidecar with no ``dry_run`` field is
+    treated as real (the field is additive — defaulting missing to False
+    means existing real-money audits keep publishing). This test pins
+    the back-compat contract so a future "require dry_run present" gate
+    doesn't slip in and brick prior sidecars."""
+    from topofuzz.publish import build_counterfactual_card_pdf
+
+    run_dir = _make_run_dir_with_audit(tmp_path)
+    audit_path = run_dir / "audit.json"
+    payload = json.loads(audit_path.read_text(encoding="utf-8"))
+    payload.pop("dry_run", None)  # ensure field is absent
+    audit_path.write_text(
+        json.dumps(payload, indent=2), encoding="utf-8"
+    )
+    # Doesn't raise the dry-run refusal; may raise downstream rendering
+    # errors, which we ignore — the goal is to assert the dry-run gate
+    # is the only thing the missing field affects.
+    try:
+        build_counterfactual_card_pdf(
+            run_dir, out_path=tmp_path / "card.pdf",
+        )
+    except Exception as e:
+        assert "--dry-run" not in str(e), (
+            f"missing dry_run field tripped the dry-run gate: {e}"
+        )
+
+
 def test_build_counterfactual_card_pdf_rejects_bidi_override_target(tmp_path):
     """A `target` containing U+202E (right-to-left override) must be
     rejected with the same error class consistency_card uses."""
