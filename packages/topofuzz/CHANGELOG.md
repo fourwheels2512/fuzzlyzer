@@ -8,12 +8,152 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases prior to `0.5.0rc1` were development drops on the `0.5.0.dev0`
 placeholder version and are not separately enumerated.
 
+## [Unreleased] — pending v1.1.0 tag
+
+Three feature/fix commits + several release-engineering fixes post-date
+the `1.0.0` tag on `main` and will roll into the next release. The
+1.0.0 lede's claim of "F1-F8 features all shipped" was an off-by-one —
+F7 (counterfactual audit) shipped in `7948c94`, **after** the v1.0.0
+cut. The 1.0.0 entry has been amended to read "F1-F6 and F8 features
+shipped" to match what was actually under the tag. The git tag
+`v1.0.0` (commit `f8beb04`) and any PyPI artifact published from that
+tag still carry the original "F1-F8" claim and the v1.0.0 known
+limitations enumerated below — readers of the on-disk CHANGELOG and
+readers of the published wheel will see divergent text until v1.0.1
+is cut.
+
+### Known limitations of the v1.0.0 tag (not yet patched on PyPI)
+
+These were present in `f8beb04` and require a v1.0.1 patch release to
+clear from any installed wheel. The fixes themselves are committed on
+`main` in `[Unreleased]` below.
+
+- **`pip install topofuzz[full]==1.0.0` fails to resolve.** The base
+  `dependencies` pinned `fuzzeval>=0.2,<0.3` while the `[full]` extra
+  pinned `fuzzeval[stats,cache]>=0.1,<0.2` — mutually unsatisfiable.
+  Anyone running `pip install topofuzz[full]==1.0.0` against the
+  published wheel sees pip resolver fail with a `ResolutionImpossible`
+  error. Fixed in `[Unreleased]` by aligning the `[full]` pin to
+  `>=0.2,<0.3`.
+- **F8 Stage A all-zero attribution contradiction.** When `ablation.json`
+  was partial / cap-hit, the F8 consistency-card headline could read
+  "agent X contributed most" alongside a "0.0%" stat panel — the same
+  self-contradiction shape `45683cb` closed for F7. v1.0.0's
+  `_extract_attribution_rows` did not gate on `attribution_pct > 0`.
+  Fixed in `[Unreleased]` (`45683cb`).
+
+### Dependencies (lockfile regen)
+
+- **`uv.lock` regenerated.** Resolves `fuzzeval` from `0.1.0` (stale
+  in the v1.0.0 lockfile carry-forward) to `0.2.0` matching the bumped
+  package, AND fills in 11 missing optional-extras entries that the
+  `[ui]` and `[pdf]` extras have declared since their introduction:
+  `fastapi`, `greenlet`, `httptools`, `playwright`, `pyee`, `pypdf`,
+  `python-multipart`, `starlette`, `uvicorn`, `uvloop`, `watchfiles`.
+  All are direct or transitive deps of declared optional extras; no
+  new direct deps were added to `pyproject.toml`. Lockfile diff
+  +338/-2 lines. Procurement reviewers running SBOM checks should
+  re-pull the lockfile after a `topofuzz` reinstall.
+
+### Fixed (release engineering, post-tag)
+
+- **Mutually-unsatisfiable `fuzzeval` constraint in `[full]` extra.**
+  `packages/topofuzz/pyproject.toml` line 72 was `>=0.1,<0.2` while
+  base line 29 was `>=0.2,<0.3`. Aligned to `>=0.2,<0.3` so
+  `pip install topofuzz[full]` resolves. Surfaced by RT-specialist
+  audit 2026-05-17. v1.0.1 patch release must rebuild + republish the
+  wheel.
+
+### Added
+
+- **F7 — `topofuzz audit` per-node counterfactual attribution.**
+  Commit `7948c94`. For each `(variant, canonical_eval, dim)` triple,
+  generates a paired counterfactual eval row (Maria → Mario for
+  name-swap; age-swap, zip-swap, gender-swap likewise), runs the
+  variant against it, and — when the verdict flips — walks every
+  upstream node and ablates it back to its canonical-run response to
+  attribute which agent caused the disparate-impact flip. The
+  buyer-actionable answer to "which agent is biased on this input
+  axis?". Source-run gate: `--jury-of-3` required (SingleJudge runs
+  rejected at the gate so the leave-one-out re-judgments do not
+  inherit the source's ~26% per-judgment verdict noise). Writes
+  `<run_dir>/audit.json`; consumed by `topofuzz publish
+  --counterfactual-card`.
+- **Empty-token regression fixture** at
+  `examples/gallery/langgraph-lending-4role/eval-empty-tokens.csv`
+  (commit `45683cb`) — every row yields zero swaps across all four
+  dims, pinning the `n_canonical_pairs == 0` branch of the F7 publish
+  headline picker. The pre-existing `eval.csv` did not exercise this
+  branch because rows contained "NN years old" phrases that the
+  age-swap generator matched.
+
+### Fixed
+
+- **F7 counter-mismatch contradiction.** Commit `a348f6a`. Phase-1
+  flip counts now authoritatively drive `by_dim` /
+  `by_swap_pair.flipping_pairs` instead of being re-derived from
+  Phase-2 leave-one-out `results[]`. Before this fix, when Phase 2
+  was cap-hit before any triple completed (e.g. `$3` cap on `4 dims
+  × 8 rows × jury-of-3`), `results[]` was empty so per-dim and
+  per-swap flip counts collapsed to 0 while the top-level scalar
+  `n_flipping_pairs` remained at 8 — and the buyer-PDF rendered the
+  contradiction silently. New maps
+  `n_flipping_pairs_by_swap_pair` + `n_flipping_pairs_by_dim` are
+  incremented in Phase 1 alongside the scalar (same if-branch,
+  mathematically lockstep) and threaded through `_aggregate`.
+  `by_node` attribution remains Phase-2-derived (the F4 leave-one-out
+  math is untouched). Publish-side guard at
+  `_build_counterfactual_card_context` adds three distinct
+  `PublishError` diagnostics: **cap-hit** (`n > 0`, well-formed
+  entries, sum == 0 → "rerun with higher cap"), **fully malformed
+  sidecar** (every entry missing/non-int/negative/non-dict →
+  "sidecar unreadable — DO NOT raise cap"), **mixed validity**
+  (some valid positives + stray malformed → "refusing to publish
+  partial"). +7 regression tests; two passes of dual audit folded
+  (pass-1: 1 MAJOR + 1 MINOR; pass-2: 2 MEDIUM).
+- **All-zero attribution contradiction (F7 + F8 Stage A).** Commit
+  `45683cb`. A 2026-05-17 partial-Phase-2 lending bias audit
+  rendered a buyer-PDF whose title read "The intake agent
+  contributed most to demographic-counterfactual verdict flips"
+  alongside a "0.0%" stat panel — a self-contradiction the existing
+  counter-mismatch guard did NOT catch because the flip counts
+  themselves WERE internally consistent. The contradiction lived in
+  the **attribution counters**: every Phase-2 leave-one-out re-judge
+  had collapsed to `Score: NONE` on a HOLD response, so
+  `by_node[*].flips_closed = 0` everywhere, but the headline picker
+  still named the alphabetically-first non-terminal node.
+  `_format_counterfactual_headline` now gates the "agent X
+  contributed most" branch on `top_agent.attribution_pct > 0 AND
+  any_nonterminal_attribution`; the all-zero subcase falls through
+  to a 3-subcase honest attribution clause (math failed on some
+  cells / math ran cleanly and produced a zero answer / attribution
+  machinery never ran). F8 consistency card falls back to
+  vendor-concentration when F4 attribution is all-zero, and surfaces
+  a one-sentence `vendor_independence_note` breadcrumb so the
+  buyer-PDF does not pretend `ablation.json` doesn't exist. The
+  inconclusive-clause wording is honest about the union of
+  non-meaningful kinds. `_extract_swap_pair_rows` and
+  `_extract_attribution_rows` drop 0%-attribution contributors from
+  drilldown cells. `PublishError` on malformed
+  `n_ablation_points / n_ablation_points_meaningful` types (string,
+  negative, etc.) and on `napm > nap`. +15 regression tests
+  (`test_counterfactual.py` +1, `test_publish.py` +3,
+  `test_publish_counterfactual_card.py` +11; the `45683cb` commit
+  body says "+14" — off by one, reconciled here); two
+  passes of dual audit folded (pass-1: 1 BLOCKER + 1 MAJOR + 1
+  MAJOR + 1 MEDIUM + 2 MINOR; pass-2: 1 MAJOR + 1 MAJOR + 1 MAJOR +
+  1 MEDIUM).
+
 ## [1.0.0] — 2026-05-17
 
 First production-stable release. Engineering surface (DSSE attestation
 byte-exact against the secure-systems-lab reference, dual-audit-every-
-step discipline, 1595-test suite, F1-F8 features all shipped) earns
-the 1.0 tag. The 0.x line was a pre-release iteration; on this release
+step discipline, F1-F6 and F8 features shipped) earns the 1.0 tag.
+(The v1.0.0 commit body cites "1595 tests"; the canonical pytest
+suite at HEAD `f8beb04` actually collected closer to 1700 — the 1595
+figure was a stale carry-forward from an earlier session. Reported
+here so the published number is not load-bearing. Current `main`
+collects 1755 tests; 1753 pass + 2 platform-skip on Windows.) The 0.x line was a pre-release iteration; on this release
 the Trove classifier moves to `Development Status :: 5 -
 Production/Stable` and SECURITY.md `Supported Versions` table is
 rebuilt around 1.0.x.

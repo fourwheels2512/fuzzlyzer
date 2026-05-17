@@ -2114,7 +2114,9 @@ def ablate(
 
     The source run MUST have used ``--jury-of-3``; SingleJudge runs are
     rejected at the gate so the leave-one-out re-judgments don't inherit
-    the source's ~26 % per-judgment verdict noise (see BLUEPRINT §F4).
+    the source's ~26 % per-judgment verdict noise (see BLUEPRINT §9a
+    noise-corrected metrics; F4 is the feature name, not a section
+    number).
 
     Writes ``<run_dir>/ablation.json``. ``topofuzz inspect`` consumes
     the sidecar to render a per-flip attribution panel next to the
@@ -2412,7 +2414,8 @@ def audit(
     The source run MUST have used ``--jury-of-3``; SingleJudge runs are
     rejected at the gate so the leave-one-out re-judgments don't
     inherit the source's ~26 % per-judgment verdict noise (see
-    BLUEPRINT §F4 / §F7).
+    BLUEPRINT §9a noise-corrected metrics; F4 / F7 are feature names,
+    not section numbers).
 
     Writes ``<run_dir>/audit.json``. The PDF builder
     (``topofuzz publish --counterfactual-card``) consumes the sidecar

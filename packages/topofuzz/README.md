@@ -285,6 +285,43 @@ paragraph. NFC normalisation + bidi-override / zero-width / homoglyph
 rejection match the F6 CEO-card surface (shared via
 `_validate_target_company`).
 
+### Counterfactual Audit (F7, post-v1.0.0 on `main`)
+
+`topofuzz audit RUN_DIR --max-cost-usd N --yes` runs per-node
+disparate-impact attribution on a source run. For each
+`(variant, canonical_eval, dim)` triple — where `dim` is one of
+`name-swap`, `zip-swap`, `age-swap`, `gender-swap` — it generates a
+paired counterfactual eval row (Maria → Mario, 11211 → 11212, 29 → 59,
+etc.), runs the variant against it, and — when the verdict flips —
+walks every upstream node and ablates it back to its canonical-run
+response to attribute which agent caused the flip. The buyer-actionable
+answer to "which agent is biased on this input axis?"
+
+Source-run gate: `--jury-of-3` required (SingleJudge runs are rejected
+at the gate so the leave-one-out re-judgments do not inherit the
+source's ~26% per-judgment verdict noise — see BLUEPRINT §9a — noise-corrected metrics — and features F4 (ablation) / F7 (counterfactual audit)).
+
+Writes `<run_dir>/audit.json`. The PDF builder
+(`topofuzz publish RUN_DIR --counterfactual-card OUT.pdf
+--target "Acme Bank"`) consumes the sidecar to render the per-dim
+disparate-impact + per-node attribution tables. The artifact is
+**adjacent** to ECOA / FHA / NYC LL144 / OCC SR 11-7 adverse-impact
+work — it produces a candidate disparate-impact signal worth a
+follow-up formal audit. It is **not** a compliance determination and
+makes no certification claim (see the Limitations section above —
+"makes no claim of compliance with HIPAA, GDPR, SOC 2, FedRAMP, FINRA,
+the EU AI Act, or any other regulatory regime"). Treat the per-agent
+attribution as a scoping signal for where a compliance team should
+look first, not as a finding to file.
+
+The publish-side guard refuses to render contradictory sidecars with
+three distinct error messages (cap-hit / unreadable / mixed validity),
+and the headline picker gates the "agent X contributed most" branch on
+positive non-terminal attribution — the all-zero subcase falls through
+to an honest 3-subcase clause distinguishing "math failed on some
+cells" / "math ran cleanly and produced a zero answer" / "attribution
+machinery never ran."
+
 ### Reserved flag namespace
 
 The following flags are reserved for v1.0 and raise a helpful error

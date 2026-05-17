@@ -25,7 +25,9 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    # Pinned to 0.1.x — same major series. v0.2 may break the §17a contract.
+    # Pinned to 0.2.x — same major series as the v1.0 ship. v0.3 may
+    # break the §17a contract; bump deliberately with a co-tested
+    # fuzzeval release.
     "fuzzeval>=0.2,<0.3",
     "typer>=0.12",
     "rich>=13",
@@ -69,7 +71,11 @@ ui = [
 # Stats (numpy+scipy) and cache (diskcache) come transitively via
 # fuzzeval[stats,cache] so they aren't duplicated here.
 full = [
-    "fuzzeval[stats,cache]>=0.1,<0.2",
+    # MUST match the base `dependencies` pin above. v1.0.0 shipped this
+    # as `>=0.1,<0.2` which is mutually-unsatisfiable with the base
+    # `>=0.2,<0.3` and made `pip install topofuzz[full]==1.0.0` fail to
+    # resolve. Disclosed in CHANGELOG [Unreleased] / known v1.0.0 limitations.
+    "fuzzeval[stats,cache]>=0.2,<0.3",
     # Match the dev-group pin (root pyproject.toml). The adapter touches
     # `compiled.builder`, `BranchSpec.ends`, and the `xray=1` flatten
     # contract — all of which moved between LangGraph 0.x and 1.x.

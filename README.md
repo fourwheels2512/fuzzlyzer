@@ -25,6 +25,8 @@ Both packages call LLM vendors only when **you** invoke them with credentials. *
 
 **v1.0.0** (2026-05-17). Production-stable engine, BSL-1.1 licensed. 1595-test suite passes. DSSE-signed run bundles. Single-judge by default; opt-in jury-of-3 (Anthropic + OpenAI + Gemini) wired end-to-end with jury-aware variance-of-orderings and Wilson 95% CIs. F8 Cross-Vendor Consistency card auto-leads with F4 per-agent attribution when `ablation.json` is present in the run dir.
 
+**Post-v1.0.0 on `main` (pending v1.1.0 tag):** F7 counterfactual audit shipped — `topofuzz audit` runs per-node disparate-impact attribution on demographic input swaps (name / zip / age / gender), and `topofuzz publish --counterfactual-card` renders the buyer-facing PDF. The artifact is **adjacent** to ECOA / FHA / NYC LL144 / OCC SR 11-7 adverse-impact work — it is a candidate disparate-impact signal worth a follow-up formal audit, **not** a compliance determination (see `packages/topofuzz/README.md` Limitations). 1753-test suite. See `packages/topofuzz/CHANGELOG.md` for the [Unreleased] entry, including a `pip install topofuzz[full]==1.0.0` resolver bug (v1.0.1 patch pending).
+
 [![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](packages/topofuzz/LICENSE)
 [![Python: 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](#)
 
