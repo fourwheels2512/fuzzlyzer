@@ -1345,6 +1345,81 @@ def test_aggregate_by_dim_aggregates_across_swap_pairs():
     assert summary.by_dim["name"]["total_pairs"] == 2
 
 
+def test_aggregate_phase1_flip_maps_override_phase2_derivation():
+    """F7 BLOCKER regression: when Phase 2 is cap-hit before any
+    triple produces meaningful results, Phase-1 flip maps must
+    authoritatively drive ``by_dim`` and ``by_swap_pair`` flip counts
+    so the published PDF stops reading "counterfactuals flipped" over
+    an all-zero drilldown table.
+
+    Pre-fix: ``by_dim[*].flipping_pairs == 0`` and
+    ``by_swap_pair[*].flipping_pairs == 0`` while top-level
+    ``n_flipping_pairs == 8``. Post-fix: when the production Phase-1
+    flip maps are supplied, every per-dim / per-swap entry reflects
+    them and the totals reconcile by construction.
+    """
+    # Empty Phase-2 results (the cap-hit-before-any-triple-finishes
+    # state). Phase 1 found 8 flips distributed across name + age.
+    summary = _aggregate(
+        results=(),
+        dims=("name", "age"),
+        n_canonical_pairs=29,
+        n_flipping_pairs=8,
+        total_cost=3.01,
+        partial=True,
+        n_phase1_attempts_by_swap_pair={
+            ("name", "Emily Murphy", "Lakisha Washington"): 4,
+            ("age", "29", "59"): 2,
+        },
+        n_phase1_attempts_by_dim={"name": 8, "age": 7},
+        n_flipping_pairs_by_swap_pair={
+            ("name", "Emily Murphy", "Lakisha Washington"): 5,
+            ("age", "29", "59"): 3,
+        },
+        n_flipping_pairs_by_dim={"name": 5, "age": 3},
+    )
+    # The headline numerator reconciles with the per-dim breakdown.
+    assert summary.n_flipping_pairs == 8
+    assert summary.by_dim["name"]["flipping_pairs"] == 5
+    assert summary.by_dim["age"]["flipping_pairs"] == 3
+    assert (
+        summary.by_dim["name"]["flipping_pairs"]
+        + summary.by_dim["age"]["flipping_pairs"]
+        == summary.n_flipping_pairs
+    )
+    # And so does the swap-pair breakdown.
+    sp = summary.by_swap_pair
+    assert sp["name|Emily Murphy|Lakisha Washington"]["flipping_pairs"] == 5
+    assert sp["age|29|59"]["flipping_pairs"] == 3
+    assert (
+        sum(v["flipping_pairs"] for v in sp.values())
+        == summary.n_flipping_pairs
+    )
+    # by_node remains empty because Phase 2 produced no results — the
+    # F7 fix is about flip COUNTS, not attribution synthesis.
+    assert summary.by_node == {}
+
+
+def test_aggregate_phase1_flip_maps_omitted_preserves_legacy_derivation():
+    """F7 fix back-compat: when the Phase-1 flip maps are NOT supplied
+    (existing direct-`_aggregate` test paths), ``flipping_pairs`` is
+    derived from Phase-2 ``results[]`` as before. The two
+    ``_aggregate`` paths must coexist so unrelated tests continue to
+    pin attribution arithmetic without exercising the Phase-1 maps.
+    """
+    summary = _aggregate(
+        results=(),
+        dims=("name",),
+        n_canonical_pairs=0,
+        n_flipping_pairs=0,
+        total_cost=0.0,
+        partial=False,
+    )
+    # No kwargs → derived from empty results → 0 everywhere.
+    assert summary.by_dim["name"]["flipping_pairs"] == 0
+    assert summary.by_swap_pair == {}
+
+
 # ---------------------------------------------------------------------------
 # _atomic_write_text
 # ---------------------------------------------------------------------------

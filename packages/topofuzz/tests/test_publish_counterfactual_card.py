@@ -860,3 +860,207 @@ def test_pass2_b1_publish_rejects_v1_schema_via_consumer_check(tmp_path):
     )
     with pytest.raises(AuditError, match="schema_version is 1"):
         read_audit_sidecar(run_dir)
+
+
+def test_counterfactual_card_rejects_contradictory_flip_counter(tmp_path):
+    """F7 BLOCKER guard: when the audit reports ``n_flipping_pairs > 0``
+    but every ``by_swap_pair[*].flipping_pairs`` is zero, the publish
+    path must refuse to render rather than emit a card whose
+    "counterfactuals flipped" headline contradicts every drilldown row.
+
+    The audit-side fix prevents new sidecars from carrying this state,
+    but a stale sidecar from a pre-fix engine (or a hand-edited file)
+    would still hit the renderer. This guard catches it at the
+    front door.
+    """
+    from topofuzz.publish import (
+        PublishError,
+        _build_counterfactual_card_context,
+        _load_manifest,
+    )
+
+    run_dir = _make_run_dir_with_audit(
+        tmp_path,
+        n_canonical_pairs=29,
+        n_flipping_pairs=8,
+        swap_pair_flips=0,  # the buggy state: top says 8, drilldown says 0
+        swap_pair_total=2,
+    )
+    audit = json.loads((run_dir / "audit.json").read_text(encoding="utf-8"))
+    manifest = _load_manifest(run_dir)
+    with pytest.raises(PublishError, match="n_flipping_pairs=8"):
+        _build_counterfactual_card_context(
+            metadata={
+                "run_id": "cf-publish-001",
+                "tds_version": "0.6.1",
+                "signed_at": "2026-05-17T15:00:00Z",
+                "target": "Acme Lending Co.",
+            },
+            manifest=manifest,
+            audit=audit,
+            target="Acme Lending Co.",
+        )
+
+
+def test_counterfactual_card_distinguishes_malformed_sidecar(tmp_path):
+    """F7 RT MAJOR regression: when by_swap_pair entries are malformed
+    (``flipping_pairs`` as a string from a partner producer, missing,
+    or negative), the guard must point at the SIDECAR shape, not at
+    cap-hit — wrong diagnosis costs the buyer real $$$ on a needless
+    rerun.
+    """
+    from topofuzz.publish import (
+        PublishError,
+        _build_counterfactual_card_context,
+        _load_manifest,
+    )
+
+    run_dir = _make_run_dir_with_audit(
+        tmp_path,
+        n_canonical_pairs=29,
+        n_flipping_pairs=8,
+        swap_pair_flips=3,
+        swap_pair_total=5,
+    )
+    audit = json.loads((run_dir / "audit.json").read_text(encoding="utf-8"))
+    # Corrupt: stringify the flipping_pairs field (legitimate concern
+    # for partner-supplied audit.json files from a non-Python producer).
+    for payload in audit["by_swap_pair"].values():
+        payload["flipping_pairs"] = str(payload["flipping_pairs"])
+    manifest = _load_manifest(run_dir)
+    with pytest.raises(PublishError, match="malformed flipping_pairs"):
+        _build_counterfactual_card_context(
+            metadata={
+                "run_id": "cf-publish-001",
+                "tds_version": "0.6.1",
+                "signed_at": "2026-05-17T15:00:00Z",
+                "target": "Acme Lending Co.",
+            },
+            manifest=manifest,
+            audit=audit,
+            target="Acme Lending Co.",
+        )
+
+
+def test_counterfactual_card_rejects_non_dict_payloads(tmp_path):
+    """F7 RT FINDING N1 regression: a sidecar whose by_swap_pair
+    entries are mostly non-dict garbage (strings, nulls, lists) must
+    route to the malformed-sidecar diagnostic, NOT silently fall into
+    the cap-hit branch and burn the buyer's audit budget on a wrong
+    root cause.
+    """
+    from topofuzz.publish import (
+        PublishError,
+        _build_counterfactual_card_context,
+        _load_manifest,
+    )
+
+    run_dir = _make_run_dir_with_audit(
+        tmp_path,
+        n_canonical_pairs=29,
+        n_flipping_pairs=8,
+        swap_pair_flips=3,
+        swap_pair_total=5,
+    )
+    audit = json.loads((run_dir / "audit.json").read_text(encoding="utf-8"))
+    # Corrupt: replace every by_swap_pair entry with a non-dict value
+    # (the partner-producer / hand-edited bad-shape case).
+    audit["by_swap_pair"] = {
+        "name|A|B": "corrupted string entry",
+        "name|C|D": None,
+        "name|E|F": [1, 2, 3],
+    }
+    manifest = _load_manifest(run_dir)
+    with pytest.raises(PublishError, match="malformed flipping_pairs"):
+        _build_counterfactual_card_context(
+            metadata={
+                "run_id": "cf-publish-001",
+                "tds_version": "0.6.1",
+                "signed_at": "2026-05-17T15:00:00Z",
+                "target": "Acme Lending Co.",
+            },
+            manifest=manifest,
+            audit=audit,
+            target="Acme Lending Co.",
+        )
+
+
+def test_counterfactual_card_rejects_mixed_malformed_partial_sidecar(tmp_path):
+    """F7 RT FINDING N3 regression: a sidecar that mixes valid
+    positive flip counts with one or more malformed entries (e.g. a
+    stray negative or a string-typed field on one row) must hard-fail
+    rather than silently drop the malformed entries from the
+    drilldown total. A buyer-facing PDF cannot legitimately quote a
+    partial total without surfacing the dropped count.
+    """
+    from topofuzz.publish import (
+        PublishError,
+        _build_counterfactual_card_context,
+        _load_manifest,
+    )
+
+    run_dir = _make_run_dir_with_audit(
+        tmp_path,
+        n_canonical_pairs=29,
+        n_flipping_pairs=8,
+        swap_pair_flips=3,
+        swap_pair_total=5,
+    )
+    audit = json.loads((run_dir / "audit.json").read_text(encoding="utf-8"))
+    # Mixed: original entry stays valid (flipping_pairs=3); add a
+    # stray negative-flip entry that would silently drop pre-fix.
+    audit["by_swap_pair"]["name|Bad|Negative"] = {
+        "dim": "name",
+        "from_token": "Bad",
+        "to_token": "Negative",
+        "flipping_pairs": -1,
+        "total_pairs": 1,
+        "by_node": {},
+    }
+    manifest = _load_manifest(run_dir)
+    with pytest.raises(PublishError, match="entries with a malformed"):
+        _build_counterfactual_card_context(
+            metadata={
+                "run_id": "cf-publish-001",
+                "tds_version": "0.6.1",
+                "signed_at": "2026-05-17T15:00:00Z",
+                "target": "Acme Lending Co.",
+            },
+            manifest=manifest,
+            audit=audit,
+            target="Acme Lending Co.",
+        )
+
+
+def test_counterfactual_card_allows_consistent_zero_flip_audit(tmp_path):
+    """F7 guard counterexample: an audit where Phase 1 found zero
+    flips (n_flipping_pairs == 0) is a LEGITIMATE empty / stable
+    state — the guard must not trip when both sides agree on zero.
+    """
+    from topofuzz.publish import (
+        _build_counterfactual_card_context,
+        _load_manifest,
+    )
+
+    run_dir = _make_run_dir_with_audit(
+        tmp_path,
+        n_canonical_pairs=29,
+        n_flipping_pairs=0,
+        swap_pair_flips=0,
+        swap_pair_total=2,
+    )
+    audit = json.loads((run_dir / "audit.json").read_text(encoding="utf-8"))
+    manifest = _load_manifest(run_dir)
+    ctx = _build_counterfactual_card_context(
+        metadata={
+            "run_id": "cf-publish-001",
+            "tds_version": "0.6.1",
+            "signed_at": "2026-05-17T15:00:00Z",
+            "target": "Acme Lending Co.",
+        },
+        manifest=manifest,
+        audit=audit,
+        target="Acme Lending Co.",
+    )
+    # Stable headline ("held its verdict") fires, no PublishError.
+    assert "held its verdict" in ctx["headline_title"]

@@ -787,6 +787,19 @@ async def _audit_async(
     # always collapsed to ~100%.
     n_phase1_attempts_by_swap_pair: dict[tuple[str, str, str], int] = {}
     n_phase1_attempts_by_dim: dict[str, int] = {}
+    # F7 BLOCKER fix (counter mismatch): track Phase-1 FLIP counts per
+    # swap-pair / per-dim. Prior implementation derived these from
+    # Phase-2 ``results[]``; when Phase 2 was cap-hit before any triple
+    # finished, the top-level ``n_flipping_pairs`` carried the true
+    # Phase-1 count (e.g. 8) while every ``by_dim[*].flipping_pairs``
+    # and ``by_swap_pair[*].flipping_pairs`` collapsed to 0 — the same
+    # field name carrying inconsistent semantics, surfacing as a
+    # contradictory PDF headline ("counterfactuals flipped" + every
+    # drilldown row showing 0). These maps are the authoritative
+    # numerator: Phase-2 ``results[]`` continues to drive ``by_node``
+    # attribution, but the flip COUNT belongs to Phase 1.
+    n_flipping_pairs_by_swap_pair: dict[tuple[str, str, str], int] = {}
+    n_flipping_pairs_by_dim: dict[str, int] = {}
     # Pass-1 BLOCKER B4 fix: track unpriced re-execution calls so the
     # sidecar can warn that total_cost_usd is a lower bound.
     n_unpriced_calls = 0
@@ -1013,6 +1026,19 @@ async def _audit_async(
                         continue
 
                     n_flipping_pairs += 1
+                    # F7 BLOCKER fix: increment Phase-1 flip counts at
+                    # the same site as n_flipping_pairs so by_swap_pair
+                    # and by_dim carry the Phase-1 truth even when
+                    # Phase 2 is cap-hit. Without this, the published
+                    # PDF could lead with "counterfactuals flipped"
+                    # while every drilldown row showed 0 flips.
+                    sp_flip_key = (dim, swap.from_token, swap.to_token)
+                    n_flipping_pairs_by_swap_pair[sp_flip_key] = (
+                        n_flipping_pairs_by_swap_pair.get(sp_flip_key, 0) + 1
+                    )
+                    n_flipping_pairs_by_dim[dim] = (
+                        n_flipping_pairs_by_dim.get(dim, 0) + 1
+                    )
                     flipping_triples.append(
                         {
                             "variant_id": variant_id,
@@ -1087,6 +1113,13 @@ async def _audit_async(
         # _aggregate uses them as flip-rate denominators.
         n_phase1_attempts_by_swap_pair=n_phase1_attempts_by_swap_pair,
         n_phase1_attempts_by_dim=n_phase1_attempts_by_dim,
+        # F7 BLOCKER fix: thread the Phase-1 FLIP maps so _aggregate
+        # uses them as the authoritative numerator on by_swap_pair /
+        # by_dim. Without these, partial Phase-2 runs surface a
+        # contradictory PDF where the top-level n_flipping_pairs
+        # disagrees with every per-dim / per-swap row.
+        n_flipping_pairs_by_swap_pair=n_flipping_pairs_by_swap_pair,
+        n_flipping_pairs_by_dim=n_flipping_pairs_by_dim,
         # Pass-1 BLOCKER B4 fix: thread unpriced-call accounting.
         unpriced_call_count=n_unpriced_calls,
         unpriced_models=tuple(sorted(unpriced_models)),
@@ -1661,6 +1694,8 @@ def _aggregate(
     partial: bool,
     n_phase1_attempts_by_swap_pair: dict[tuple[str, str, str], int] | None = None,
     n_phase1_attempts_by_dim: dict[str, int] | None = None,
+    n_flipping_pairs_by_swap_pair: dict[tuple[str, str, str], int] | None = None,
+    n_flipping_pairs_by_dim: dict[str, int] | None = None,
     unpriced_call_count: int = 0,
     unpriced_models: tuple[str, ...] = (),
 ) -> CounterfactualAuditSummary:
@@ -1672,16 +1707,39 @@ def _aggregate(
     are used as the denominator for ``by_swap_pair[*].total_pairs``,
     ``by_dim[*].total_pairs``, and ``by_dim[*].flip_rate_pct``.
 
+    F7 BLOCKER fix: ``n_flipping_pairs_by_swap_pair`` /
+    ``n_flipping_pairs_by_dim`` carry the TRUE Phase-1 flip counts.
+    When supplied, they are used as the authoritative NUMERATOR for
+    ``by_swap_pair[*].flipping_pairs`` and
+    ``by_dim[*].flipping_pairs``. Without these, by_swap_pair and
+    by_dim flip counts were derived from Phase-2 ``results[]``; when
+    Phase 2 was cap-hit before any triple completed, that derivation
+    collapsed every per-dim / per-swap flipping_pairs to 0 while the
+    top-level ``n_flipping_pairs`` carried the (nonzero) Phase-1
+    truth — surfacing as a contradictory PDF.
+
     The kwargs default to None for back-compat with existing tests that
     call ``_aggregate`` directly with only the meaningful-results
-    skeleton; in that fallback path the denominator is rebuilt from
-    ``results`` (preserves prior test contracts that pin attribution
-    arithmetic without exercising the Phase-1 attempt-count machinery).
+    skeleton; in that fallback path both numerator and denominator are
+    rebuilt from ``results`` (preserves prior test contracts that pin
+    attribution arithmetic without exercising the Phase-1 machinery).
     """
     if n_phase1_attempts_by_swap_pair is None:
         n_phase1_attempts_by_swap_pair = {}
     if n_phase1_attempts_by_dim is None:
         n_phase1_attempts_by_dim = {}
+    # F7 BLOCKER fix: distinguish "kwarg not supplied at all" (test
+    # back-compat: derive from results) from "kwarg supplied as empty
+    # dict" (production zero-flip path: 0 is authoritative). The
+    # ``_phase1_flip_kwargs_supplied`` flag preserves both contracts.
+    _phase1_flip_kwargs_supplied = (
+        n_flipping_pairs_by_swap_pair is not None
+        or n_flipping_pairs_by_dim is not None
+    )
+    if n_flipping_pairs_by_swap_pair is None:
+        n_flipping_pairs_by_swap_pair = {}
+    if n_flipping_pairs_by_dim is None:
+        n_flipping_pairs_by_dim = {}
 
     meaningful_kinds = (_KIND_REEXECUTE_TERMINAL, _KIND_SUBSTITUTE_TERMINAL)
 
@@ -1770,7 +1828,14 @@ def _aggregate(
     by_swap_pair_json: dict[str, dict[str, Any]] = {}
     for sp_key, slot in by_swap_pair_tmp.items():
         dim, from_t, to_t = sp_key
-        n_flip = len(slot["flipping_pairs"])
+        # F7 BLOCKER fix: numerator is the Phase-1 flip count when the
+        # production maps were supplied; falls back to the Phase-2-
+        # derived set length for test back-compat. Both branches use
+        # ``len(slot["flipping_pairs"])`` for the Phase-2 contract.
+        if _phase1_flip_kwargs_supplied:
+            n_flip = n_flipping_pairs_by_swap_pair.get(sp_key, 0)
+        else:
+            n_flip = len(slot["flipping_pairs"])
         # Pass-1 BLOCKER B1 fix: denominator is the Phase-1 attempt
         # count when supplied; falls back to observed-triple count for
         # test paths.
@@ -1828,22 +1893,29 @@ def _aggregate(
         if r.flip_closed:
             slot_node["flips_closed"] += 1
 
-    # by_dim.flipping_pairs: count of unique (variant, canonical_eval,
-    # cf_eval) triples in this dim that produced at least one
-    # meaningful row (i.e. were Phase-2 flipping triples).
-    by_dim_flipping_triples: dict[str, set[tuple[str, str, str]]] = {
-        d: set() for d in dims
-    }
-    for r in results:
-        if r.kind not in meaningful_kinds:
-            continue
-        if r.dim not in by_dim_flipping_triples:
-            continue
-        by_dim_flipping_triples[r.dim].add(
-            (r.variant_id, r.canonical_eval_id, r.counterfactual_eval_id)
-        )
-    for d in dims:
-        by_dim[d]["flipping_pairs"] = len(by_dim_flipping_triples[d])
+    # by_dim.flipping_pairs: Phase-1 flip count per dim when the
+    # production maps were supplied (F7 BLOCKER fix); falls back to
+    # Phase-2-derived unique-triple count for test back-compat. The
+    # Phase-2 derivation collapses to 0 whenever Phase 2 is cap-hit
+    # before any triple produces meaningful results — the exact
+    # contradiction the maps were threaded in to prevent.
+    if _phase1_flip_kwargs_supplied:
+        for d in dims:
+            by_dim[d]["flipping_pairs"] = n_flipping_pairs_by_dim.get(d, 0)
+    else:
+        by_dim_flipping_triples: dict[str, set[tuple[str, str, str]]] = {
+            d: set() for d in dims
+        }
+        for r in results:
+            if r.kind not in meaningful_kinds:
+                continue
+            if r.dim not in by_dim_flipping_triples:
+                continue
+            by_dim_flipping_triples[r.dim].add(
+                (r.variant_id, r.canonical_eval_id, r.counterfactual_eval_id)
+            )
+        for d in dims:
+            by_dim[d]["flipping_pairs"] = len(by_dim_flipping_triples[d])
 
     for d, slot in by_dim.items():
         # Pass-1 BLOCKER B1 fix: by_dim total_pairs is the Phase-1

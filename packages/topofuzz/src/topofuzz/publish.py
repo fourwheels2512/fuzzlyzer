@@ -1526,6 +1526,104 @@ def _build_counterfactual_card_context(
     ):
         n_flipping_pairs = 0
 
+    # F7 BLOCKER guard (belt-and-suspenders): refuse to render the
+    # buyer-facing PDF when the audit's top-level flip counter says
+    # "flips happened" but every per-swap-pair entry reports zero.
+    # Pre-fix audits cap-hit during Phase 2 produced exactly this
+    # state — the audit-side fix prevents new sidecars from carrying
+    # it, but stale sidecars on disk would still render a
+    # contradictory PDF without this guard. Narrow on purpose:
+    # ``n != sum(...)`` would catch benign test fixtures with looser
+    # fidelity; ``n > 0 AND sum == 0`` catches the exact misleading
+    # state and nothing else.
+    #
+    # Pass-1 RT MAJOR fix: when the inconsistency is caused by
+    # malformed by_swap_pair entries (string-typed / missing /
+    # negative ``flipping_pairs``) the diagnostic must point at the
+    # MALFORMED SIDECAR, not at the cap-hit story — otherwise the
+    # buyer reruns a multi-dollar audit chasing the wrong root
+    # cause. Pass-1 RT MINOR fix: negative ints don't silently drop;
+    # they emit a WARNING (producers should never write negatives)
+    # and count toward the malformed tally.
+    if n_flipping_pairs > 0:
+        by_swap_pair_raw = audit.get("by_swap_pair")
+        sp_flip_sum = 0
+        sp_entries_total = 0
+        sp_entries_malformed = 0
+        if isinstance(by_swap_pair_raw, dict):
+            for payload in by_swap_pair_raw.values():
+                # Pass-2 RT FINDING N1 fix: non-dict payloads count
+                # toward the total + malformed tallies so a sidecar
+                # whose entries are mostly garbage strings / nulls
+                # routes to the malformed-sidecar diagnostic instead
+                # of being skipped and dropping into the cap-hit
+                # branch (which would waste the buyer's audit budget
+                # on a wrong root cause).
+                sp_entries_total += 1
+                if not isinstance(payload, dict):
+                    sp_entries_malformed += 1
+                    continue
+                fp = payload.get("flipping_pairs")
+                if isinstance(fp, bool) or not isinstance(fp, int):
+                    sp_entries_malformed += 1
+                    continue
+                if fp < 0:
+                    _log.warning(
+                        "publish: by_swap_pair entry has negative "
+                        "flipping_pairs=%r; treating as malformed "
+                        "(producers should never emit negatives).",
+                        fp,
+                    )
+                    sp_entries_malformed += 1
+                    continue
+                sp_flip_sum += fp
+        # Pass-2 RT FINDING N3 fix: a sidecar that mixes valid
+        # positives with stray malformed entries (e.g. one negative
+        # in a 10-entry table) raises a DEDICATED PublishError rather
+        # than silently dropping the malformed entries from
+        # ``sp_flip_sum``. A _log.warning to stderr is invisible to a
+        # buyer reading the rendered PDF, so the malformed signal has
+        # to surface as a hard render-stop with an actionable message
+        # naming the count of dropped entries.
+        if sp_entries_malformed > 0 and sp_flip_sum > 0:
+            raise PublishError(
+                f"audit.json by_swap_pair has "
+                f"{sp_entries_malformed} of {sp_entries_total} "
+                "entries with a malformed flipping_pairs field "
+                "(missing, non-int, negative, or non-dict payload). "
+                "Rendering would silently drop these from the "
+                "drilldown total — refusing to publish. Rerun "
+                "`topofuzz audit` against the source run to "
+                "regenerate a well-formed sidecar."
+            )
+        if sp_flip_sum == 0:
+            if (
+                sp_entries_total > 0
+                and sp_entries_malformed == sp_entries_total
+            ):
+                raise PublishError(
+                    f"audit.json reports n_flipping_pairs={n_flipping_pairs} "
+                    f"but every by_swap_pair entry "
+                    f"({sp_entries_malformed} / {sp_entries_total}) has a "
+                    "malformed flipping_pairs field (missing, non-int, "
+                    "negative, or non-dict payload). The sidecar was "
+                    "produced by an incompatible writer or hand-edited. "
+                    "Rerun `topofuzz audit` against the source run to "
+                    "regenerate a well-formed sidecar — DO NOT raise "
+                    "the cost cap; the existing run is structurally "
+                    "unreadable, not under-budgeted."
+                )
+            raise PublishError(
+                f"audit.json reports n_flipping_pairs={n_flipping_pairs} "
+                "but every by_swap_pair[*].flipping_pairs is zero — the "
+                "card cannot honestly lead with a 'counterfactuals "
+                "flipped' headline against an all-zero drilldown. This "
+                "usually means the audit was hard-stopped mid-Phase-2 "
+                "(see --max-cost-usd) under a pre-fix engine; rerun "
+                "`topofuzz audit` with a higher cap to regenerate the "
+                "sidecar."
+            )
+
     total_cost_usd = audit.get("total_cost_usd")
     if isinstance(total_cost_usd, (int, float)) and not isinstance(
         total_cost_usd, bool
