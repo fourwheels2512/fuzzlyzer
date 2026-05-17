@@ -1,0 +1,368 @@
+<!--
+  Copyright (c) 2026 Kiran Nayudu. All rights reserved.
+  Licensed under the Business Source License 1.1.
+  See LICENSE file in the project root for full terms.
+  PATENT_PENDING_NOTICE_GOES_HERE
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'none'; base-uri 'none'; form-action 'none';">
+<meta name="referrer" content="no-referrer">
+<title>topofuzz counterfactual audit — {{ topology_name }}</title>
+<style>
+  @page {
+    size: Letter;
+    margin: 0.55in 0.6in 0.55in 0.6in;
+  }
+  :root {
+    --bg: #faf7f2;
+    --surface: #ffffff;
+    --border: #e7d8c2;
+    --border-soft: #f0eae0;
+    --ink: #2a2622;
+    --ink-strong: #1f1c19;
+    --muted: #897764;
+    --muted-soft: #6b5f54;
+    --accent: #c25024;
+    --accent-soft: #d97757;
+    --signal-bg: #f0f4fa;
+    --signal-border: #c9d4e5;
+    --signal-ink: #2e4d7a;
+    --caveat-bg: #fcf3e3;
+    --caveat-border: #ecd29a;
+    --caveat-ink: #7a541f;
+    --font-serif: "Source Serif Pro", "Source Serif 4", Georgia, "Times New Roman", serif;
+    --font-sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--bg); }
+  body {
+    margin: 0;
+    font-family: var(--font-sans);
+    background: var(--bg);
+    color: var(--ink);
+    line-height: 1.45;
+    font-size: 10.5pt;
+    -webkit-font-smoothing: antialiased;
+  }
+  .container {
+    max-width: 7.4in;
+    margin: 0 auto;
+    padding: 0;
+  }
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 8.5pt;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 6px 0;
+  }
+  h1 {
+    font-family: var(--font-serif);
+    font-size: 20pt;
+    font-weight: 500;
+    line-height: 1.15;
+    letter-spacing: -0.01em;
+    color: var(--ink-strong);
+    margin: 0 0 8px 0;
+  }
+  .lede {
+    font-family: var(--font-serif);
+    font-size: 12pt;
+    line-height: 1.4;
+    color: var(--ink);
+    margin: 0 0 14px 0;
+  }
+  .headline-stat {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    padding: 12px 14px;
+    border-width: 1.5px;
+    border-style: solid;
+    border-color: var(--signal-border);
+    background: var(--signal-bg);
+    border-radius: 6px;
+    margin: 0 0 14px 0;
+  }
+  .headline-stat .pct {
+    font-family: var(--font-serif);
+    font-size: 32pt;
+    font-weight: 500;
+    line-height: 1;
+    color: var(--signal-ink);
+  }
+  .headline-stat .body { flex: 1; }
+  .headline-stat .body .label {
+    font-family: var(--font-sans);
+    font-size: 10pt;
+    color: var(--ink-strong);
+    font-weight: 600;
+    margin-bottom: 2px;
+  }
+  .headline-stat .body .ci {
+    font-family: var(--font-mono);
+    font-size: 9pt;
+    color: var(--muted-soft);
+  }
+  h2 {
+    font-family: var(--font-serif);
+    font-size: 12pt;
+    font-weight: 500;
+    color: var(--ink-strong);
+    margin: 12px 0 6px 0;
+    padding-bottom: 3px;
+    border-bottom: 1px solid var(--border);
+  }
+  table.data {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0 0 12px 0;
+    font-size: 9.5pt;
+  }
+  table.data th, table.data td {
+    text-align: left;
+    padding: 5px 9px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  table.data th {
+    font-family: var(--font-mono);
+    font-size: 8.5pt;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 600;
+    border-bottom: 1.5px solid var(--border);
+  }
+  table.data td.name {
+    font-family: var(--font-mono);
+    font-size: 9.5pt;
+    font-weight: 600;
+    color: var(--ink-strong);
+  }
+  table.data td.num {
+    font-family: var(--font-mono);
+    font-size: 9.5pt;
+    color: var(--ink);
+    text-align: right;
+  }
+  table.data td.dim {
+    font-family: var(--font-mono);
+    font-size: 9pt;
+    color: var(--muted-soft);
+    text-align: right;
+  }
+  tr.control td {
+    background: #f6f1e8;
+    color: var(--muted-soft);
+    font-style: italic;
+  }
+  .caveat {
+    margin: 12px 0 14px 0;
+    padding: 11px 14px;
+    background: var(--caveat-bg);
+    border: 1.5px solid var(--caveat-border);
+    border-radius: 6px;
+    font-size: 10pt;
+    line-height: 1.5;
+    color: var(--ink);
+  }
+  .caveat strong {
+    color: var(--caveat-ink);
+  }
+  .meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    font-family: var(--font-mono);
+    font-size: 8.5pt;
+    color: var(--muted-soft);
+    margin: 0 0 10px 0;
+  }
+  .meta-row strong {
+    color: var(--ink-strong);
+    font-weight: 600;
+  }
+  .notes {
+    margin: 0 0 12px 0;
+    padding: 9px 11px;
+    background: var(--surface);
+    border-left: 3px solid var(--muted);
+    font-size: 9.5pt;
+    line-height: 1.45;
+    color: var(--ink);
+  }
+  .notes strong {
+    color: var(--ink-strong);
+  }
+  .footer {
+    margin-top: 16px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+    font-family: var(--font-mono);
+    font-size: 7.5pt;
+    color: var(--muted-soft);
+    line-height: 1.5;
+  }
+  .footer .attest { word-break: break-all; }
+  .footer .target {
+    font-family: var(--font-sans);
+    font-size: 9.5pt;
+    color: var(--ink-strong);
+    margin: 0 0 4px 0;
+    font-weight: 500;
+  }
+  .footer .methodology {
+    margin-top: 4px;
+    color: var(--muted);
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="eyebrow">topofuzz™ · counterfactual audit · by-agent attribution</div>
+  <h1>{{ headline_title }}</h1>
+  <p class="lede">{{ headline_lede }}</p>
+
+  <div class="headline-stat">
+    <div class="pct">{{ stat_headline }}</div>
+    <div class="body">
+      <div class="label">{{ stat_label }}</div>
+      <div class="ci">{{ headline_sub_line }}</div>
+    </div>
+  </div>
+
+  {% if by_node_rows %}
+  <h2>By-agent attribution (audit-wide)</h2>
+  <table class="data">
+    <thead>
+      <tr>
+        <th>Agent / node</th>
+        <th style="text-align: right;">Attribution</th>
+        <th style="text-align: right;">Flips closed</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in by_node_rows %}
+      <tr{% if r.is_terminal %} class="control"{% endif %}>
+        <td class="name">{{ r.name }}{% if r.is_terminal %} (control){% endif %}</td>
+        <td class="num">{{ r.attribution_pct_str }}</td>
+        <td class="dim">
+          {%- if r.flips_closed is not none and r.total_meaningful is not none -%}
+            {{ r.flips_closed }} / {{ r.total_meaningful }}
+          {%- else -%}
+            —
+          {%- endif -%}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if terminal_control_note %}
+  <div class="notes">{{ terminal_control_note }}</div>
+  {% endif %}
+  {% endif %}
+
+  {% if swap_pair_rows %}
+  <h2>By swap-pair drilldown</h2>
+  <table class="data">
+    <thead>
+      <tr>
+        <th>Dimension</th>
+        <th>Substitution</th>
+        <th style="text-align: right;">Flips</th>
+        <th>Top contributors</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for s in swap_pair_rows %}
+      <tr>
+        <td class="dim" style="text-align: left;">{{ s.dim }}</td>
+        <td class="name">{{ s.from_token }} → {{ s.to_token }}</td>
+        <td class="num">{{ s.flipping_pairs }} / {{ s.total_pairs }}</td>
+        <td class="dim" style="text-align: left;">
+          {%- if s.top_contributors -%}
+            {{ s.top_contributors }}
+          {%- else -%}
+            —
+          {%- endif -%}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  {% if by_dim_rows %}
+  <h2>By-dimension flip rates</h2>
+  <table class="data">
+    <thead>
+      <tr>
+        <th>Dimension</th>
+        <th style="text-align: right;">Flipping pairs</th>
+        <th style="text-align: right;">Flip rate</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for d in by_dim_rows %}
+      <tr>
+        <td class="name">{{ d.dim }}</td>
+        <td class="num">{{ d.flipping_pairs }} / {{ d.total_pairs }}</td>
+        <td class="num">{{ d.flip_rate_pct_str }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <div class="caveat">
+    <strong>Read this before quoting the number.</strong>
+    This is a <strong>candidate disparate-impact signal worth a follow-up audit</strong>,
+    not a finding that your model is biased.
+    "Disparate impact" is a legal term of art (ECOA Reg-B, FHA, ADEA) that requires
+    an 80%-rule check or a Wald-test significance test on the full eligible population;
+    this report measures a verdict-flip rate on a counterfactual sample and surfaces
+    which agent in the chain contributed most to those flips.
+    Use the by-agent table to scope where a compliance team should look first;
+    do not file it as a disparate-impact determination.
+  </div>
+
+  <div class="meta-row">
+    <span><strong>Topology:</strong> {{ topology_name }}</span>
+    <span><strong>Canonical pairs:</strong> {{ n_canonical_pairs }}</span>
+    <span><strong>Flipping pairs:</strong> {{ n_flipping_pairs }}</span>
+    <span><strong>Cost:</strong> {{ cost_str }}</span>
+  </div>
+
+  {# Pass-1 BLOCKER B4 fix: surface unpriced-model footnote when any
+     re-execution call hit a model missing from the cost rate table. #}
+  {% if unpriced_note %}
+  <div class="notes">
+    <strong>Cost footnote:</strong> {{ unpriced_note }}
+  </div>
+  {% endif %}
+
+  {% if partial %}
+  <div class="notes">
+    <strong>Run flagged partial:</strong>
+    the audit was hard-stopped before all dimensions / swaps completed
+    (most often by <code>--max-cost-usd</code>). Treat this as a preliminary
+    signal pending a full rerun.
+  </div>
+  {% endif %}
+
+  <div class="footer">
+    {% if target_phrase %}
+    <div class="target">Prepared for {{ target_phrase }}.</div>
+    {% endif %}
+    <div>topofuzz · run {{ run_id }} · TDS v{{ tds_version }} · signed {{ signed_at }}</div>
+    <div class="attest">verify: copy <code>{{ run_id }}</code> into <code>topofuzz verify</code> against the source bundle.</div>
+    <div class="methodology">methodology: counterfactual audit — eval-axis demographic substitutions (name / ZIP / age / gender) re-judged under the source jury; per-agent attribution via leave-one-out re-execution. Full protocol in packages/topofuzz/README.md §Counterfactual Audit.</div>
+  </div>
+</div>
+</body>
+</html>

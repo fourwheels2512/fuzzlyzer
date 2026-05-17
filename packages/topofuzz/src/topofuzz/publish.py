@@ -820,6 +820,830 @@ def build_consistency_card_pdf(
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# F7 — Counterfactual-card PDF (1-2 page derivative of `topofuzz audit`).
+# ---------------------------------------------------------------------------
+
+
+_COUNTERFACTUAL_CARD_NODE_ROW_LIMIT = 8
+"""How many rows the by-agent table shows. A 4-role pipeline has ~3
+non-terminal roles plus the terminal control; 8 covers the realistic
+upper bound while keeping the card to 1-2 paper pages."""
+
+_COUNTERFACTUAL_CARD_SWAP_ROW_LIMIT = 6
+"""How many swap-pair rows the drilldown table shows. Six covers a
+typical 4-dim audit with 1-2 substitutions per dim; an audit that
+generated more will surface its by-dim rates in the dim section."""
+
+_COUNTERFACTUAL_CARD_DIM_DISPLAY_LIMIT = 30
+"""Hard cap on rendered dim / swap-token strings. Matches the role-name
+cap so a hostile audit.json can't push the card past its page budget."""
+
+
+def build_counterfactual_card_pdf(
+    run_dir: Path,
+    *,
+    out_path: Path,
+    target: str | None = None,
+) -> Path:
+    """Render a 1-2 page counterfactual-audit card to ``out_path``.
+
+    F7 (2026-05-17). The cold-email enclosure for ``topofuzz audit``:
+    surfaces the by-agent attribution headline (which non-terminal node
+    contributed most to demographic-counterfactual verdict flips) plus
+    the by-swap-pair drilldown and the by-dim flip-rate summary.
+
+    Reads ``<run_dir>/audit.json`` via
+    :func:`topofuzz.counterfactual_audit.read_audit_sidecar`. Refuses to
+    render when the sidecar is absent (the operator must run
+    ``topofuzz audit`` first).
+
+    Pitch-copy guardrail (non-negotiable per F7 spec): the rendered PDF
+    says "candidate disparate-impact signal worth a follow-up audit",
+    NOT "your model is biased". "Disparate impact" is a legal term of
+    art (ECOA Reg-B, FHA, ADEA) that this engine does NOT compute — we
+    measure a flip-rate sample and attribute it to upstream agents.
+
+    Reuses :func:`load_publish_metadata`, :func:`_format_footer`,
+    :func:`_render_html_pages_to_pdfs`, and :func:`_atomic_write_bytes`
+    so the attestation footer / Chromium sandbox / atomic-write
+    contracts are inherited byte-identically from F5/F6/F8.
+
+    Raises :class:`PublishError` on any failure.
+    """
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        raise PublishError(
+            f"run_dir is not a directory: {run_dir}"
+        )
+    out_path = Path(out_path)
+    if out_path.is_dir():
+        raise PublishError(
+            f"out_path is an existing directory: {out_path}"
+        )
+    target = _validate_target_company(target)
+
+    metadata = load_publish_metadata(run_dir)
+    footer_text = _format_footer(metadata)
+
+    manifest = _load_manifest(run_dir)
+
+    # Read the audit sidecar. ``read_audit_sidecar`` returns ``None``
+    # when the file is absent; raises ``AuditError`` when it is present
+    # but unreadable / wrong-typed. Translate both surfaces into
+    # ``PublishError`` so the CLI prints a single coherent message.
+    #
+    # Pass-1 MAJOR M5 fix: ``counterfactual_audit`` is shipped as part of
+    # the topofuzz package itself — there is no install extra that gates
+    # it. The prior error message ("install the full topofuzz package,
+    # not just the verify-only extras") misrouted operators toward a
+    # non-existent install fix. Mirror inspect.py's pattern of importing
+    # an adjacent topofuzz module inline at the call site (inspect.py
+    # imports ablation.py the same way), and rewrite the error to the
+    # actually-reachable failure surface: the topofuzz package is
+    # corrupt / partially uninstalled.
+    try:
+        from topofuzz.counterfactual_audit import (
+            AuditError,
+            read_audit_sidecar,
+        )
+    except ImportError as e:
+        raise PublishError(
+            "topofuzz publish --counterfactual-card could not import "
+            "topofuzz.counterfactual_audit. The module is shipped with "
+            "the topofuzz package itself, so an ImportError here "
+            "indicates a corrupt or partial install. Reinstall topofuzz "
+            "(`pip install --force-reinstall topofuzz`) before retrying."
+        ) from e
+
+    try:
+        audit = read_audit_sidecar(run_dir)
+    except AuditError as e:
+        raise PublishError(f"could not read audit.json: {e}") from e
+    if audit is None:
+        raise PublishError(
+            "audit.json is missing in run_dir — run "
+            "`topofuzz audit <run_dir>` once so the counterfactual "
+            "card has data to render."
+        )
+
+    # Pass-2 BLOCKER B1 fix + Pass-2 MAJOR M3 fix: defensive
+    # second-line schema check at the consumer site. ``read_audit_sidecar``
+    # is the primary gate (see counterfactual_audit.py); this is
+    # belt-and-suspenders so a future code path that bypasses the
+    # reader (e.g. an in-memory cached sidecar dict) cannot render a
+    # v1-shape sidecar with v2-code semantics.
+    from topofuzz.counterfactual_audit import (
+        _AUDIT_SIDECAR_SCHEMA_VERSION,
+    )
+    observed_version = audit.get("schema_version")
+    if observed_version != _AUDIT_SIDECAR_SCHEMA_VERSION:
+        raise PublishError(
+            f"audit.json schema_version is {observed_version!r}, "
+            f"expected {_AUDIT_SIDECAR_SCHEMA_VERSION}. Older sidecars "
+            "carry different denominator semantics (v1 quoted Phase-2 "
+            "flipping triples; v2 quotes Phase-1 attempts) — rerun "
+            "`topofuzz audit` against the source run to regenerate."
+        )
+
+    ctx = _build_counterfactual_card_context(
+        metadata=metadata,
+        manifest=manifest,
+        audit=audit,
+        target=target,
+    )
+
+    html = _render_counterfactual_card_html(ctx)
+    # Mirror the F6/F8 stale-debris sweep so an interrupted Chromium
+    # handle on Windows can't accumulate orphans. Narrow prefix so a
+    # legitimate operator file `counterfactual_card_demo.html` isn't
+    # swept.
+    for stale in run_dir.glob("counterfactual_card_tmp_*.html"):
+        try:
+            stale.unlink()
+        except OSError:
+            _log.debug(
+                "publish: could not sweep stale counterfactual card %s",
+                stale,
+            )
+    # Pass-1 BLOCKER B5 fix: pypdf MUST be importable so the page-cap
+    # check actually runs. The prior code silently treated an
+    # ImportError as ``n_pages = 1`` — a runaway template on a slim
+    # install would ship a 10-page PDF to a buyer without tripping
+    # the F7 1-2-page hard cap. Fail eagerly with the same wording
+    # the consistency-card sibling uses for the same dependency
+    # surface (mirrors line 2280 of publish.py for the [full] extra).
+    try:
+        import pypdf  # noqa: F401 — checked before render to fail fast.
+    except ImportError as e:
+        raise PublishError(
+            "topofuzz publish --counterfactual-card requires the "
+            "'full' install (pip install topofuzz[full]) to enforce "
+            "the F7 spec's 1-2 page hard cap. Install the full extras "
+            "or use the consistency-card PDF, which has the same "
+            "dependency."
+        ) from e
+
+    # Pass-1 MINOR Mi8 fix: assign tmp_html_path BEFORE fh.write so a
+    # mid-write OSError / disk-full surfaces with a clean unlink path
+    # in the finally block, rather than leaving a half-written scratch
+    # file in the run_dir.
+    with tempfile.NamedTemporaryFile(
+        prefix="counterfactual_card_tmp_",
+        suffix=".html",
+        dir=run_dir,
+        delete=False,
+        mode="w",
+        encoding="utf-8",
+    ) as fh:
+        tmp_html_path = Path(fh.name)
+        fh.write(html)
+    try:
+        pdf_bytes_list = _render_html_pages_to_pdfs(
+            [tmp_html_path], footer_text
+        )
+    finally:
+        try:
+            tmp_html_path.unlink()
+        except OSError:
+            _log.warning(
+                "publish: could not unlink counterfactual card scratch "
+                "file %s",
+                tmp_html_path,
+            )
+    if len(pdf_bytes_list) != 1:
+        raise PublishError(
+            f"counterfactual card render produced {len(pdf_bytes_list)} "
+            "PDFs; expected exactly 1."
+        )
+    pdf_bytes = pdf_bytes_list[0]
+    # Pass-1 BLOCKER B5 fix: pypdf is now mandatory (imported above);
+    # no fallback ``n_pages = 1`` branch.
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        n_pages = len(reader.pages)
+    except Exception as e:  # noqa: BLE001 — refuse the artifact, not crash
+        raise PublishError(
+            f"could not validate counterfactual card page count: {e}"
+        ) from e
+    if n_pages > 2:
+        raise PublishError(
+            f"counterfactual card rendered to {n_pages} pages; the F7 "
+            "spec is 1-2 pages. Inspect the source HTML for runaway "
+            "content (usually a long topology_name or oversized "
+            "by_swap_pair table)."
+        )
+    _atomic_write_bytes(out_path, pdf_bytes)
+    return out_path
+
+
+def _safe_dim_token(name: str) -> str:
+    """NFC-normalize, strip invisible/control codepoints, length-bound.
+
+    Reused for dim names, from_token, and to_token cells so a hostile
+    audit.json can't inflate the rendered table past the 1-2 page
+    budget. Autoescape catches XSS; this cap catches overflow.
+
+    Pass-1 MINOR Mi2 fix: also NFC-normalize the input and strip the
+    same family of invisible/control/homoglyph codepoints that
+    :func:`_validate_target_company` rejects. The dim-token cell is
+    surfaced inside a PDF table; a hand-edited ``audit.json`` carrying
+    U+202E (RLO bidi override) in a ``from_token`` cosmetically poisons
+    every row to its right. Unlike the target-company path (which
+    raises), this helper sanitizes silently because the dim-token cell
+    is rendered as a non-fatal display fragment — refusing the whole
+    render over a stray ZWSP is over-correction. The stripped form
+    matches what the autoescaped HTML would have rendered if the
+    codepoints had been "harmless" — a buyer-readable token without
+    the bidi/zero-width payload.
+    """
+    if not isinstance(name, str):
+        return "—"
+    import unicodedata
+    original_input = name
+    name = unicodedata.normalize("NFC", name)
+    out_chars: list[str] = []
+    for ch in name:
+        cp = ord(ch)
+        if cp < 0x20 and ch not in ("\t", "\n"):
+            # C0 control char — drop silently. Tab/newline tolerated
+            # because Jinja autoescape collapses them in table cells.
+            continue
+        if 0x7f <= cp <= 0x9f:
+            # C1 control char — drop silently.
+            continue
+        if (
+            0x200b <= cp <= 0x200f
+            or 0x202a <= cp <= 0x202e
+            or 0x2066 <= cp <= 0x2069
+            or cp == 0x00ad
+            or cp == 0x2060  # Pass-2 RT MINOR Mi3 fix: word joiner
+            or cp == 0xfeff  # Pass-2 RT MINOR Mi3 fix: BOM / ZWNBSP
+            or 0xfe00 <= cp <= 0xfe0f
+            or 0xe0100 <= cp <= 0xe01ef
+            or 0xe0000 <= cp <= 0xe007f
+            or 0x1d400 <= cp <= 0x1d7ff
+        ):
+            # Invisible / bidi-format / variation-selector / Unicode-
+            # tag / mathematical-alphanumeric homoglyph — drop silently.
+            continue
+        out_chars.append(ch)
+    sanitized = "".join(out_chars)
+    # Pass-2 RT MAJOR M2 fix: emit a forensics warning whenever
+    # sanitization actually MODIFIED the input — defensible silent
+    # stripping for stray ZWSPs becomes irresponsible silence for
+    # U+202E (RLO bidi override) and the rest of the homoglyph family,
+    # which are malicious-input signals. One warning per call only
+    # (not per token codepoint) — sufficient for forensics, doesn't
+    # spam the log. Inputs[:50] truncation protects the log line
+    # itself from a hostile multi-kB token.
+    if sanitized != original_input:
+        n_stripped = len(original_input) - len(sanitized)
+        _log.warning(
+            "publish: stripped %d invisible/bidi codepoints from dim "
+            "token %r → %r",
+            n_stripped,
+            original_input[:50],
+            sanitized[:50],
+        )
+    if not sanitized:
+        # Token was 100% invisible/control payload — surface a sentinel
+        # so the rendered cell isn't blank.
+        return "—"
+    if len(sanitized) > _COUNTERFACTUAL_CARD_DIM_DISPLAY_LIMIT:
+        return sanitized[: _COUNTERFACTUAL_CARD_DIM_DISPLAY_LIMIT - 1] + "…"
+    return sanitized
+
+
+def _extract_by_node_rows(
+    audit: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Pull the audit-wide ``by_node`` table → list of dicts for the template.
+
+    Returns ``(non_terminal_rows_plus_optional_terminal, terminal_row)``.
+    Non-terminal rows are sorted by ``attribution_pct`` descending;
+    ties on name ascending for byte-determinism. The terminal row (if
+    present) is appended LAST and styled as the experimental control —
+    its attribution_pct is always 100% by construction
+    (``substitute_terminal`` ablation kind), so labelling it as a
+    control prevents a buyer from mis-reading it as "the terminal node
+    is the bias source".
+    """
+    by_node = audit.get("by_node")
+    if not isinstance(by_node, dict):
+        return [], None
+    non_terminal: list[dict[str, Any]] = []
+    terminal: dict[str, Any] | None = None
+    for name, payload in by_node.items():
+        if not isinstance(name, str) or not isinstance(payload, dict):
+            continue
+        pct = payload.get("attribution_pct")
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            continue
+        if pct != pct:  # NaN
+            continue
+        if pct < 0 or pct > 100:
+            continue
+        flips_closed = payload.get("flips_closed")
+        total_meaningful = payload.get("total_meaningful")
+        if (
+            isinstance(total_meaningful, int)
+            and not isinstance(total_meaningful, bool)
+            and total_meaningful == 0
+        ):
+            continue
+        is_terminal = payload.get("is_terminal") is True
+        row = {
+            "name": _safe_dim_token(name),
+            "attribution_pct": float(pct),
+            "attribution_pct_str": f"{float(pct):.1f}%",
+            "flips_closed": (
+                flips_closed
+                if isinstance(flips_closed, int)
+                and not isinstance(flips_closed, bool)
+                else None
+            ),
+            "total_meaningful": (
+                total_meaningful
+                if isinstance(total_meaningful, int)
+                and not isinstance(total_meaningful, bool)
+                else None
+            ),
+            "is_terminal": is_terminal,
+        }
+        if is_terminal:
+            # Only keep ONE terminal row even if a malformed sidecar
+            # contains multiple — the buyer-facing card has a single
+            # control slot.
+            if terminal is None:
+                terminal = row
+        else:
+            non_terminal.append(row)
+    non_terminal.sort(key=lambda r: (-r["attribution_pct"], r["name"]))
+    # Cap the non-terminal list, then append the terminal as a labelled
+    # control row at the bottom. Truncation count tracked separately so
+    # the template can surface "+N more" if needed in a later iteration.
+    rows = non_terminal[: _COUNTERFACTUAL_CARD_NODE_ROW_LIMIT]
+    if terminal is not None:
+        rows.append(terminal)
+    return rows, terminal
+
+
+def _extract_swap_pair_rows(
+    audit: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Pull the ``by_swap_pair`` table → flat list of rows for the template.
+
+    Sorted by ``flipping_pairs`` descending so the most-impactful
+    substitution leads. Top-2 contributing nodes per row are rendered
+    inline as ``"role 64% · role 55%"``.
+
+    Pass-1 MINOR Mi5 fix: the audit-wide ``by_node`` table is the
+    source of truth for ``is_terminal`` (set on the per-node slot at
+    aggregation time). We pre-extract the terminal node IDs from the
+    audit-wide table and filter them out of the per-swap-pair
+    contributors. The prior comment claimed the filter caught
+    ``substitute_terminal`` rows via ``tm == 0``, but the terminal
+    control has ``tm > 0`` (it's the experimental baseline) and
+    ``pct == 100``, so without this lookup it leaked into the "Top
+    contributors" cell and crowded out actionable upstream agents.
+    """
+    by_sp = audit.get("by_swap_pair")
+    if not isinstance(by_sp, dict):
+        return []
+    # Pass-1 MINOR Mi5 fix: collect terminal node ids from the audit-
+    # wide by_node table (single authoritative source).
+    terminal_node_ids: set[str] = set()
+    audit_by_node = audit.get("by_node")
+    if isinstance(audit_by_node, dict):
+        for nid, slot in audit_by_node.items():
+            if (
+                isinstance(nid, str)
+                and isinstance(slot, dict)
+                and slot.get("is_terminal") is True
+            ):
+                terminal_node_ids.add(nid)
+    rows: list[dict[str, Any]] = []
+    for flat_key, payload in by_sp.items():
+        if not isinstance(payload, dict):
+            continue
+        dim = payload.get("dim") or ""
+        from_token = payload.get("from_token") or ""
+        to_token = payload.get("to_token") or ""
+        flipping_pairs = payload.get("flipping_pairs")
+        total_pairs = payload.get("total_pairs")
+        if (
+            isinstance(flipping_pairs, bool)
+            or not isinstance(flipping_pairs, int)
+        ):
+            flipping_pairs = 0
+        if (
+            isinstance(total_pairs, bool)
+            or not isinstance(total_pairs, int)
+        ):
+            total_pairs = 0
+        # Top-2 contributing non-terminal nodes for this swap-pair.
+        per_node = payload.get("by_node")
+        contrib_rows: list[tuple[str, float]] = []
+        if isinstance(per_node, dict):
+            for nid, pn in per_node.items():
+                if not isinstance(nid, str) or not isinstance(pn, dict):
+                    continue
+                pct = pn.get("attribution_pct")
+                if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+                    continue
+                if pct != pct or pct < 0 or pct > 100:
+                    continue
+                # Pass-1 MINOR Mi5 fix: cross-reference audit-wide
+                # by_node to filter the experimental control out of
+                # the drilldown. tm==0 alone was insufficient.
+                if nid in terminal_node_ids:
+                    continue
+                tm = pn.get("total_meaningful")
+                if (
+                    isinstance(tm, int)
+                    and not isinstance(tm, bool)
+                    and tm == 0
+                ):
+                    continue
+                contrib_rows.append((nid, float(pct)))
+        contrib_rows.sort(key=lambda x: (-x[1], x[0]))
+        top_strs = [
+            f"{_safe_dim_token(n)} {pct:.0f}%"
+            for n, pct in contrib_rows[:2]
+        ]
+        top_contributors = " · ".join(top_strs)
+        rows.append({
+            "dim": _safe_dim_token(str(dim)),
+            "from_token": _safe_dim_token(str(from_token)),
+            "to_token": _safe_dim_token(str(to_token)),
+            "flipping_pairs": flipping_pairs,
+            "total_pairs": total_pairs,
+            "top_contributors": top_contributors,
+        })
+    rows.sort(
+        key=lambda r: (-r["flipping_pairs"], r["dim"], r["from_token"])
+    )
+    return rows[:_COUNTERFACTUAL_CARD_SWAP_ROW_LIMIT]
+
+
+def _extract_by_dim_rows(
+    audit: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Pull the ``by_dim`` table → one row per audited dim."""
+    by_dim = audit.get("by_dim")
+    if not isinstance(by_dim, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    for dim, payload in by_dim.items():
+        if not isinstance(dim, str) or not isinstance(payload, dict):
+            continue
+        flipping_pairs = payload.get("flipping_pairs")
+        total_pairs = payload.get("total_pairs")
+        flip_rate = payload.get("flip_rate_pct")
+        if (
+            isinstance(flipping_pairs, bool)
+            or not isinstance(flipping_pairs, int)
+        ):
+            flipping_pairs = 0
+        if (
+            isinstance(total_pairs, bool)
+            or not isinstance(total_pairs, int)
+        ):
+            total_pairs = 0
+        if (
+            isinstance(flip_rate, bool)
+            or not isinstance(flip_rate, (int, float))
+        ):
+            flip_rate_str = "—"
+        elif flip_rate != flip_rate:  # NaN
+            flip_rate_str = "—"
+        else:
+            flip_rate_str = f"{float(flip_rate):.1f}%"
+        rows.append({
+            "dim": _safe_dim_token(dim),
+            "flipping_pairs": flipping_pairs,
+            "total_pairs": total_pairs,
+            "flip_rate_pct_str": flip_rate_str,
+        })
+    # Stable order: by flipping_pairs descending, ties on dim ascending.
+    rows.sort(key=lambda r: (-r["flipping_pairs"], r["dim"]))
+    return rows
+
+
+def _format_counterfactual_headline(
+    *,
+    by_node_rows: list[dict[str, Any]],
+    swap_pair_rows: list[dict[str, Any]],
+    n_flipping_pairs: int,
+    n_canonical_pairs: int,
+    topology_name: str,
+    partial: bool,
+) -> tuple[str, str, str, str, str]:
+    """Pick the headline tuple (title, lede, stat, stat_label, sub_line).
+
+    Leads with the BY-AGENT attribution finding (the F7 wedge versus
+    LangFair / MALIBU) — NOT with the raw flip count. When attribution
+    data is unavailable, falls back to a flip-rate-led headline so the
+    card still renders cleanly on a degenerate / empty audit.
+
+    Caveat (non-negotiable): no branch says "your model is biased".
+    Copy describes signal magnitudes worth a follow-up audit.
+    """
+    # The first non-terminal row is the top attributable agent.
+    top_agent: dict[str, Any] | None = None
+    for r in by_node_rows:
+        if not r.get("is_terminal"):
+            top_agent = r
+            break
+
+    # The first swap-pair row is the most-flipping substitution.
+    top_swap = swap_pair_rows[0] if swap_pair_rows else None
+
+    # Pass-1 MAJOR M3 fix: n_canonical_pairs == 0 means no demographic
+    # markers were found in the eval set, so the generators returned
+    # zero swaps. The prior "held its verdict under demographic
+    # counterfactual substitutions" headline was a stability claim
+    # against a measurement that NEVER RAN — actively misleading. Lead
+    # with the no-op explanation so the operator's eye lands on
+    # "nothing measured" instead of "nothing flipped".
+    if n_canonical_pairs == 0:
+        title = (
+            "No counterfactual measurements were possible on this run."
+        )
+        lede = (
+            f"None of the canonical eval rows in {topology_name} "
+            "contained demographic markers our counterfactual "
+            "generators recognise (Bertrand-Mullainathan names, "
+            "metro-matched ZIPs, age phrases, or gendered pronouns). "
+            "This card cannot certify a stability or fairness claim. "
+            "Add demographic-marker rows to the eval set or run with "
+            "`--counterfactual <dim>` filtered to dims whose markers "
+            "actually appear in your input. The headline number "
+            "below is therefore zero by construction, not a measured "
+            "stability finding — see the caveat box."
+        )
+        stat_headline = "0"
+        stat_label = (
+            "ablation-eligible verdict flips under demographic "
+            "substitution (no markers found in eval)"
+        )
+        sub_parts = ["0 pairs audited (no markers in eval)"]
+        if partial:
+            sub_parts.append("audit run partial")
+        sub_line = " · ".join(sub_parts)
+        return title, lede, stat_headline, stat_label, sub_line
+
+    if top_agent and top_swap and n_flipping_pairs > 0:
+        top_name = top_agent["name"]
+        # Pass-1 MINOR Mi3 fix: rename ``top_pct`` → ``top_pct_str``.
+        # The field carries the pre-formatted "%.1f%%" string (e.g.
+        # ``"64.0%"``); the bare name suggested a float and invited
+        # arithmetic comparison. Use ``top_agent["attribution_pct"]``
+        # if the float form is needed.
+        top_pct_str = top_agent["attribution_pct_str"]
+        flipping_pairs = top_swap["flipping_pairs"]
+        total_pairs = top_swap["total_pairs"]
+        from_token = top_swap["from_token"]
+        to_token = top_swap["to_token"]
+        title = (
+            f"The {top_name} agent contributed most to "
+            "demographic-counterfactual verdict flips on "
+            f"{topology_name}."
+        )
+        # Pass-1 BLOCKER B1 fix: the denominator on the swap-pair row
+        # (``total_pairs``) is now the count of Phase-1 ATTEMPTS for
+        # that substitution, not a structurally-100% denominator.
+        # Reword the lede so it reads as a measurement against
+        # canonical attempts, not as "N/M times" with a hidden
+        # denominator.
+        lede = (
+            f"Swapping {from_token} → {to_token} flipped the verdict "
+            f"{flipping_pairs} of {total_pairs} canonical attempts in "
+            "this audit; leave-one-out ablation traced "
+            f"{top_pct_str} of audit-wide flip-closure back to the "
+            f"{top_name} role. The by-agent table below shows the "
+            "full attribution distribution — scope a follow-up "
+            "audit against the top contributors before treating the "
+            "headline as actionable."
+        )
+        stat_headline = top_pct_str
+        stat_label = (
+            f"of audit-wide ablation-eligible flips closed by removing "
+            f"the {top_name} agent"
+        )
+        sub_parts = [f"{n_flipping_pairs} flipping pairs measured"]
+        if partial:
+            sub_parts.append("audit run partial")
+        sub_line = " · ".join(sub_parts)
+        return title, lede, stat_headline, stat_label, sub_line
+
+    if top_swap and n_flipping_pairs > 0:
+        # No usable by_node attribution (e.g. all meaningful results
+        # were on the terminal). Fall back to the flip-pair headline
+        # but still keep the by-agent framing in the lede.
+        flipping_pairs = top_swap["flipping_pairs"]
+        total_pairs = top_swap["total_pairs"]
+        from_token = top_swap["from_token"]
+        to_token = top_swap["to_token"]
+        title = (
+            f"Demographic counterfactuals flipped {topology_name}'s "
+            "verdict, but the leave-one-out pass did not isolate a "
+            "single upstream agent."
+        )
+        # Pass-1 BLOCKER B1 fix: denominator wording per above.
+        lede = (
+            f"Swapping {from_token} → {to_token} flipped the verdict "
+            f"{flipping_pairs} of {total_pairs} canonical attempts "
+            "across the audit. By-agent attribution was inconclusive "
+            "(no non-terminal role closed enough flips to lead the "
+            "ranking) — the drilldown table below scopes the "
+            "substitutions that did the most damage."
+        )
+        stat_headline = f"{flipping_pairs}/{total_pairs}"
+        stat_label = (
+            f"verdict flips on the {from_token} → {to_token} "
+            "substitution"
+        )
+        sub_parts = [f"{n_flipping_pairs} flipping pairs measured"]
+        if partial:
+            sub_parts.append("audit run partial")
+        sub_line = " · ".join(sub_parts)
+        return title, lede, stat_headline, stat_label, sub_line
+
+    # n_canonical_pairs > 0 but zero flips — the audit ran AND the
+    # pipeline held its verdict under demographic substitution. This
+    # is the legitimate "stable under counterfactual" branch.
+    title = (
+        f"This {topology_name} pipeline held its verdict under "
+        "demographic counterfactual substitutions."
+    )
+    lede = (
+        f"{n_canonical_pairs} canonical / counterfactual pairs were "
+        "audited and none produced an ablation-eligible verdict flip. "
+        "Treat this as a preliminary cross-demographic-stability "
+        "signal, not a disparate-impact certification — see the "
+        "caveat box below."
+    )
+    stat_headline = "0"
+    stat_label = (
+        "ablation-eligible verdict flips under demographic "
+        "substitution"
+    )
+    sub_parts = [f"{n_canonical_pairs} pairs audited"]
+    if partial:
+        sub_parts.append("audit run partial")
+    sub_line = " · ".join(sub_parts)
+    return title, lede, stat_headline, stat_label, sub_line
+
+
+def _build_counterfactual_card_context(
+    *,
+    metadata: dict[str, str],
+    manifest: dict[str, Any],
+    audit: dict[str, Any],
+    target: str | None,
+) -> dict[str, Any]:
+    """Assemble the Jinja context for counterfactual_card.html.j2.
+
+    Byte-deterministic given (metadata, manifest, audit, target). Tests
+    pin the rendered context without spinning up Chromium.
+    """
+    topology_name = _truncate_topology_name(
+        str(manifest.get("topology_name") or "(unknown)")
+    )
+
+    n_canonical_pairs = audit.get("n_canonical_pairs")
+    n_flipping_pairs = audit.get("n_flipping_pairs")
+    if (
+        isinstance(n_canonical_pairs, bool)
+        or not isinstance(n_canonical_pairs, int)
+    ):
+        n_canonical_pairs = 0
+    if (
+        isinstance(n_flipping_pairs, bool)
+        or not isinstance(n_flipping_pairs, int)
+    ):
+        n_flipping_pairs = 0
+
+    total_cost_usd = audit.get("total_cost_usd")
+    if isinstance(total_cost_usd, (int, float)) and not isinstance(
+        total_cost_usd, bool
+    ):
+        cost_str = f"${float(total_cost_usd):.2f}"
+    else:
+        cost_str = "—"
+
+    partial = audit.get("partial") is True
+
+    # Pass-1 BLOCKER B4 fix: surface the unpriced-call footnote when
+    # any re-execution calls hit a model missing from the cost rate
+    # table. Without this the buyer reads "$0.42" as the audit's real
+    # spend even though billing excludes unpriced calls.
+    # Pass-2 RT MAJOR M3 fix: changed wording from "lower bound" →
+    # "EXCLUDES UNPRICED CALLS — billing could be ~5x higher" because
+    # Phase-2 verdict-node fallback ($0.05) sits in the middle of a
+    # $0.03-$0.10 premium-model band; a compliance buyer reading the
+    # PDF in deposition deserves the stronger framing.
+    unpriced_count = audit.get("unpriced_call_count")
+    unpriced_models_field = audit.get("unpriced_models")
+    if (
+        isinstance(unpriced_count, int)
+        and not isinstance(unpriced_count, bool)
+        and unpriced_count > 0
+    ):
+        models_repr: list[str] = []
+        if isinstance(unpriced_models_field, list):
+            for m in unpriced_models_field:
+                if isinstance(m, str) and m:
+                    models_repr.append(m)
+        if models_repr:
+            models_str = ", ".join(models_repr)
+        else:
+            models_str = "unknown vendor model(s)"
+        unpriced_note = (
+            f"total_cost_usd EXCLUDES UNPRICED CALLS — {unpriced_count} "
+            f"re-execution call(s) used models missing from the cost "
+            f"rate table ({models_str}); actual vendor billing could be "
+            f"~5× higher on premium verdict-node models."
+        )
+    else:
+        unpriced_note = ""
+
+    by_node_rows, terminal_row = _extract_by_node_rows(audit)
+    swap_pair_rows = _extract_swap_pair_rows(audit)
+    by_dim_rows = _extract_by_dim_rows(audit)
+
+    headline_title, headline_lede, stat_headline, stat_label, headline_sub = (
+        _format_counterfactual_headline(
+            by_node_rows=by_node_rows,
+            swap_pair_rows=swap_pair_rows,
+            n_flipping_pairs=n_flipping_pairs,
+            n_canonical_pairs=n_canonical_pairs,
+            topology_name=topology_name,
+            partial=partial,
+        )
+    )
+
+    terminal_control_note = (
+        "The terminal node is listed as a control: its attribution is "
+        "always 100% by construction (substitute_terminal ablation "
+        "swaps the canonical answer directly into the counterfactual "
+        "run), so a high value there reflects mechanics, not a "
+        "finding."
+        if terminal_row is not None
+        else ""
+    )
+
+    target_phrase = target.strip() if target else None
+
+    return {
+        "headline_title": headline_title,
+        "headline_lede": headline_lede,
+        "stat_headline": stat_headline,
+        "stat_label": stat_label,
+        "headline_sub_line": headline_sub,
+        "by_node_rows": by_node_rows,
+        "swap_pair_rows": swap_pair_rows,
+        "by_dim_rows": by_dim_rows,
+        "terminal_control_note": terminal_control_note,
+        "topology_name": topology_name,
+        "n_canonical_pairs": n_canonical_pairs,
+        "n_flipping_pairs": n_flipping_pairs,
+        "cost_str": cost_str,
+        # Pass-1 BLOCKER B4 fix: pass the unpriced-call footnote
+        # through to the template; rendered next to the cost when
+        # nonzero, empty string otherwise.
+        "unpriced_note": unpriced_note,
+        "partial": partial,
+        "target_phrase": target_phrase,
+        "run_id": metadata.get("run_id") or "(unknown)",
+        "tds_version": metadata.get("tds_version") or "(unknown)",
+        "signed_at": metadata.get("signed_at") or "(unsigned)",
+    }
+
+
+def _render_counterfactual_card_html(ctx: dict[str, Any]) -> str:
+    """Render counterfactual_card.html.j2 with the assembled context."""
+    try:
+        import jinja2
+    except ImportError as e:
+        raise PublishError(
+            "topofuzz publish --counterfactual-card requires the "
+            "'full' install extra — jinja2 not found. Install with "
+            "`pip install topofuzz[full]`."
+        ) from e
+
+    template_dir = Path(__file__).parent / "templates"
+    env = jinja2.Environment(
+        loader=jinja2.FileSystemLoader(str(template_dir)),
+        autoescape=True,
+        undefined=jinja2.StrictUndefined,
+    )
+    template = env.get_template("counterfactual_card.html.j2")
+    return template.render(**ctx)
+
+
 _DEGRADED_THRESHOLD = 0.0995
 """Failure-rate threshold for the degraded branch (F8 RT pass-1 M3).
 

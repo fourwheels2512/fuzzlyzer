@@ -215,6 +215,13 @@ def _variant_violates_edges(
 _RESERVED_FLAG_EXIT = 2
 _NOT_IMPLEMENTED_EXIT = 2
 _BAD_USAGE_EXIT = 2
+# Pass-1 MAJOR M6 fix: ``topofuzz audit --max-cost-usd`` below this
+# threshold skips the real-LLM confirmation prompt. A sub-dollar cap is
+# friction-theater (the cap itself trips before the second cell runs),
+# so the prompt becomes noise rather than a safeguard. Set to $1.00 so
+# a casual operator capping at $0.05 / $0.25 / $0.50 runs in one shot
+# while a $5 / $10 / uncapped pass still requires explicit consent.
+_CONFIRMATION_PROMPT_SKIP_THRESHOLD_USD = 1.00
 # `topofuzz verify` returns 1 on signature/JCS/digest failure per
 # BLUEPRINT_v5plus.md §15 DoD line 436 ("Tampering with one byte of the
 # payload returns exit 1"). Distinct from _BAD_USAGE_EXIT (=2) so CI
@@ -1758,13 +1765,28 @@ def publish(
             "(report.json must contain headline.judge_independence)."
         ),
     ),
+    counterfactual_card: Path | None = typer.Option(
+        None,
+        "--counterfactual-card",
+        help=(
+            "Destination PDF path for the 1-2 page counterfactual-audit "
+            "card — surfaces by-agent attribution on demographic input "
+            "swaps (name / ZIP / age / gender), the by-swap-pair "
+            "drilldown, and the by-dim flip rates from a "
+            "`topofuzz audit` source run. Requires <run_dir>/audit.json "
+            "(run `topofuzz audit` first). Bias-audit-flavoured pitch "
+            "hook — copy is calibrated to 'candidate disparate-impact "
+            "signal worth a follow-up audit', NOT a determination."
+        ),
+    ),
     target: str | None = typer.Option(
         None,
         "--target",
         help=(
             "Optional company name to substitute into the 'what this "
-            "means for $TARGET' paragraph on --ceo-card and "
-            "--consistency-card outputs. Max 80 chars."
+            "means for $TARGET' paragraph on --ceo-card, "
+            "--consistency-card, and --counterfactual-card outputs. "
+            "Max 80 chars."
         ),
     ),
     max_flips: int = typer.Option(
@@ -1816,20 +1838,32 @@ def publish(
     _reject_reserved_flags(list(ctx.args))
     _reject_unknown_extras(list(ctx.args))
 
-    if pdf is None and ceo_card is None and consistency_card is None:
+    if (
+        pdf is None
+        and ceo_card is None
+        and consistency_card is None
+        and counterfactual_card is None
+    ):
         typer.echo(
-            "topofuzz publish: at least one of --pdf, --ceo-card, or "
-            "--consistency-card must be supplied.",
+            "topofuzz publish: at least one of --pdf, --ceo-card, "
+            "--consistency-card, or --counterfactual-card must be "
+            "supplied.",
             err=True,
         )
         raise typer.Exit(code=_BAD_USAGE_EXIT)
     # F6 pass-1 RT M2: ``--target ""`` slips past `is not None`. Treat
     # any truthy target as "supplied" so the --pdf-only path doesn't
     # silently ignore an empty string the operator intended as a value.
-    if target and ceo_card is None and consistency_card is None:
+    if (
+        target
+        and ceo_card is None
+        and consistency_card is None
+        and counterfactual_card is None
+    ):
         typer.echo(
             "topofuzz publish: --target is only meaningful with "
-            "--ceo-card or --consistency-card.",
+            "--ceo-card, --consistency-card, or "
+            "--counterfactual-card.",
             err=True,
         )
         raise typer.Exit(code=_BAD_USAGE_EXIT)
@@ -1846,6 +1880,7 @@ def publish(
         PublishError,
         build_ceo_card_pdf,
         build_consistency_card_pdf,
+        build_counterfactual_card_pdf,
         build_publish_pdf,
     )
 
@@ -1869,6 +1904,13 @@ def publish(
                 target_company=target,
             )
             typer.echo(str(consistency_target))
+        if counterfactual_card is not None:
+            cf_target = build_counterfactual_card_pdf(
+                run_dir_path,
+                out_path=counterfactual_card,
+                target=target,
+            )
+            typer.echo(str(cf_target))
     except PublishError as e:
         typer.echo(f"topofuzz publish: {e}", err=True)
         raise typer.Exit(code=_VERIFY_FAIL_EXIT) from e
@@ -2222,6 +2264,371 @@ def ablate(
     typer.echo("")
     typer.echo(
         f"Wrote sidecar: {run_dir_path / 'ablation.json'!s}"
+    )
+
+
+# Maps CLI `--counterfactual` string tokens to the dim constants the
+# counterfactual generators speak. Kept here (not in counterfactual.py)
+# because the dash-suffixed CLI vocabulary is a UI concern, not an
+# engine concern — the engine API stays ``name|zip|age|gender``.
+_COUNTERFACTUAL_DIM_MAP: dict[str, str] = {
+    "name-swap": "name",
+    "zip-swap": "zip",
+    "age-swap": "age",
+    "gender-swap": "gender",
+}
+
+
+def _parse_counterfactual_dims(values: list[str]) -> tuple[str, ...]:
+    """Map CLI ``--counterfactual`` strings to dim constants.
+
+    Empty input → default to all four dims (the same default the engine
+    uses when ``dims`` is omitted). Unknown tokens raise a usage error
+    with the full supported vocabulary in the message — a typo like
+    ``--counterfactual=names`` must surface immediately, not silently
+    degrade to a no-op audit.
+    """
+    if not values:
+        return tuple(_COUNTERFACTUAL_DIM_MAP.values())
+    # Allow either repeated flags (--counterfactual name-swap
+    # --counterfactual zip-swap) OR a comma-separated single value
+    # (--counterfactual name-swap,zip-swap). The latter is what the
+    # F7 spec example uses; Typer's repeatable-option support handles
+    # the former natively.
+    tokens: list[str] = []
+    for v in values:
+        for part in str(v).split(","):
+            part = part.strip()
+            if part:
+                tokens.append(part)
+    unknown = [t for t in tokens if t not in _COUNTERFACTUAL_DIM_MAP]
+    if unknown:
+        supported = ", ".join(sorted(_COUNTERFACTUAL_DIM_MAP.keys()))
+        raise typer.BadParameter(
+            f"Unknown --counterfactual value(s): {', '.join(unknown)}. "
+            f"Supported: {supported}.",
+            param_hint="--counterfactual",
+        )
+    # Preserve request order but de-duplicate (a buyer passing
+    # `--counterfactual name-swap --counterfactual name-swap` should
+    # not double-charge themselves).
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in tokens:
+        dim = _COUNTERFACTUAL_DIM_MAP[t]
+        if dim not in seen:
+            seen.add(dim)
+            out.append(dim)
+    return tuple(out)
+
+
+@app.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+def audit(
+    ctx: typer.Context,
+    run_dir: str = typer.Argument(
+        ...,
+        help="Run directory (contains manifest.json + run.sqlite).",
+    ),
+    counterfactual: list[str] = typer.Option(
+        [],
+        "--counterfactual",
+        help=(
+            "Counterfactual dim(s) to audit, repeatable or comma-"
+            "separated. Choices: name-swap, zip-swap, age-swap, "
+            "gender-swap. Default = all four. Example: "
+            "`--counterfactual name-swap,zip-swap`."
+        ),
+    ),
+    max_cost_usd: float | None = typer.Option(
+        None,
+        "--max-cost-usd",
+        min=0.0,
+        help=(
+            "Soft-warn at 80%%, hard-stop at 100%%. None = uncapped. "
+            "A cap of 0 is rejected — it would trip before the first "
+            "counterfactual cell ran."
+        ),
+    ),
+    max_variants: int | None = typer.Option(
+        None,
+        "--max-variants",
+        min=1,
+        help=(
+            "Cap the number of source-run variants included in the "
+            "audit. Useful for cost containment on a first pass; the "
+            "default is unbounded."
+        ),
+    ),
+    max_canonical_evals: int | None = typer.Option(
+        None,
+        "--max-canonical-evals",
+        min=1,
+        help=(
+            "Cap the number of canonical eval rows audited per dim. "
+            "Default is unbounded."
+        ),
+    ),
+    fixture: str | None = typer.Option(
+        None,
+        "--fixture",
+        help=(
+            "Override the manifest's recorded fixture spec (use when "
+            "the fixture file has moved on disk since the source run)."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "Short-circuit every LLM call into a deterministic stub. "
+            "Counterfactual cells produce no flips in dry-run, so the "
+            "leave-one-out path is not exercised. Use for plumbing "
+            "validation and cost preflight; the percentages produced "
+            "are not meaningful."
+        ),
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the confirmation prompt (the audit pass bills real LLM calls).",
+    ),
+) -> None:
+    """Run eval-axis counterfactual audit on a source run's flips.
+
+    For each ``(variant, canonical_eval, dim)`` triple, generate a
+    paired counterfactual eval row (e.g. Maria -> Mario for name-swap),
+    run the variant against it, and — when the verdict flips — walk
+    every upstream node and ablate it back to its canonical-run
+    response to attribute which agent caused the disparate-impact
+    flip. The buyer-actionable answer to "which agent is biased on
+    this input axis?".
+
+    The source run MUST have used ``--jury-of-3``; SingleJudge runs are
+    rejected at the gate so the leave-one-out re-judgments don't
+    inherit the source's ~26 % per-judgment verdict noise (see
+    BLUEPRINT §F4 / §F7).
+
+    Writes ``<run_dir>/audit.json``. The PDF builder
+    (``topofuzz publish --counterfactual-card``) consumes the sidecar
+    to render the per-dim disparate-impact + per-node attribution
+    tables.
+
+    Exit codes:
+
+    * 0 — pass completed (possibly with partial results when the cost
+      cap tripped; partial state is surfaced in the summary, not the
+      exit code).
+    * 2 — usage error (run_dir not a directory; missing / malformed
+      manifest; non-jury-of-3 source; unknown ``--counterfactual``
+      value; fixture can't be loaded).
+    """
+    _reject_reserved_flags(list(ctx.args))
+    _reject_unknown_extras(list(ctx.args))
+
+    run_dir_path = Path(run_dir)
+    if not run_dir_path.is_dir():
+        typer.echo(
+            f"topofuzz audit: run_dir is not a directory: {run_dir}",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT)
+
+    if max_cost_usd is not None and max_cost_usd <= 0.0:
+        typer.echo(
+            "topofuzz audit: --max-cost-usd must be a positive amount. "
+            "Omit the flag for an uncapped pass.",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT)
+
+    try:
+        dims = _parse_counterfactual_dims(list(counterfactual))
+    except typer.BadParameter as e:
+        typer.echo(f"topofuzz audit: {e.message}", err=True)
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+
+    if not dry_run:
+        typer.echo(
+            "topofuzz: research tool, no warranty. The audit pass "
+            "generates counterfactual cells and re-judges flips under "
+            "the jury — this bills real LLM calls. See LICENSE.",
+            err=True,
+        )
+
+    from topofuzz.counterfactual_audit import AuditError, run_audit_pass
+
+    # Pass-1 MAJOR M6 fix: a sub-$1 cap is itself the safeguard — the
+    # cap trips before the second cell runs, so the "bills real LLM
+    # calls" confirm prompt is friction-theater. Skip the prompt and
+    # surface a single INFO line so the operator still sees the cap
+    # value in the log. Above the threshold (or uncapped) the prompt
+    # still fires.
+    if (
+        not yes
+        and not dry_run
+        and max_cost_usd is not None
+        and max_cost_usd <= _CONFIRMATION_PROMPT_SKIP_THRESHOLD_USD
+    ):
+        typer.echo(
+            f"INFO: cost capped at ${max_cost_usd:.2f} — skipping "
+            "confirmation prompt."
+        )
+    elif not yes and not dry_run:
+        if not typer.confirm(
+            "Run counterfactual audit on every canonical/dim pair "
+            "(bills real LLM calls)?",
+            default=False,
+        ):
+            typer.echo("Aborted.")
+            raise typer.Exit(code=0)
+
+    try:
+        summary = run_audit_pass(
+            run_dir_path,
+            dims=dims,
+            max_cost_usd=max_cost_usd,
+            max_variants=max_variants,
+            max_canonical_evals=max_canonical_evals,
+            fixture_override=fixture,
+            dry_run=dry_run,
+        )
+    except AuditError as e:
+        typer.echo(f"topofuzz audit: {e}", err=True)
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+
+    # Pass-1 MAJOR M3 fix: when no demographic markers were found in
+    # the eval set the audit is a no-op AND the per-dim summary below
+    # has 0/0 in every cell. Surface that BEFORE the regular summary
+    # so the operator sees "your eval lacks markers" instead of
+    # scanning a table of zeros and assuming the pipeline is stable.
+    if summary.n_canonical_pairs == 0:
+        typer.echo("")
+        typer.secho(
+            "WARNING: counterfactual generators found no swap tokens "
+            "in this eval set; audit is a no-op. The headline numbers "
+            "below are zero by construction, not a stability finding. "
+            "Add demographic-marker rows (Bertrand-Mullainathan names, "
+            "metro-matched ZIPs, age phrases, or gendered pronouns) "
+            "to the eval set before treating any result as actionable.",
+            err=True,
+            fg=typer.colors.YELLOW,
+        )
+
+    typer.echo("")
+    typer.echo(
+        f"Canonical pairs: {summary.n_canonical_pairs} | "
+        f"Flipping triples: {summary.n_flipping_pairs} | "
+        f"Ablation points: {summary.n_ablation_points} "
+        f"({summary.n_ablation_points_meaningful} meaningful)"
+    )
+    typer.echo(f"Cost (priced cells only): ${summary.total_cost_usd:.4f}")
+    # Pass-1 BLOCKER B4 fix: surface unpriced-call accounting so the
+    # operator knows the headline cost is incomplete.
+    # Pass-2 RT MAJOR M3 fix: replaced "lower bound" framing with a
+    # stronger "EXCLUDES UNPRICED CALLS" disclosure. The Phase-2
+    # terminal re-exec fallback ($0.05) is the midpoint of a $0.03-$0.10
+    # range on premium verdict-node models — "lower bound" is too soft
+    # a hedge when a compliance buyer reads the PDF in deposition and
+    # the actual bill could be ~5× higher than quoted.
+    if summary.unpriced_call_count > 0:
+        models_str = (
+            ", ".join(summary.unpriced_models)
+            if summary.unpriced_models else "unknown vendor model(s)"
+        )
+        typer.secho(
+            f"WARNING: total_cost_usd EXCLUDES UNPRICED CALLS — "
+            f"{summary.unpriced_call_count} re-execution call(s) used "
+            f"models missing from the cost rate table ({models_str}); "
+            "the actual vendor bill could be ~5× higher on premium "
+            "verdict-node models. Add these models to fuzzeval.costest's "
+            "rate table for accurate billing.",
+            err=True,
+            fg=typer.colors.YELLOW,
+        )
+    if summary.partial:
+        typer.echo(
+            "WARNING: cost cap tripped mid-pass; results are PARTIAL. "
+            "Per-dim and per-node tables below may have an incomplete "
+            "denominator. Re-run `topofuzz audit` to complete the "
+            "remaining counterfactual cells."
+        )
+    if dry_run:
+        typer.echo(
+            "DRY-RUN: every counterfactual cell and jury vote was "
+            "stubbed. No flips are produced in dry-run, so the per-"
+            "node attribution table is empty by construction. Re-run "
+            "without --dry-run for measured percentages."
+        )
+
+    # Per-dim disparate-impact summary — the lead signal for a buyer.
+    # Pass-1 BLOCKER B1 fix: per-dim total_pairs is now the Phase-1
+    # ATTEMPT count (every cell run), not the Phase-2 triple count.
+    # Wording reads "flipped K/N (M.MM%)" so the denominator semantics
+    # are unambiguous on the terminal.
+    if summary.by_dim:
+        typer.echo("")
+        typer.echo("Per-dim flip rate (flipped / canonical attempts):")
+        for dim_name, slot in summary.by_dim.items():
+            typer.echo(
+                f"  {dim_name:<10s} "
+                f"flipped {slot['flipping_pairs']}/{slot['total_pairs']}  "
+                f"({slot['flip_rate_pct']:6.2f}%)"
+            )
+
+    # Per-node attribution — answers "which agent is biased?".
+    by_node_non_terminal = {
+        nid: slot for nid, slot in summary.by_node.items()
+        if not slot.get("is_terminal")
+    }
+    if (
+        summary.n_flipping_pairs > 0
+        and not by_node_non_terminal
+        and summary.by_node
+    ):
+        typer.echo("")
+        typer.echo(
+            "WARNING: every upstream agent in every flipping variant's "
+            "execution order ran AFTER the terminal node; no causal "
+            "attribution is possible for this flip-set. The 100% row "
+            "below is the terminal-substitution baseline (control "
+            "column), not an attribution signal."
+        )
+    if summary.by_node:
+        typer.echo("")
+        typer.echo(
+            "Per-node attribution "
+            f"(aggregate across all {summary.n_flipping_pairs} flipping "
+            "triple(s); per-flip breakdown lives in audit.json):"
+        )
+        rows = sorted(
+            summary.by_node.items(),
+            key=lambda kv: (
+                kv[1].get("is_terminal", False),
+                -kv[1].get("attribution_pct", 0.0),
+            ),
+        )
+        for node_id, slot in rows:
+            label = "(terminal — baseline)" if slot.get("is_terminal") else ""
+            sample_annot = ""
+            if summary.partial and summary.n_flipping_pairs > 0:
+                sample_annot = (
+                    f"  [{slot['total_meaningful']}/"
+                    f"{summary.n_flipping_pairs} triples sampled]"
+                )
+            typer.echo(
+                f"  {node_id:<32s} "
+                f"{slot['flips_closed']}/{slot['total_meaningful']}  "
+                f"{slot['attribution_pct']:6.2f}%  {label}{sample_annot}"
+            )
+    typer.echo("")
+    typer.echo(
+        f"Wrote sidecar: {run_dir_path / 'audit.json'!s}"
     )
 
 
