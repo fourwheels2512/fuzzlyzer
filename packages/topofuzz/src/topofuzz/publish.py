@@ -434,69 +434,7 @@ def build_ceo_card_pdf(
         raise PublishError(
             f"out_path is an existing directory: {out_path}"
         )
-    if target_company is not None:
-        # Length bound prevents a malicious or sloppy operator from
-        # injecting a multi-paragraph "company name" that breaks the
-        # single-page layout (and prevents pathological wrapping in
-        # PDF metadata if we ever decide to set it later).
-        if not isinstance(target_company, str):
-            raise PublishError(
-                f"target_company must be str, got "
-                f"{type(target_company).__name__}"
-            )
-        if not target_company.strip():
-            raise PublishError("target_company must be non-empty / non-whitespace")
-        # F6 pass-1 RT M3: NFC-normalise before the length cap so a
-        # decomposed-form ZWJ/combining-mark/fullwidth-digit input cannot
-        # bypass the visual-width budget. Then reject bidi-override
-        # codepoints (‪-‮, ⁦-⁩) and zero-width
-        # joiners (​-‏) outright — they survive autoescape
-        # but cosmetically poison the rendered PDF (e.g. RIGHT-TO-LEFT
-        # OVERRIDE reverses subsequent text). C0/C1 controls are
-        # blocked because they break Chromium text shaping in
-        # undefined ways.
-        import unicodedata
-        target_company = unicodedata.normalize("NFC", target_company)
-        for ch in target_company:
-            cp = ord(ch)
-            if cp < 0x20 and ch not in ("\t", "\n"):
-                raise PublishError(
-                    "target_company contains a C0 control character "
-                    f"(U+{cp:04X}); reject."
-                )
-            if 0x7f <= cp <= 0x9f:
-                raise PublishError(
-                    "target_company contains a C1 control character "
-                    f"(U+{cp:04X}); reject."
-                )
-            if (
-                # zero-width + bidi-format
-                0x200b <= cp <= 0x200f
-                or 0x202a <= cp <= 0x202e
-                or 0x2066 <= cp <= 0x2069
-                # soft hyphen (invisible word break)
-                or cp == 0x00ad
-                # variation selectors (font-shaping bypass)
-                or 0xfe00 <= cp <= 0xfe0f
-                or 0xe0100 <= cp <= 0xe01ef
-                # tag chars (Unicode tag attack payload-smuggling)
-                or 0xe0000 <= cp <= 0xe007f
-                # mathematical alphanumeric symbols (homoglyph
-                # bypassing the visual-width budget; NFC does NOT
-                # fold these — they're distinct codepoints)
-                or 0x1d400 <= cp <= 0x1d7ff
-            ):
-                raise PublishError(
-                    "target_company contains an invisible / formatting "
-                    f"/ homoglyph codepoint (U+{cp:04X}); reject — "
-                    "would cosmetically poison the rendered PDF or "
-                    "bypass the visual-width budget."
-                )
-        if len(target_company) > 80:
-            raise PublishError(
-                f"target_company exceeds 80 chars ({len(target_company)}); "
-                "trim before render."
-            )
+    target_company = _validate_target_company(target_company)
 
     metadata = load_publish_metadata(run_dir)
     footer_text = _format_footer(metadata)
@@ -612,6 +550,1154 @@ def build_ceo_card_pdf(
         )
     _atomic_write_bytes(out_path, pdf_bytes)
     return out_path
+
+
+def _validate_target_company(target_company: str | None) -> str | None:
+    """NFC + invisible/control-char + length-bound validation.
+
+    Shared by ``build_ceo_card_pdf`` and ``build_consistency_card_pdf``
+    so the security posture stays byte-identical across the 1-page PDF
+    derivatives. Returns the NFC-normalised string (or ``None`` if input
+    was ``None``). Raises :class:`PublishError` on any rejection so the
+    operator sees the codepoint that tripped the guard.
+
+    F6 pass-1 RT M3 + F8 reuse: NFC-normalise BEFORE the length cap so a
+    decomposed-form ZWJ / combining-mark / fullwidth-digit input cannot
+    bypass the visual-width budget. Then reject:
+
+    * C0 (``U+0000-U+001F`` ex. ``\\t``, ``\\n``) and C1 (``U+007F-U+009F``)
+      controls — break Chromium text shaping in undefined ways.
+    * Zero-width and bidi-format codepoints (``U+200B-U+200F``,
+      ``U+202A-U+202E``, ``U+2066-U+2069``) and soft hyphen (``U+00AD``)
+      — survive autoescape but cosmetically poison the rendered PDF.
+    * Variation selectors (``U+FE00-U+FE0F``, ``U+E0100-U+E01EF``) and
+      Unicode tag chars (``U+E0000-U+E007F``) — font-shaping bypass and
+      Unicode-tag-attack payload-smuggling vector.
+    * Mathematical alphanumeric symbols (``U+1D400-U+1D7FF``) — distinct
+      codepoints that NFC does NOT fold; a homoglyph bypass of the
+      visual-width budget.
+    """
+    if target_company is None:
+        return None
+    if not isinstance(target_company, str):
+        raise PublishError(
+            f"target_company must be str, got "
+            f"{type(target_company).__name__}"
+        )
+    if not target_company.strip():
+        raise PublishError("target_company must be non-empty / non-whitespace")
+    import unicodedata
+    target_company = unicodedata.normalize("NFC", target_company)
+    for ch in target_company:
+        cp = ord(ch)
+        if cp < 0x20 and ch not in ("\t", "\n"):
+            raise PublishError(
+                "target_company contains a C0 control character "
+                f"(U+{cp:04X}); reject."
+            )
+        if 0x7f <= cp <= 0x9f:
+            raise PublishError(
+                "target_company contains a C1 control character "
+                f"(U+{cp:04X}); reject."
+            )
+        if (
+            0x200b <= cp <= 0x200f
+            or 0x202a <= cp <= 0x202e
+            or 0x2066 <= cp <= 0x2069
+            or cp == 0x00ad
+            or 0xfe00 <= cp <= 0xfe0f
+            or 0xe0100 <= cp <= 0xe01ef
+            or 0xe0000 <= cp <= 0xe007f
+            or 0x1d400 <= cp <= 0x1d7ff
+        ):
+            raise PublishError(
+                "target_company contains an invisible / formatting "
+                f"/ homoglyph codepoint (U+{cp:04X}); reject — "
+                "would cosmetically poison the rendered PDF or "
+                "bypass the visual-width budget."
+            )
+    if len(target_company) > 80:
+        raise PublishError(
+            f"target_company exceeds 80 chars ({len(target_company)}); "
+            "trim before render."
+        )
+    return target_company
+
+
+def build_consistency_card_pdf(
+    run_dir: Path,
+    *,
+    out_path: Path,
+    target_company: str | None = None,
+) -> Path:
+    """Render a single-page Cross-Vendor Consistency card to ``out_path``.
+
+    F8 (2026-05-16). Surfaces the procurement-flavoured finding the F6
+    CEO card cannot: how many distinct vendors actually backed the
+    jury-of-3 audit, and what fraction of jury votes failed. Compliance
+    reviewers and procurement leads have a budget line for "cross-vendor
+    consistency" but not for "topology fragility under permutation," so
+    this card is the cold/warm-pitch hook the F5+F6 PDFs are not.
+
+    Pure replay over ``report.json`` aggregate fields — no LLM spend, no
+    ``run.sqlite`` required. The card refuses to render when the source
+    run was single-judge (no jury_independence block populated).
+
+    ``target_company`` substitutes into the "what this means for $TARGET"
+    paragraph, same as the F6 CEO card. Validation is shared via
+    :func:`_validate_target_company`.
+
+    Reuses :func:`load_publish_metadata`, :func:`_format_footer`,
+    :func:`_render_html_pages_to_pdfs`, and :func:`_atomic_write_bytes`
+    so the attestation footer / Chromium sandbox / atomic-write
+    contracts are inherited byte-identically from F5/F6.
+
+    Raises :class:`PublishError` on any failure.
+    """
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        raise PublishError(
+            f"run_dir is not a directory: {run_dir}"
+        )
+    out_path = Path(out_path)
+    if out_path.is_dir():
+        raise PublishError(
+            f"out_path is an existing directory: {out_path}"
+        )
+    target_company = _validate_target_company(target_company)
+
+    metadata = load_publish_metadata(run_dir)
+    footer_text = _format_footer(metadata)
+
+    manifest = _load_manifest(run_dir)
+    report_json_path = run_dir / "report.json"
+    if not report_json_path.is_file():
+        raise PublishError(
+            "report.json is missing in run_dir — run "
+            "`topofuzz publish` once (or `topofuzz report`) so the "
+            "judge-independence block is available."
+        )
+    try:
+        report_payload = json.loads(report_json_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise PublishError(f"could not read report.json: {e}") from e
+    if not isinstance(report_payload, dict):
+        raise PublishError(
+            "report.json root is not an object — refuse to render."
+        )
+
+    headline = (
+        report_payload.get("headline")
+        if isinstance(report_payload.get("headline"), dict)
+        else {}
+    )
+    independence = headline.get("judge_independence") if isinstance(headline, dict) else None
+    if not isinstance(independence, dict):
+        raise PublishError(
+            "report.json has no headline.judge_independence block. The "
+            "consistency card requires a jury-of-N source run — single-"
+            "judge runs do not produce cross-vendor data."
+        )
+    # F8 RT pass-1 M1+M2: filter out source runs that do NOT look like
+    # jury-of-N. The check raises when ALL three signals are negative
+    # (judge_protocol != "jury_of_3" AND jury_of_3 flag not True AND
+    # < 2 judges). A producer that wrote ``judge_protocol="jury_of_3"``
+    # on a single-judge run will slip past this gate (F8 RT pass-2 R2,
+    # safe-degenerate: the downstream ``have_juror_evidence`` predicate
+    # in ``_format_consistency_headline`` falls back to ``unknown``
+    # severity rather than fabricating a jury-of-N claim). A future
+    # pass should tighten to AND-of-both for defense-in-depth.
+    judge_protocol = independence.get("judge_protocol")
+    judges_list = independence.get("judges")
+    n_judges = len(judges_list) if isinstance(judges_list, list) else 0
+    cli_args = manifest.get("cli_args") if isinstance(manifest, dict) else None
+    cli_jury_flag = (
+        cli_args.get("jury_of_3") if isinstance(cli_args, dict) else None
+    )
+    if judge_protocol != "jury_of_3" and not (
+        cli_jury_flag is True or n_judges >= 2
+    ):
+        raise PublishError(
+            "report.json has a judge_independence block but no signal "
+            "indicates the source was a jury-of-N — judge_protocol is "
+            f"{judge_protocol!r}, manifest.cli_args.jury_of_3 is "
+            f"{cli_jury_flag!r}, judges array has {n_judges} entry(s). "
+            "The consistency card refuses to render this as "
+            "cross-vendor evidence."
+        )
+
+    # F8 Stage A: auto-resolve ablation.json so the F4 per-agent
+    # attribution headline wins when the source run has it. We do NOT
+    # require the file; runs without ablation fall back to the
+    # vendor-concentration narrative (regression-safe). Defensive
+    # parse: malformed JSON or non-dict root logs a warning and
+    # behaves as if the file was absent, rather than refusing the
+    # whole card.
+    ablation: dict[str, Any] | None = None
+    ablation_path = run_dir / "ablation.json"
+    if ablation_path.is_file():
+        try:
+            ablation_payload = json.loads(
+                ablation_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError) as e:
+            _log.warning(
+                "publish: ablation.json present but unreadable (%s); "
+                "falling back to vendor-concentration headline.",
+                e,
+            )
+        else:
+            if isinstance(ablation_payload, dict):
+                ablation = ablation_payload
+            else:
+                _log.warning(
+                    "publish: ablation.json root is not an object "
+                    "(got %s); falling back to vendor-concentration "
+                    "headline.",
+                    type(ablation_payload).__name__,
+                )
+
+    ctx = _build_consistency_card_context(
+        metadata=metadata,
+        manifest=manifest,
+        independence=independence,
+        target_company=target_company,
+        ablation=ablation,
+    )
+
+    html = _render_consistency_card_html(ctx)
+    # Mirror the F6 stale-debris sweep so an interrupted Chromium handle
+    # on Windows can't accumulate orphans. Narrow prefix so a legitimate
+    # operator file `consistency_card_demo.html` isn't swept.
+    for stale in run_dir.glob("consistency_card_tmp_*.html"):
+        try:
+            stale.unlink()
+        except OSError:
+            _log.debug("publish: could not sweep stale consistency card %s", stale)
+    with tempfile.NamedTemporaryFile(
+        prefix="consistency_card_tmp_",
+        suffix=".html",
+        dir=run_dir,
+        delete=False,
+        mode="w",
+        encoding="utf-8",
+    ) as fh:
+        fh.write(html)
+        tmp_html_path = Path(fh.name)
+    try:
+        pdf_bytes_list = _render_html_pages_to_pdfs([tmp_html_path], footer_text)
+    finally:
+        try:
+            tmp_html_path.unlink()
+        except OSError:
+            _log.warning(
+                "publish: could not unlink consistency card scratch file %s",
+                tmp_html_path,
+            )
+    if len(pdf_bytes_list) != 1:
+        raise PublishError(
+            f"consistency card render produced {len(pdf_bytes_list)} PDFs; "
+            "expected exactly 1 page."
+        )
+    pdf_bytes = pdf_bytes_list[0]
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        n_pages = len(reader.pages)
+    except ImportError:
+        n_pages = 1
+    except Exception as e:  # noqa: BLE001 — refuse the artifact, not crash
+        raise PublishError(
+            f"could not validate consistency card page count: {e}"
+        ) from e
+    if n_pages > 2:
+        raise PublishError(
+            f"consistency card rendered to {n_pages} pages; the F8 spec is "
+            "1-2 pages. Inspect the source HTML for runaway content "
+            "(usually a long topology_name or jury vendor list)."
+        )
+    _atomic_write_bytes(out_path, pdf_bytes)
+    return out_path
+
+
+_DEGRADED_THRESHOLD = 0.0995
+"""Failure-rate threshold for the degraded branch (F8 RT pass-1 M3).
+
+Set just below 0.10 so a rate of 0.0999 — which displays as ``10.0%``
+under our ``.1f`` formatter — does NOT slip through into the stable
+branch. Prevents a card that says ``"stable"`` while displaying
+``"10.0%"`` in the same panel."""
+
+_VALID_SEVERITIES = frozenset(
+    {"concentrated", "degraded", "stable", "unknown", "attribution"}
+)
+"""Severity strings that map to a defined CSS class in the template
+(F8 RT pass-1 M10). Anything outside this set falls back to ``unknown``
+so a future naming drift cannot produce an unstyled white card.
+
+``"attribution"`` is the F8 Stage A class: F4 per-agent ablation
+headline wins when ``ablation.json`` is present in the run_dir, and
+the vendor-concentration narrative demotes to a secondary notes
+block. Stylesheet maps it to a neutral blue chip (not concentrated
+red / degraded amber / stable green) because high attribution to one
+role is a finding-to-investigate, not a failure verdict."""
+
+_ATTRIBUTION_TABLE_LIMIT = 3
+"""How many top non-terminal nodes to render in the attribution table
+(F8 Stage A). Pragmatic upper bound: a 4-role pipeline like the
+lending-4role gallery has 3 non-terminal roles (intake/risk/policy);
+a 6-role pipeline still fits the 1-page card if we cap at 3.
+Truncation tail is shown as a note when more roles exist."""
+
+_VENDOR_OVERLAP_DISPLAY_LIMIT = 3
+"""How many vendor names to show literally in the lede before
+collapsing to ``... (+N more)`` (F8 RT pass-1 M6). Bounds the joined
+string so a cosmetically poisoned manifest cannot push the card over
+its 1-page spec."""
+
+_TOPOLOGY_NAME_DISPLAY_LIMIT = 60
+"""Hard cap on the topology name shown in the headline strip and
+``<title>`` (F8 CR pass-1 N3). A 5KB hostile topology_name would not
+render on-page but would inflate the ``<title>`` tag."""
+
+
+def _build_consistency_card_context(
+    *,
+    metadata: dict[str, str],
+    manifest: dict[str, Any],
+    independence: dict[str, Any],
+    target_company: str | None,
+    ablation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assemble the Jinja context for consistency_card.html.j2.
+
+    Byte-deterministic given (metadata, manifest, independence,
+    target_company, ablation) — tests can pin headline / stats without
+    spinning up Chromium. Defensive against malformed independence
+    blocks: any missing, wrong-typed, or contradictory field collapses
+    to the conservative ``unknown`` framing rather than fabricating an
+    audit-grade headline from absent data (F8 BLOCKERs B1/B2).
+
+    F8 Stage A: when ``ablation`` is non-None and yields at least one
+    non-terminal node with attribution, the F4 per-agent attribution
+    headline takes precedence over the vendor-concentration headline.
+    Rationale: a CRO reading "risk-agent caused 64% of flips on this
+    pipeline" gets the actionable finding directly, whereas
+    "2-of-3 jurors are Google" requires a second hop to "what do I
+    fix?". Vendor-concentration narrative demotes to a secondary
+    ``vendor_independence_note`` rendered as a notes block.
+    """
+    topology_name = _truncate_topology_name(
+        str(manifest.get("topology_name") or "(unknown)")
+    )
+    n_variants = manifest.get("n_variants")
+    # F8 RT pass-1 M5: real production manifests write ``n_eval_rows``,
+    # not ``n_evals``. Fall back so the card doesn't render ``Evals: —``
+    # on every real gallery run.
+    n_evals = manifest.get("n_evals")
+    if not isinstance(n_evals, int) or isinstance(n_evals, bool):
+        n_evals = manifest.get("n_eval_rows")
+    cost_actual = manifest.get("cost_actual_usd")
+
+    overlap, failure_rate, disjoint, juror_rows, distinct_vendor_count, total_jurors = (
+        _extract_vendor_independence(independence, manifest)
+    )
+
+    # F8 RT pass-1 B4: surface self_preference_warning when present.
+    # The real lending-tricky-jury gallery run has it ("Agents and
+    # judges share vendor(s): google. ..."). Silently dropping it
+    # lets an analyst diff the PDF against report.json and catch us.
+    self_preference = independence.get("self_preference_warning")
+    self_preference_str = (
+        str(self_preference).strip()
+        if isinstance(self_preference, str) and self_preference.strip()
+        else ""
+    )
+
+    # F8 RT pass-1 M9: format the failure rate ONCE so headline and
+    # body don't diverge by 0.4pp. Done up here so all branches can
+    # interpolate the same string.
+    if isinstance(failure_rate, float) and not isinstance(failure_rate, bool):
+        failure_rate_str = f"{failure_rate * 100:.1f}%"
+    else:
+        failure_rate_str = "—"
+
+    target_phrase = target_company.strip() if target_company else None
+    target = target_phrase or "your stack"
+
+    # F8 Stage A: pick the attribution headline when ablation has at
+    # least one non-terminal node with parseable attribution; else fall
+    # back to the existing vendor-concentration headline. Both branches
+    # compute the vendor-concentration narrative; only one publishes it
+    # as the headline. The other surfaces it as a secondary notes block.
+    attribution_rows = _extract_attribution_rows(ablation) if ablation else []
+    attribution_n_truncated = 0
+    attribution_n_flipping_pairs: int | None = None
+    attribution_partial = False
+    if ablation and isinstance(ablation, dict):
+        nfp_raw = ablation.get("n_flipping_pairs")
+        if isinstance(nfp_raw, int) and not isinstance(nfp_raw, bool):
+            attribution_n_flipping_pairs = nfp_raw
+        # F8 Stage A pass-1 RT-B2: surface ablation.partial so a CRO who
+        # opens the source can't catch us silently dropping the flag.
+        attribution_partial = ablation.get("partial") is True
+        # Track whether more non-terminal nodes existed than we render.
+        by_node = ablation.get("by_node")
+        if isinstance(by_node, dict):
+            non_terminal_total = sum(
+                1
+                for v in by_node.values()
+                if isinstance(v, dict) and not v.get("is_terminal", False)
+            )
+            if non_terminal_total > len(attribution_rows):
+                attribution_n_truncated = non_terminal_total - len(attribution_rows)
+
+    if attribution_rows:
+        # F8 Stage A: F4 attribution headline wins. Attribution mode
+        # also publishes its own sub-line (the chip's lower text) —
+        # the vendor-concentration "Jury-vote failure rate: X%" is
+        # off-topic under an attribution headline (RT pass-1 M3).
+        (
+            headline_title,
+            headline_lede,
+            stat_headline,
+            stat_label,
+            headline_sub_line,
+        ) = _format_attribution_headline(
+            attribution_rows=attribution_rows,
+            topology_name=topology_name,
+            n_flipping_pairs=attribution_n_flipping_pairs,
+            n_truncated=attribution_n_truncated,
+            partial=attribution_partial,
+        )
+        severity = "attribution"
+        # Vendor-concentration narrative demotes to a notes block.
+        vc_title, vc_lede, _vc_stat, _vc_label, vc_severity = (
+            _format_consistency_headline(
+                overlap=overlap,
+                failure_rate=failure_rate,
+                failure_rate_str=failure_rate_str,
+                disjoint=disjoint,
+                total_jurors=total_jurors,
+                distinct_vendor_count=distinct_vendor_count,
+            )
+        )
+        # Only surface as a note when the vendor-concentration finding
+        # is itself meaningful (concentrated or degraded). A "stable"
+        # or "unknown" finding doesn't earn a notes block in
+        # attribution mode — keep the card uncluttered.
+        if vc_severity in ("concentrated", "degraded"):
+            vendor_independence_note = f"{vc_title} {vc_lede}"
+        else:
+            vendor_independence_note = ""
+    else:
+        # Pre-Stage-A behaviour: vendor-concentration is the headline,
+        # and the chip sub-line is the failure-rate line preserved
+        # byte-for-byte from the original F8 ship for back-compat.
+        headline_title, headline_lede, stat_headline, stat_label, severity = (
+            _format_consistency_headline(
+                overlap=overlap,
+                failure_rate=failure_rate,
+                failure_rate_str=failure_rate_str,
+                disjoint=disjoint,
+                total_jurors=total_jurors,
+                distinct_vendor_count=distinct_vendor_count,
+            )
+        )
+        vendor_independence_note = ""
+        headline_sub_line = f"Jury-vote failure rate: {failure_rate_str}"
+
+    # F8 RT pass-1 M10: whitelist the CSS class to a known severity
+    # so a future naming drift falls back to ``unknown`` (styled)
+    # instead of an unstyled white card.
+    if severity not in _VALID_SEVERITIES:
+        severity = "unknown"
+
+    what_para = _format_consistency_what_paragraph(target, severity)
+    cta_line = (
+        f"Want this independence check rerun against {target_phrase}'s "
+        "own jury composition? Reply to this email — repro is free."
+        if target_phrase
+        else (
+            "Want this independence check rerun against your own jury "
+            "composition? Reply to this email — repro is free."
+        )
+    )
+
+    cost_str = (
+        f"${float(cost_actual):.2f}"
+        if isinstance(cost_actual, (int, float)) and not isinstance(cost_actual, bool)
+        else "—"
+    )
+
+    def _safe_int(v: Any) -> int | str:
+        if isinstance(v, bool) or not isinstance(v, int):
+            return "—"
+        return v
+
+    return {
+        "headline_title": headline_title,
+        "headline_lede": headline_lede,
+        "stat_headline": stat_headline,
+        "stat_label": stat_label,
+        "severity": severity,
+        "failure_rate_str": failure_rate_str,
+        # F8 Stage A pass-1 RT-M3: chip sub-line varies by mode —
+        # attribution shows flip count + role count (+ "F4 run
+        # partial" when ablation.partial), vendor-concentration shows
+        # the original "Jury-vote failure rate: X%".
+        "headline_sub_line": headline_sub_line,
+        "self_preference_warning": self_preference_str,
+        "what_paragraph": what_para,
+        "cta_line": cta_line,
+        "topology_name": topology_name,
+        "n_variants": _safe_int(n_variants),
+        "n_evals": _safe_int(n_evals),
+        "cost_str": cost_str,
+        "jurors": juror_rows,
+        # F8 Stage A: empty list when ablation absent, populated list
+        # (top-N non-terminal rows) when present. The template loops
+        # over this with ``{% if attribution_rows %}`` so both modes
+        # render correctly. ``vendor_independence_note`` is the
+        # demoted vendor-concentration text shown as a notes block in
+        # attribution mode; empty string suppresses the block in
+        # vendor-concentration mode.
+        "attribution_rows": attribution_rows,
+        "attribution_n_truncated": attribution_n_truncated,
+        "vendor_independence_note": vendor_independence_note,
+        "run_id": metadata.get("run_id") or "(unknown)",
+        "tds_version": metadata.get("tds_version") or "(unknown)",
+        "signed_at": metadata.get("signed_at") or "(unsigned)",
+    }
+
+
+def _truncate_topology_name(name: str) -> str:
+    """Bound the rendered topology_name (F8 CR pass-1 N3).
+
+    Operator-supplied; an oversize value would inflate the HTML
+    ``<title>`` and the .meta-row line without tripping the page-count
+    guard (the page-count check only catches body overflows).
+    """
+    if len(name) > _TOPOLOGY_NAME_DISPLAY_LIMIT:
+        return name[: _TOPOLOGY_NAME_DISPLAY_LIMIT - 1] + "…"
+    return name
+
+
+_ATTRIBUTION_ROLE_NAME_DISPLAY_LIMIT = 30
+"""Hard cap on the role name shown in the attribution title and table
+(F8 Stage A pass-1 code-review M-CR2 / RT-M1 — drops the
+`-agent` suffix grafting AND bounds operator-supplied role IDs so
+a 5000-char hostile node id can't inflate ``headline_title`` or the
+HTML ``<title>`` tag past the page budget. Autoescape catches XSS;
+this cap catches overflow."""
+
+
+def _safe_role_name(name: str) -> str:
+    """Length-bound a role name + visible-truncation marker. F8 Stage A.
+
+    Reused by ``_extract_attribution_rows`` (table cells) and
+    ``_format_attribution_headline`` (title + lede). Visible ``…``
+    suffix so an auditor can tell the field was clipped rather than
+    silently misreading a truncated identifier as the full one.
+    """
+    if len(name) > _ATTRIBUTION_ROLE_NAME_DISPLAY_LIMIT:
+        return name[: _ATTRIBUTION_ROLE_NAME_DISPLAY_LIMIT - 1] + "…"
+    return name
+
+
+def _extract_attribution_rows(
+    ablation: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Pull the top-N non-terminal node attribution rows from ablation.json.
+
+    F8 Stage A. The ablation.json shape (schema_version 1) has::
+
+        {
+          "n_flipping_pairs": int,
+          "by_node": {
+            "<node_id>": {
+              "flips_closed": int,
+              "total_meaningful": int,
+              "attribution_pct": float,  # 0–100
+              "is_terminal": bool
+            },
+            ...
+          },
+          ...
+        }
+
+    Returns up to :data:`_ATTRIBUTION_TABLE_LIMIT` rows sorted by
+    ``attribution_pct`` descending, filtered to non-terminal nodes
+    only (terminal attribution is always 100% by construction via the
+    ``substitute_terminal`` ablation kind — mechanical, not signal).
+    Each row has ``{name, attribution_pct, flips_closed,
+    total_meaningful, attribution_pct_str}`` for the template.
+
+    Defensive against malformed input: missing / wrong-typed /
+    out-of-range entries are silently skipped. An empty list signals
+    "no F4 headline available, fall back to vendor-concentration."
+    Empty list is returned when ``ablation`` is None or when no
+    non-terminal node has parseable attribution.
+    """
+    if not isinstance(ablation, dict):
+        return []
+    by_node = ablation.get("by_node")
+    if not isinstance(by_node, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    for name, payload in by_node.items():
+        if not isinstance(name, str) or not isinstance(payload, dict):
+            continue
+        if payload.get("is_terminal") is True:
+            continue
+        pct = payload.get("attribution_pct")
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            continue
+        # NaN / out-of-range filter — protects the headline against a
+        # mis-emitted attribution value that would render as "nan%".
+        if pct != pct:  # NaN
+            continue
+        if pct < 0 or pct > 100:
+            continue
+        flips_closed = payload.get("flips_closed")
+        total_meaningful = payload.get("total_meaningful")
+        # F8 Stage A pass-2 code-review MINOR: drop degenerate rows
+        # where total_meaningful == 0 (no eligible ablation cells).
+        # These produce "0 of 0" copy in the lede and a zero-or-NaN
+        # attribution pct that would be misleading in the table.
+        if (
+            isinstance(total_meaningful, int)
+            and not isinstance(total_meaningful, bool)
+            and total_meaningful == 0
+        ):
+            continue
+        rows.append({
+            "name": _safe_role_name(name),
+            "attribution_pct": float(pct),
+            "attribution_pct_str": f"{float(pct):.1f}%",
+            "flips_closed": flips_closed if isinstance(flips_closed, int) and not isinstance(flips_closed, bool) else None,
+            "total_meaningful": total_meaningful if isinstance(total_meaningful, int) and not isinstance(total_meaningful, bool) else None,
+        })
+    # Stable secondary sort on name so ties render deterministically
+    # (important for byte-exact PDF reproducibility under repro).
+    rows.sort(key=lambda r: (-r["attribution_pct"], r["name"]))
+    return rows[:_ATTRIBUTION_TABLE_LIMIT]
+
+
+def _format_attribution_headline(
+    *,
+    attribution_rows: list[dict[str, Any]],
+    topology_name: str,
+    n_flipping_pairs: int | None,
+    n_truncated: int,
+    partial: bool,
+) -> tuple[str, str, str, str, str]:
+    """Render the F4 per-agent attribution headline + stat copy.
+
+    Caller guarantees ``attribution_rows`` is non-empty (the empty
+    case falls back to the vendor-concentration headline upstream).
+    Returns ``(title, lede, stat_headline, stat_label, sub_line)``.
+
+    Honesty bar (F8 Stage A pass-1 RT-B1 / B2):
+
+    * Per-role denominator: each ``attribution_pct`` is
+      ``flips_closed / total_meaningful`` for THAT role, where
+      ``total_meaningful`` is the number of flipping pairs where the
+      role was on the ablation-eligible path — NOT ``n_flipping_pairs``.
+      The lede must publish the per-role numerator/denominator so a
+      reader who divides reaches the same ratio. Pre-fix, the lede
+      read "Across {n_flipping_pairs} measured verdict flips ...
+      attributes the highest share to the {top} role" and a CRO who
+      did 7/12 = 58.3% (not 63.6%) caught us on a 30-second diff.
+    * ``partial`` flag: when ``ablation.partial is True`` (F4 run was
+      interrupted), the lede MUST disclose it. Pre-fix, the field was
+      silently dropped — a CRO who opened ablation.json saw the flag
+      and dismissed the report.
+
+    Copy guardrails:
+
+    * No "-agent" suffix grafting (operator-supplied role IDs may
+      already include role-type words; suffix produces redundancy
+      like "risk-agent-agent").
+    * No ``.capitalize()`` — sentence-leads with "The {role}" so the
+      role name renders as-typed (autoescape + ``_safe_role_name``
+      bound length).
+    * "Follow-up audit" instead of "re-engineering pass" — the engine
+      measures attribution, not causation; "re-engineering" overclaims
+      what F4 can substantiate.
+
+    Sub-line (``headline_stat .ci`` slot in the template): in
+    attribution mode this should NOT say "Jury-vote failure rate" —
+    that's a vendor-concentration sub-line. Replace with F4-relevant
+    context: flip count + non-terminal role count.
+    """
+    top = attribution_rows[0]
+    top_name = str(top["name"])  # already bounded by _safe_role_name
+    top_pct_str = top["attribution_pct_str"]
+    top_closed = top.get("flips_closed")
+    top_total = top.get("total_meaningful")
+
+    # F8 Stage A pass-2 RT-MAJOR: surface the per-role denominator in
+    # the title itself so a CRO scanning the headline can reconcile
+    # the % against the ratio without scrolling to the lede. Pre-fix,
+    # title "63.6% of attributable verdict flips" + chip sub-line "12
+    # measured flips" invited the false-positive diff 7/12 = 58.3% ≠
+    # 63.6%. Post-fix title leads with the ratio + pct in parens, so
+    # the denominator is part of the headline (not buried).
+    if isinstance(top_closed, int) and isinstance(top_total, int) and top_total > 0:
+        title = (
+            f"The {top_name} role closed {top_closed} of {top_total} "
+            f"ablation-eligible verdict flips on {topology_name} "
+            f"({top_pct_str})."
+        )
+    else:
+        title = (
+            f"The {top_name} role closed {top_pct_str} of "
+            f"ablation-eligible verdict flips on {topology_name}."
+        )
+
+    others = attribution_rows[1:]
+    if others:
+        other_phrases = [
+            (
+                f"{r['name']} {r['flips_closed']}/{r['total_meaningful']} "
+                f"({r['attribution_pct_str']})"
+                if (
+                    isinstance(r.get("flips_closed"), int)
+                    and isinstance(r.get("total_meaningful"), int)
+                )
+                else f"{r['name']} ({r['attribution_pct_str']})"
+            )
+            for r in others
+        ]
+        if len(other_phrases) == 1:
+            others_clause = f"; the next contributor was {other_phrases[0]}"
+        else:
+            others_clause = (
+                "; the next contributors were " +
+                ", ".join(other_phrases[:-1]) +
+                f", and {other_phrases[-1]}"
+            )
+    else:
+        others_clause = ""
+
+    if isinstance(top_closed, int) and isinstance(top_total, int):
+        top_ratio = f"{top_closed} of {top_total}"
+    else:
+        top_ratio = "the majority of"
+
+    lede = (
+        f"Leave-one-out ablation closed {top_ratio} ablation-"
+        f"eligible flip pairs when the {top_name} role was removed "
+        f"({top_pct_str}){others_clause}. The breakdown below shows "
+        "the contribution magnitude a reviewer would use to scope a "
+        "follow-up audit."
+    )
+    if partial:
+        lede += (
+            " The source ablation run was flagged ``partial`` — some "
+            "ablation cells did not complete; treat this as a "
+            "preliminary signal pending a full F4 rerun."
+        )
+
+    stat_headline = top_pct_str
+    if n_truncated > 0:
+        stat_label = (
+            f"of attributable verdict flips closed by removing the "
+            f"{top_name} role (top of {len(attribution_rows) + n_truncated} "
+            "non-terminal roles ablated)"
+        )
+    else:
+        stat_label = (
+            f"of attributable verdict flips closed by removing the "
+            f"{top_name} role"
+        )
+
+    # Attribution-mode sub-line: replace the vendor-concentration
+    # "Jury-vote failure rate: X%" with F4 telemetry. n_flipping_pairs
+    # is the count of distinct flipping pairs the run measured.
+    sub_parts: list[str] = []
+    if isinstance(n_flipping_pairs, int) and n_flipping_pairs > 0:
+        sub_parts.append(f"{n_flipping_pairs} measured verdict flips")
+    sub_parts.append(
+        f"{len(attribution_rows) + n_truncated} non-terminal roles ablated"
+        if n_truncated > 0
+        else f"{len(attribution_rows)} non-terminal roles ablated"
+    )
+    if partial:
+        sub_parts.append("F4 run partial")
+    sub_line = " · ".join(sub_parts)
+
+    return title, lede, stat_headline, stat_label, sub_line
+
+
+def _format_consistency_headline(
+    *,
+    overlap: list[str],
+    failure_rate: float | None,
+    failure_rate_str: str,
+    disjoint: bool,
+    total_jurors: int | None,
+    distinct_vendor_count: int | None,
+) -> tuple[str, str, str, str, str]:
+    """Pick the severity branch + render headline copy.
+
+    Returns ``(title, lede, stat_headline, stat_label, severity)``.
+
+    Branch precedence (highest-severity wins, so a run that triggers
+    both concentrated AND degraded ships under concentrated — the
+    overlap is the more actionable procurement finding because the
+    jury's independence claim itself is conditional on disjointness).
+    The degradation signal is preserved on the headline-stat
+    sub-line ("Jury-vote failure rate: X%" in the template) AND, when
+    non-zero, in a tail sentence appended to the concentrated lede
+    (F8 RT pass-2 R1 — earlier docstring overclaimed surfacing in the
+    ``what`` paragraph, which is not the case; the lede tail is the
+    correct surface):
+
+    1. ``concentrated`` — ``overlap`` non-empty AND we have enough
+       juror telemetry (``total_jurors >= 2``, ``distinct_vendor_count``
+       resolved) to make a defensible "N of K share a vendor" claim.
+       Lede branches on ``distinct_vendor_count == 1`` (F8 RT pass-2
+       R3: "Two or more jurors share a vendor" is tonally wrong when
+       ALL jurors share a single vendor — use "All jurors share a
+       vendor" in that case).
+    2. ``degraded`` — failure rate at-or-above the displayed-10%
+       boundary. (F8 RT pass-1 M3 donut-hole fix.)
+    3. ``stable`` — disjoint, low failure rate, AND we can prove from
+       juror telemetry that the jury has at least 2 distinct vendors
+       (``total_jurors >= 2`` AND ``distinct_vendor_count ==
+       total_jurors``). Without this guard the branch fabricated
+       "3 / 3" headlines from hardcoded ``or 3`` literals (F8 B1/B2).
+    4. ``unknown`` — anything else. Defaults the stat panel to ``?``
+       so a procurement reader sees the absence of evidence, not a
+       confected number.
+    """
+    have_juror_evidence = (
+        total_jurors is not None
+        and total_jurors >= 2
+        and distinct_vendor_count is not None
+    )
+
+    if overlap and have_juror_evidence:
+        # Bound the joined overlap list (F8 RT pass-1 M6).
+        display = [_html_safe_vendor(v) for v in overlap[:_VENDOR_OVERLAP_DISPLAY_LIMIT]]
+        if len(overlap) > _VENDOR_OVERLAP_DISPLAY_LIMIT:
+            display.append(f"+{len(overlap) - _VENDOR_OVERLAP_DISPLAY_LIMIT} more")
+        pretty_overlap = ", ".join(display)
+        # F8 CR pass-1 M2: pluralise to avoid "1 distinct vendors".
+        vendor_noun = "vendor" if distinct_vendor_count == 1 else "vendors"
+        title = (
+            f"This jury-of-{total_jurors} has only "
+            f"{distinct_vendor_count} distinct {vendor_noun}."
+        )
+        # F8 RT pass-2 R3: branch lede tone on the all-same-vendor case.
+        # "Two or more jurors share a vendor" reads wrong when every
+        # juror shares the same vendor; "All jurors share a vendor"
+        # is the correct copy.
+        if distinct_vendor_count == 1:
+            lede_head = f"All jurors share a vendor ({pretty_overlap})."
+        else:
+            lede_head = f"Two or more jurors share a vendor ({pretty_overlap})."
+        # F8 RT pass-2 R1: surface non-zero degradation in the lede tail
+        # so a procurement reader scanning bold copy sees BOTH signals
+        # when concentrated AND degraded fire together. The headline-stat
+        # sub-line carried the number before this fix but procurement
+        # readers don't scan 9pt CSS sublines.
+        lede = (
+            f"{lede_head} A jury whose members can fail correlated is "
+            "not the independence claim the audit assumed."
+        )
+        if failure_rate is not None and failure_rate >= _DEGRADED_THRESHOLD:
+            lede += (
+                f" Jury votes also failed on {failure_rate_str} of "
+                "cells, compounding the concentration finding."
+            )
+        stat_headline = f"{distinct_vendor_count} / {total_jurors}"
+        stat_label = f"distinct {vendor_noun} backing the jury verdict"
+        return title, lede, stat_headline, stat_label, "concentrated"
+
+    if failure_rate is not None and failure_rate >= _DEGRADED_THRESHOLD:
+        # F8 RT pass-1 M9: same precision as the body line, computed once.
+        if have_juror_evidence:
+            title = (
+                f"This jury-of-{total_jurors} degraded on "
+                f"{failure_rate_str} of cells."
+            )
+        else:
+            title = f"This jury degraded on {failure_rate_str} of cells."
+        lede = (
+            "Each degraded cell fell back to a smaller jury (or to a "
+            "single juror) because a vendor call failed. A degraded-"
+            "jury claim is not the audit-grade claim the report header "
+            "advertises."
+        )
+        return (
+            title,
+            lede,
+            failure_rate_str,
+            "of cells where a jury vote failed",
+            "degraded",
+        )
+
+    if (
+        disjoint
+        and (failure_rate is None or failure_rate < _DEGRADED_THRESHOLD)
+        and have_juror_evidence
+        and distinct_vendor_count == total_jurors
+    ):
+        title = (
+            f"This jury-of-{total_jurors} held vendor disjointness."
+        )
+        lede = (
+            "Each juror was backed by a distinct vendor and the jury "
+            "voted without high-volume degraded fallbacks. Treat this "
+            "as a preliminary cross-vendor-disjointness signal — "
+            "confirm with a self-preference review and a rerun-"
+            "stability pass before quoting it in a regulated workflow."
+        )
+        stat_headline = f"{distinct_vendor_count} / {total_jurors}"
+        return (
+            title,
+            lede,
+            stat_headline,
+            "distinct vendors backing the jury verdict",
+            "stable",
+        )
+
+    # Conservative default — partial telemetry, refuse to overstate
+    # (F8 BLOCKERs B1/B2: no more hardcoded ``or 3``).
+    title = "Jury vendor independence not verifiable."
+    lede = (
+        "This run's report.json does not contain the cross-vendor "
+        "telemetry needed for an independence claim. Rerun with the "
+        "latest topofuzz to populate the judge_independence block, or "
+        "confirm the source run was a jury-of-N (not a single judge)."
+    )
+    return (
+        title,
+        lede,
+        "?",
+        "distinct vendors backing the jury verdict",
+        "unknown",
+    )
+
+
+_VENDOR_DISAMBIGUATOR_RE = re.compile(r"_\d+$")
+
+
+def _normalize_vendor_name(name: str) -> str:
+    """Strip a trailing ``_N`` disambiguator suffix from a vendor name.
+
+    The IR uses ``google``, ``google_2``, ``google_3`` to keep juror
+    keys unique when a jury-of-N pulls multiple models from the same
+    vendor (F8 RT pass-1 B1). The PDF cares about the human-readable
+    vendor only, so we strip the suffix before deduping or rendering.
+    Without this, the lending-tricky-jury gallery run prints
+    ``distinct_vendor_count=3`` while ``vendor_overlap=['google']``
+    says 2 — a contradiction a hostile analyst spots in 60 seconds by
+    diffing the PDF against ``report.json``.
+    """
+    return _VENDOR_DISAMBIGUATOR_RE.sub("", name)
+
+
+def _extract_vendor_independence(
+    independence: dict[str, Any], manifest: dict[str, Any]
+) -> tuple[
+    list[str],          # vendor_overlap (normalized)
+    float | None,       # vendor_call_failure_rate
+    bool,               # vendor_disjoint
+    list[dict[str, str]],  # juror_rows for the table (position re-numbered)
+    int | None,         # distinct vendor count (post-normalisation)
+    int | None,         # total juror count
+]:
+    """Pull the headline.judge_independence + manifest.jury_models fields.
+
+    Defensive: each field falls back to a conservative shape on type
+    mismatch so the consistency card always has something to render.
+    """
+    overlap_raw = independence.get("vendor_overlap")
+    # F8 RT pass-1 B1: normalise ``google_2`` -> ``google`` so the
+    # overlap list and the distinct-count derived from juror_rows agree.
+    # De-dup post-normalisation so a future producer that returns
+    # ["google", "google_2"] doesn't get counted twice.
+    overlap_normalised: list[str] = []
+    if isinstance(overlap_raw, list):
+        for v in overlap_raw:
+            if not isinstance(v, str):
+                continue
+            n = _normalize_vendor_name(v)
+            if n not in overlap_normalised:
+                overlap_normalised.append(n)
+    overlap = overlap_normalised
+
+    failure_rate_raw = independence.get("vendor_call_failure_rate")
+    failure_rate: float | None
+    if isinstance(failure_rate_raw, bool) or not isinstance(failure_rate_raw, (int, float)):
+        failure_rate = None
+    elif failure_rate_raw != failure_rate_raw:  # NaN
+        failure_rate = None
+    else:
+        failure_rate = float(failure_rate_raw)
+
+    disjoint_raw = independence.get("vendor_disjoint")
+    disjoint = bool(disjoint_raw) if isinstance(disjoint_raw, bool) else False
+
+    # Prefer the resolved jury list from manifest.cli_args.jury_models_resolved
+    # (dict of jury_position -> "vendor/model"). Fall back to
+    # headline.judge_independence.judges (list of {vendor, model}).
+    # Vendor names are normalised through ``_normalize_vendor_name`` so the
+    # ``google``/``google_2`` IR-disambiguator doesn't inflate the distinct
+    # vendor count (F8 RT pass-1 B1). Position is re-numbered 1..N AFTER
+    # the malformed-row filter so the rendered table never has a gap
+    # (F8 CR pass-1 N1).
+    juror_rows: list[dict[str, str]] = []
+    cli_args = manifest.get("cli_args") if isinstance(manifest, dict) else None
+    resolved = cli_args.get("jury_models_resolved") if isinstance(cli_args, dict) else None
+    if isinstance(resolved, dict):
+        for _key, model_id in sorted(resolved.items()):
+            if not isinstance(model_id, str):
+                continue
+            if "/" in model_id:
+                vendor, model = model_id.split("/", 1)
+            else:
+                vendor, model = model_id, ""
+            juror_rows.append(
+                {"vendor": _normalize_vendor_name(vendor), "model": model}
+            )
+    if not juror_rows:
+        judges_raw = independence.get("judges")
+        if isinstance(judges_raw, list):
+            for j in judges_raw:
+                if not isinstance(j, dict):
+                    continue
+                vendor = j.get("vendor")
+                model_field = j.get("model") or j.get("model_id")
+                if not isinstance(vendor, str):
+                    continue
+                # Strip the "vendor/" prefix from model_id when present so
+                # the table column doesn't duplicate the Vendor cell.
+                model_str = ""
+                if isinstance(model_field, str):
+                    if "/" in model_field:
+                        _, model_str = model_field.split("/", 1)
+                    else:
+                        model_str = model_field
+                juror_rows.append({
+                    "vendor": _normalize_vendor_name(vendor),
+                    "model": model_str,
+                })
+    # Re-number positions sequentially after the malformed-row filter.
+    for idx, row in enumerate(juror_rows, start=1):
+        row["position"] = str(idx)
+
+    total_jurors = len(juror_rows) if juror_rows else None
+    distinct_vendor_count = (
+        len({r["vendor"] for r in juror_rows}) if juror_rows else None
+    )
+
+    return overlap, failure_rate, disjoint, juror_rows, distinct_vendor_count, total_jurors
+
+
+def _format_consistency_what_paragraph(target: str, severity: str) -> str:
+    """The "what this means for $TARGET" body paragraph.
+
+    Four severity shapes (F8 Stage A added ``attribution``).
+    Pitch-copy guardrail: no shape says "your model is unsafe" — they
+    describe procurement-grade signals worth a follow-up audit.
+    """
+    if severity == "attribution":
+        return (
+            f"If {target} runs multi-agent LLM audits, the actionable "
+            "finding is which role in the chain drives the verdict "
+            "instability — not just that it exists. This run isolated "
+            "the contribution of each non-terminal role via leave-one-"
+            "out ablation. The top-contributing role is the candidate "
+            "for a follow-up audit before the SOW signs; the second- "
+            "and third-place rows say how much of the remaining "
+            "instability is distributed across the rest of the "
+            "pipeline. Per-role attribution shares can overlap and "
+            "need not sum to 100% — leave-one-out semantics credit "
+            "every role that, removed individually, would have "
+            "prevented the flip. Read the vendor-independence note "
+            "below for a secondary caveat orthogonal to attribution."
+        )
+    if severity == "concentrated":
+        return (
+            f"If {target} sources jury-of-3 model audits, this is the "
+            "kind of finding a procurement reviewer flags before the "
+            "SOW signs: the audit's independence claim only holds if "
+            "the three jurors actually fail uncorrelated. Two jurors "
+            "from the same vendor share infrastructure, share weights "
+            "(when shared model family), and fail together on the same "
+            "prompt class. The headline confidence interval the audit "
+            "report quotes is conditional on vendor-disjointness it "
+            "may not have."
+        )
+    if severity == "degraded":
+        return (
+            f"If {target} commissions jury-of-3 audits, a degraded-"
+            "jury rate above ~10% means the headline confidence is "
+            "computed against an audit that silently lost jurors on "
+            "every tenth call. The auditable claim is no longer a "
+            "jury-of-3 audit — it is a jury-of-the-jurors-that-"
+            "answered audit. Worth a clarifying question to the "
+            "vendor before the report ships to the model-risk "
+            "committee."
+        )
+    if severity == "stable":
+        return (
+            f"If {target} commissions jury-of-N audits, this run is a "
+            "preliminary cross-vendor-disjointness signal: distinct "
+            "vendors voted and no high-volume degradation events were "
+            "observed. The signal is necessary but not sufficient for "
+            "a model-risk-management quote — confirm with a self-"
+            "preference review (do agents and judges share vendors?) "
+            "and a rerun-stability check before relying on it in a "
+            "regulated workflow. The attestation footer below lets "
+            "any reviewer re-run the test bit-for-bit."
+        )
+    return (
+        f"This run does not surface enough cross-vendor telemetry to "
+        f"give {target} an independence claim either way. Rerun on "
+        "topofuzz v0.6.0+ with `--jury-of-3` and a vendor-disjoint "
+        "juror list to populate the audit-grade headline."
+    )
+
+
+def _html_safe_vendor(name: str) -> str:
+    """Length-bound a vendor name before it lands in the comma list.
+
+    Defends the headline's one-liner length against a hostile or sloppy
+    vendor name (>40 chars). Real vendor names are short (``google``,
+    ``openai``, ``anthropic``, ``deepseek``) — anything past 40 chars
+    is either a misconfig or a payload attempt; truncate visibly so an
+    auditor can tell the field was clipped.
+    """
+    if len(name) > 40:
+        return name[:37] + "…"
+    return name
+
+
+def _render_consistency_card_html(ctx: dict[str, Any]) -> str:
+    """Render consistency_card.html.j2 with the assembled context."""
+    try:
+        import jinja2
+    except ImportError as e:
+        raise PublishError(
+            "topofuzz publish --consistency-card requires the 'full' "
+            "install extra — jinja2 not found. Install with "
+            "`pip install topofuzz[full]`."
+        ) from e
+
+    template_dir = Path(__file__).parent / "templates"
+    env = jinja2.Environment(
+        loader=jinja2.FileSystemLoader(str(template_dir)),
+        autoescape=True,
+        undefined=jinja2.StrictUndefined,
+    )
+    template = env.get_template("consistency_card.html.j2")
+    return template.render(**ctx)
 
 
 def _build_ceo_card_context(

@@ -13,7 +13,7 @@ Non-production use, internal development, academic research, and
 small-scale commercial use (annual revenue under USD $100,000 from any
 use of Topofuzz) are **permitted without charge**. Production use
 beyond that threshold, or offering Topofuzz as a managed service,
-requires a commercial license — contact **licensing-TBD@modelbrew.ai**.
+requires a commercial license — contact **kiran@modelbrew.ai**.
 Each release converts to Apache 2.0 four years after publication. Full
 terms in [LICENSE](LICENSE).
 
@@ -236,6 +236,54 @@ Missing keys surface as `judge_failure` cells, not as a kickoff error
 (per the
 [BLUEPRINT §A](https://github.com/kirannayudu/topofuzz/blob/main/BLUEPRINT_v5plus.md)
 degraded-badge contract).
+
+### Cross-Vendor Consistency
+
+The jury-of-N protocol assumes the N jurors are vendor-disjoint —
+their failure modes correlate as little as the underlying models do.
+That assumption fails when two jurors share a vendor (e.g.
+`gemini-2.5-flash` + `gemini-2.5-pro` both count as Google), and the
+fraction of jury-vote failures is a separate procurement signal.
+
+`topofuzz publish --consistency-card OUT.pdf` produces a single-page
+PDF derivative of the F5 publish PDF that surfaces these two findings.
+Source must be a jury-of-N run (`--jury-of-3` set, or `judges` list of
+≥ 2 in `report.json`); the command refuses single-judge sources rather
+than emitting a misleading "cross-vendor" PDF from one juror.
+
+The card classifies the run into one of four severities:
+
+| Severity | Trigger |
+|---|---|
+| `concentrated` | `vendor_overlap` non-empty AND ≥ 2 jurors with resolved vendor data |
+| `degraded` | jury-vote failure rate ≥ 10% (`_DEGRADED_THRESHOLD = 0.0995`, set just below 10% so a 0.0999 rate that displays as 10.0% under `.1f` formatting cannot slip through into the stable branch) |
+| `stable` | disjoint, low failure rate, AND `distinct_vendor_count == total_jurors` (≥ 2) |
+| `unknown` | partial telemetry — refuses to overstate |
+
+Vendor names are normalised through `topofuzz.publish._normalize_vendor_name`
+(strips trailing `_\d+` IR disambiguators) so `google` and `google_2`
+do not double-count toward `distinct_vendor_count`. The
+`self_preference_warning` field — surfaced separately when agents and
+judges share vendors — is rendered as a Notes block on the card so a
+procurement reader sees the same warning the source `report.json`
+carries.
+
+Severity precedence: `concentrated` outranks `degraded` because vendor
+concentration is the more actionable procurement finding (the jury's
+independence claim itself is conditional on disjointness, regardless
+of the failure rate). The degradation signal is preserved on the
+headline-stat sub-line and in the body paragraph.
+
+```bash
+topofuzz publish runs/<run-id> \
+  --consistency-card consistency.pdf \
+  --target "Acme Bank"
+```
+
+The `--target` flag substitutes into a "what this means for $TARGET"
+paragraph. NFC normalisation + bidi-override / zero-width / homoglyph
+rejection match the F6 CEO-card surface (shared via
+`_validate_target_company`).
 
 ### Reserved flag namespace
 

@@ -1742,16 +1742,29 @@ def publish(
             "Destination PDF path for the single-page CEO-card "
             "derivative — cold-email-shaped, 1-2 pages, headline "
             "metric + Wilson CI + one flipped verdict + attestation "
-            "footer. At least one of --pdf or --ceo-card is required."
+            "footer. At least one of --pdf, --ceo-card, or "
+            "--consistency-card is required."
+        ),
+    ),
+    consistency_card: Path | None = typer.Option(
+        None,
+        "--consistency-card",
+        help=(
+            "Destination PDF path for the single-page Cross-Vendor "
+            "Consistency card — 1-2 pages, surfaces "
+            "vendor_overlap + jury-vote failure rate + jury composition "
+            "table from a jury-of-3 source run. Compliance/procurement-"
+            "flavoured pitch hook. Source run must be jury-of-3 "
+            "(report.json must contain headline.judge_independence)."
         ),
     ),
     target: str | None = typer.Option(
         None,
         "--target",
         help=(
-            "Optional company name to substitute into the CEO-card's "
-            "'what this means for $TARGET' paragraph. Only meaningful "
-            "with --ceo-card. Max 80 chars."
+            "Optional company name to substitute into the 'what this "
+            "means for $TARGET' paragraph on --ceo-card and "
+            "--consistency-card outputs. Max 80 chars."
         ),
     ),
     max_flips: int = typer.Option(
@@ -1803,20 +1816,20 @@ def publish(
     _reject_reserved_flags(list(ctx.args))
     _reject_unknown_extras(list(ctx.args))
 
-    if pdf is None and ceo_card is None:
+    if pdf is None and ceo_card is None and consistency_card is None:
         typer.echo(
-            "topofuzz publish: at least one of --pdf or --ceo-card "
-            "must be supplied.",
+            "topofuzz publish: at least one of --pdf, --ceo-card, or "
+            "--consistency-card must be supplied.",
             err=True,
         )
         raise typer.Exit(code=_BAD_USAGE_EXIT)
     # F6 pass-1 RT M2: ``--target ""`` slips past `is not None`. Treat
     # any truthy target as "supplied" so the --pdf-only path doesn't
     # silently ignore an empty string the operator intended as a value.
-    if target and ceo_card is None:
+    if target and ceo_card is None and consistency_card is None:
         typer.echo(
             "topofuzz publish: --target is only meaningful with "
-            "--ceo-card.",
+            "--ceo-card or --consistency-card.",
             err=True,
         )
         raise typer.Exit(code=_BAD_USAGE_EXIT)
@@ -1832,6 +1845,7 @@ def publish(
     from topofuzz.publish import (
         PublishError,
         build_ceo_card_pdf,
+        build_consistency_card_pdf,
         build_publish_pdf,
     )
 
@@ -1848,6 +1862,13 @@ def publish(
                 target_company=target,
             )
             typer.echo(str(card_target))
+        if consistency_card is not None:
+            consistency_target = build_consistency_card_pdf(
+                run_dir_path,
+                out_path=consistency_card,
+                target_company=target,
+            )
+            typer.echo(str(consistency_target))
     except PublishError as e:
         typer.echo(f"topofuzz publish: {e}", err=True)
         raise typer.Exit(code=_VERIFY_FAIL_EXIT) from e

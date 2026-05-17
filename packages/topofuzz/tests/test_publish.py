@@ -1065,7 +1065,10 @@ def test_cli_publish_requires_at_least_one_of_pdf_or_ceo_card(tmp_path):
     runner = CliRunner()
     result = runner.invoke(app, ["publish", str(run_dir)])
     assert result.exit_code == 2
-    assert "at least one of --pdf or --ceo-card" in result.output
+    # F8 widened the message to mention --consistency-card too. The
+    # "at least one of" prefix is the stable assertion target.
+    assert "at least one of" in result.output
+    assert "--pdf" in result.output and "--ceo-card" in result.output
 
 
 def test_cli_publish_rejects_target_without_ceo_card(tmp_path):
@@ -1861,3 +1864,1517 @@ def test_render_ceo_card_html_explicit_autoescape_blocks_html_in_topology_name()
     assert "<script>x</script>" not in html.replace(
         "&lt;script&gt;x&lt;/script&gt;", ""
     )
+
+
+# ============================================================
+# F8 — cross-vendor consistency card
+# ============================================================
+
+
+def _make_run_with_jury_report_json(
+    tmp_path: Path,
+    *,
+    vendor_overlap: list[str] | None = None,
+    vendor_call_failure_rate: float | None = 0.075,
+    vendor_disjoint: bool = False,
+    jury_models_resolved: dict[str, str] | None = None,
+    cost_actual_usd: float = 1.23,
+    omit_independence: bool = False,
+    omit_report_json: bool = False,
+) -> Path:
+    """Build a synthetic run with a jury-of-3 report.json populated.
+
+    Mirrors `_make_run_with_report_json` but stamps the
+    `headline.judge_independence` block the F8 consistency card reads.
+    """
+    if vendor_overlap is None:
+        vendor_overlap = ["google"]
+    if jury_models_resolved is None:
+        jury_models_resolved = {
+            "deepseek": "deepseek/deepseek-chat",
+            "google": "google/gemini-2.5-flash",
+            "google_2": "google/gemini-2.5-pro",
+        }
+    run_dir = _make_run(tmp_path, with_attestation=True)
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["cost_actual_usd"] = cost_actual_usd
+    manifest["n_evals"] = manifest.pop("n_eval_rows", 3)
+    manifest["cli_args"] = {
+        "jury_of_3": True,
+        "jury_models_resolved": jury_models_resolved,
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    if not omit_report_json:
+        report_payload: dict[str, Any] = {"headline": {}}
+        if not omit_independence:
+            independence: dict[str, Any] = {
+                "judge_protocol": "jury_of_3",
+                "judges": [
+                    {"vendor": "deepseek", "model_id": "deepseek/deepseek-chat"},
+                    {"vendor": "google", "model_id": "google/gemini-2.5-flash"},
+                    {"vendor": "google_2", "model_id": "google/gemini-2.5-pro"},
+                ],
+                "vendor_overlap": vendor_overlap,
+                "vendor_disjoint": vendor_disjoint,
+            }
+            if vendor_call_failure_rate is not None:
+                independence["vendor_call_failure_rate"] = vendor_call_failure_rate
+            report_payload["headline"]["judge_independence"] = independence
+        (run_dir / "report.json").write_text(
+            json.dumps(report_payload), encoding="utf-8"
+        )
+    return run_dir
+
+
+def test_validate_target_company_passthrough_none():
+    from topofuzz.publish import _validate_target_company
+    assert _validate_target_company(None) is None
+
+
+def test_validate_target_company_rejects_empty():
+    from topofuzz.publish import _validate_target_company, PublishError
+    with pytest.raises(PublishError, match="non-empty"):
+        _validate_target_company("   ")
+
+
+def test_validate_target_company_rejects_overlong():
+    from topofuzz.publish import _validate_target_company, PublishError
+    with pytest.raises(PublishError, match="exceeds 80 chars"):
+        _validate_target_company("a" * 81)
+
+
+def test_validate_target_company_rejects_non_string():
+    from topofuzz.publish import _validate_target_company, PublishError
+    with pytest.raises(PublishError, match="must be str"):
+        _validate_target_company(123)  # type: ignore[arg-type]
+
+
+def test_validate_target_company_rejects_bidi_override():
+    from topofuzz.publish import _validate_target_company, PublishError
+    # U+202E RIGHT-TO-LEFT OVERRIDE — survives autoescape, cosmetically
+    # reverses subsequent text in the rendered PDF.
+    with pytest.raises(PublishError, match="invisible / formatting"):
+        _validate_target_company("Acme‮Bank")
+
+
+def test_validate_target_company_rejects_zero_width_joiner():
+    from topofuzz.publish import _validate_target_company, PublishError
+    with pytest.raises(PublishError, match="invisible / formatting"):
+        _validate_target_company("Acme​Bank")
+
+
+def test_validate_target_company_rejects_mathematical_alphanumeric():
+    from topofuzz.publish import _validate_target_company, PublishError
+    # U+1D400 MATHEMATICAL BOLD CAPITAL A — homoglyph that NFC does NOT
+    # fold; would bypass the visual-width budget.
+    with pytest.raises(PublishError, match="invisible / formatting"):
+        _validate_target_company("\U0001d400cmeBank")
+
+
+def test_validate_target_company_nfc_normalises():
+    """NFC fold must happen BEFORE the length cap so a decomposed form
+    counts at its composed length, not its codepoint count."""
+    from topofuzz.publish import _validate_target_company
+    # "Café" decomposed: C, a, f, e, U+0301 combining acute = 5 codepoints
+    # NFC: C, a, f, é = 4 codepoints.
+    out = _validate_target_company("Café")
+    assert out == "Café"
+    assert len(out) == 4
+
+
+def test_extract_vendor_independence_concentrated_run():
+    from topofuzz.publish import _extract_vendor_independence
+    independence = {
+        "vendor_overlap": ["google"],
+        "vendor_call_failure_rate": 0.075,
+        "vendor_disjoint": False,
+        "judges": [
+            {"vendor": "deepseek", "model_id": "deepseek/deepseek-chat"},
+            {"vendor": "google", "model_id": "google/gemini-2.5-flash"},
+            {"vendor": "google_2", "model_id": "google/gemini-2.5-pro"},
+        ],
+    }
+    manifest = {
+        "cli_args": {
+            "jury_models_resolved": {
+                "deepseek": "deepseek/deepseek-chat",
+                "google": "google/gemini-2.5-flash",
+                "google_2": "google/gemini-2.5-pro",
+            },
+        },
+    }
+    overlap, fr, dis, jurors, dvc, total = _extract_vendor_independence(
+        independence, manifest
+    )
+    assert overlap == ["google"]
+    assert fr == 0.075
+    assert dis is False
+    assert dvc == 2 and total == 3
+    assert [j["position"] for j in jurors] == ["1", "2", "3"]
+    # Position labels are 1-indexed sequence, NOT the manifest dict key.
+    assert all(j["position"].isdigit() for j in jurors)
+    # Models are stripped of the vendor/ prefix.
+    assert any(j["model"] == "gemini-2.5-flash" for j in jurors)
+
+
+def test_extract_vendor_independence_falls_back_to_judges_when_resolved_missing():
+    from topofuzz.publish import _extract_vendor_independence
+    # No cli_args.jury_models_resolved → walk independence.judges instead.
+    independence = {
+        "vendor_overlap": [],
+        "vendor_call_failure_rate": 0.0,
+        "vendor_disjoint": True,
+        "judges": [
+            {"vendor": "anthropic", "model_id": "anthropic/claude-sonnet-4-6"},
+            {"vendor": "openai", "model_id": "openai/gpt-5"},
+            {"vendor": "google", "model_id": "google/gemini-2.5-flash"},
+        ],
+    }
+    manifest = {"cli_args": {}}
+    _, _, _, jurors, dvc, total = _extract_vendor_independence(
+        independence, manifest
+    )
+    assert dvc == 3 and total == 3
+    assert {j["vendor"] for j in jurors} == {"anthropic", "openai", "google"}
+    # Fallback also strips the vendor/ prefix from model_id.
+    assert any(j["model"] == "claude-sonnet-4-6" for j in jurors)
+
+
+def test_extract_vendor_independence_rejects_nan_failure_rate():
+    from topofuzz.publish import _extract_vendor_independence
+    independence = {
+        "vendor_call_failure_rate": float("nan"),
+        "vendor_disjoint": True,
+        "vendor_overlap": [],
+        "judges": [],
+    }
+    _, fr, _, _, _, _ = _extract_vendor_independence(independence, {})
+    assert fr is None
+
+
+def test_extract_vendor_independence_rejects_bool_failure_rate():
+    """Python bool is a subclass of int — must be rejected explicitly so
+    the template never renders True as a "100% failure rate"."""
+    from topofuzz.publish import _extract_vendor_independence
+    independence = {
+        "vendor_call_failure_rate": True,
+        "vendor_disjoint": True,
+        "vendor_overlap": [],
+        "judges": [],
+    }
+    _, fr, _, _, _, _ = _extract_vendor_independence(independence, {})
+    assert fr is None
+
+
+def test_extract_vendor_independence_skips_malformed_juror_rows():
+    from topofuzz.publish import _extract_vendor_independence
+    independence = {
+        "judges": [
+            {"vendor": "openai", "model_id": "openai/gpt-5"},
+            "not-a-dict",  # malformed entry should be dropped
+            {"vendor": 123},  # non-string vendor dropped
+            {"vendor": "google", "model_id": "google/gemini-2.5-flash"},
+        ],
+    }
+    _, _, _, jurors, dvc, total = _extract_vendor_independence(
+        independence, {"cli_args": {}}
+    )
+    assert total == 2
+    assert dvc == 2
+
+
+def test_build_consistency_card_context_concentrated_severity(tmp_path):
+    from topofuzz.publish import (
+        _build_consistency_card_context, load_publish_metadata, _load_manifest,
+    )
+    run_dir = _make_run_with_jury_report_json(tmp_path)
+    md = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    ind = report["headline"]["judge_independence"]
+    ctx = _build_consistency_card_context(
+        metadata=md, manifest=manifest, independence=ind, target_company="Acme Bank"
+    )
+    assert ctx["severity"] == "concentrated"
+    assert "2 distinct vendors" in ctx["headline_title"]
+    assert ctx["stat_headline"] == "2 / 3"
+    assert ctx["failure_rate_str"] == "7.5%"
+    assert "Acme Bank" in ctx["what_paragraph"]
+    assert "Acme Bank" in ctx["cta_line"]
+
+
+def test_build_consistency_card_context_degraded_severity(tmp_path):
+    from topofuzz.publish import (
+        _build_consistency_card_context, load_publish_metadata, _load_manifest,
+    )
+    # No overlap but high failure rate → degraded.
+    run_dir = _make_run_with_jury_report_json(
+        tmp_path,
+        vendor_overlap=[],
+        vendor_call_failure_rate=0.25,
+        vendor_disjoint=True,
+    )
+    md = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    ind = report["headline"]["judge_independence"]
+    ctx = _build_consistency_card_context(
+        metadata=md, manifest=manifest, independence=ind, target_company=None
+    )
+    assert ctx["severity"] == "degraded"
+    # F8 RT pass-1 M9: precision unified to .1f across headline + body.
+    assert "25.0%" in ctx["headline_title"]
+    assert "your stack" in ctx["what_paragraph"]
+
+
+def test_build_consistency_card_context_stable_severity(tmp_path):
+    from topofuzz.publish import (
+        _build_consistency_card_context, load_publish_metadata, _load_manifest,
+    )
+    run_dir = _make_run_with_jury_report_json(
+        tmp_path,
+        vendor_overlap=[],
+        vendor_call_failure_rate=0.02,
+        vendor_disjoint=True,
+        jury_models_resolved={
+            "anthropic": "anthropic/claude-sonnet-4-6",
+            "openai": "openai/gpt-5",
+            "google": "google/gemini-2.5-flash",
+        },
+    )
+    md = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    ind = report["headline"]["judge_independence"]
+    ctx = _build_consistency_card_context(
+        metadata=md, manifest=manifest, independence=ind, target_company=None
+    )
+    assert ctx["severity"] == "stable"
+    # F8 RT pass-1 B3 follow-up: copy was softened. The stable branch
+    # no longer claims SOC 2 / MRM quotability outright — it now reads
+    # as a "preliminary cross-vendor-disjointness signal" requiring
+    # self-preference + rerun-stability confirmation.
+    assert "preliminary" in ctx["what_paragraph"]
+    assert "cross-vendor-disjointness signal" in ctx["what_paragraph"]
+    # Soft-claim guardrail: must NOT say it's quotable without confirmation.
+    assert "SOC 2" not in ctx["what_paragraph"]
+
+
+def test_build_consistency_card_context_unknown_severity_when_partial(tmp_path):
+    """No overlap signal, no failure-rate signal, no disjoint flag → the
+    extractor falls back to the conservative "unknown" branch rather
+    than over-claiming stability."""
+    from topofuzz.publish import (
+        _build_consistency_card_context, load_publish_metadata, _load_manifest,
+    )
+    run_dir = _make_run_with_jury_report_json(
+        tmp_path,
+        vendor_overlap=[],
+        vendor_call_failure_rate=None,
+        vendor_disjoint=False,  # disjoint=False AND no overlap is the partial-telemetry shape
+    )
+    md = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    ind = report["headline"]["judge_independence"]
+    ctx = _build_consistency_card_context(
+        metadata=md, manifest=manifest, independence=ind, target_company=None
+    )
+    assert ctx["severity"] == "unknown"
+    assert ctx["stat_headline"] == "?"
+
+
+def test_html_safe_vendor_truncates_long_name():
+    from topofuzz.publish import _html_safe_vendor
+    assert _html_safe_vendor("google") == "google"
+    out = _html_safe_vendor("a" * 100)
+    assert out.endswith("…")
+    assert len(out) == 38  # 37 chars + ellipsis
+
+
+def test_build_consistency_card_pdf_rejects_missing_run_dir(tmp_path):
+    from topofuzz.publish import build_consistency_card_pdf, PublishError
+    with pytest.raises(PublishError, match="not a directory"):
+        build_consistency_card_pdf(
+            tmp_path / "nope", out_path=tmp_path / "card.pdf"
+        )
+
+
+def test_build_consistency_card_pdf_rejects_out_path_is_directory(tmp_path):
+    from topofuzz.publish import build_consistency_card_pdf, PublishError
+    run_dir = _make_run_with_jury_report_json(tmp_path)
+    (tmp_path / "out").mkdir()
+    with pytest.raises(PublishError, match="existing directory"):
+        build_consistency_card_pdf(run_dir, out_path=tmp_path / "out")
+
+
+def test_build_consistency_card_pdf_rejects_missing_report_json(tmp_path):
+    from topofuzz.publish import build_consistency_card_pdf, PublishError
+    run_dir = _make_run_with_jury_report_json(tmp_path, omit_report_json=True)
+    with pytest.raises(PublishError, match="report.json is missing"):
+        build_consistency_card_pdf(run_dir, out_path=tmp_path / "card.pdf")
+
+
+def test_build_consistency_card_pdf_rejects_missing_independence_block(tmp_path):
+    """Single-judge runs have no headline.judge_independence — the
+    consistency card must refuse to render rather than silently emit a
+    "stable" PDF on a single-juror source."""
+    from topofuzz.publish import build_consistency_card_pdf, PublishError
+    run_dir = _make_run_with_jury_report_json(tmp_path, omit_independence=True)
+    with pytest.raises(PublishError, match="judge_independence"):
+        build_consistency_card_pdf(run_dir, out_path=tmp_path / "card.pdf")
+
+
+def test_build_consistency_card_pdf_rejects_overlong_target(tmp_path):
+    from topofuzz.publish import build_consistency_card_pdf, PublishError
+    run_dir = _make_run_with_jury_report_json(tmp_path)
+    with pytest.raises(PublishError, match="exceeds 80 chars"):
+        build_consistency_card_pdf(
+            run_dir,
+            out_path=tmp_path / "card.pdf",
+            target_company="a" * 81,
+        )
+
+
+def test_build_consistency_card_pdf_rejects_bidi_override_target(tmp_path):
+    from topofuzz.publish import build_consistency_card_pdf, PublishError
+    run_dir = _make_run_with_jury_report_json(tmp_path)
+    with pytest.raises(PublishError, match="invisible / formatting"):
+        build_consistency_card_pdf(
+            run_dir,
+            out_path=tmp_path / "card.pdf",
+            target_company="Acme‮Bank",
+        )
+
+
+def test_render_consistency_card_html_strict_undefined_catches_missing_keys():
+    """The Jinja env uses StrictUndefined — a typo in the context dict
+    crashes the render rather than emitting an empty cell."""
+    import jinja2
+    from topofuzz.publish import _render_consistency_card_html
+    with pytest.raises((jinja2.UndefinedError, KeyError)):
+        _render_consistency_card_html({"headline_title": "x"})  # missing the rest
+
+
+def test_render_consistency_card_html_autoescape_blocks_html_in_vendor():
+    """A hostile or sloppy vendor name must be HTML-escaped in the
+    rendered card, not rendered raw."""
+    from topofuzz.publish import _render_consistency_card_html
+    ctx = {
+        "headline_title": "title",
+        "headline_lede": "lede",
+        "stat_headline": "2 / 3",
+        "stat_label": "label",
+        "severity": "concentrated",
+        "failure_rate_str": "7.5%",
+        "self_preference_warning": "",
+        "what_paragraph": "what",
+        "cta_line": "cta",
+        "topology_name": "fixture",
+        "n_variants": 4, "n_evals": 3, "cost_str": "$1.00",
+        "jurors": [
+            {"position": "1", "vendor": "<script>alert(1)</script>", "model": "x"},
+        ],
+        "attribution_rows": [],
+        "attribution_n_truncated": 0,
+        "vendor_independence_note": "",
+        "headline_sub_line": "Jury-vote failure rate: 0.0%",
+        "run_id": "rid", "tds_version": "0.5.0", "signed_at": "now",
+    }
+    html = _render_consistency_card_html(ctx)
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+
+
+def test_render_consistency_card_html_autoescape_blocks_html_in_self_preference():
+    """F8 RT pass-1 B4 follow-up: a hostile self_preference_warning
+    string from a producer typo must not escape into raw HTML."""
+    from topofuzz.publish import _render_consistency_card_html
+    ctx = {
+        "headline_title": "title", "headline_lede": "lede",
+        "stat_headline": "?", "stat_label": "label",
+        "severity": "unknown", "failure_rate_str": "—",
+        "self_preference_warning": "<img src=x onerror=alert(1)>",
+        "what_paragraph": "what", "cta_line": "cta",
+        "topology_name": "fixture",
+        "n_variants": "—", "n_evals": "—", "cost_str": "—",
+        "jurors": [],
+        "attribution_rows": [],
+        "attribution_n_truncated": 0,
+        "vendor_independence_note": "",
+        "headline_sub_line": "Jury-vote failure rate: 0.0%",
+        "run_id": "rid", "tds_version": "0.5.0", "signed_at": "now",
+    }
+    html = _render_consistency_card_html(ctx)
+    assert "<img src=x onerror=alert(1)>" not in html
+    assert "&lt;img src=x onerror=alert(1)&gt;" in html
+
+
+def test_cli_publish_requires_at_least_one_card_type(tmp_path):
+    from typer.testing import CliRunner
+    from topofuzz.cli import app
+    run_dir = _make_run_with_jury_report_json(tmp_path)
+    runner = CliRunner()
+    # No --pdf, no --ceo-card, no --consistency-card.
+    # F8 CR pass-1 M1: assert against ``result.output`` to match the
+    # F6 precedent at L1063-1071 — every other publish-CLI test in
+    # this file uses ``.output``, not ``.stderr``.
+    result = runner.invoke(app, ["publish", str(run_dir)])
+    assert result.exit_code == 2
+    assert "at least one of" in result.output
+
+
+def test_cli_publish_target_without_card_is_usage_error(tmp_path):
+    from typer.testing import CliRunner
+    from topofuzz.cli import app
+    run_dir = _make_run_with_jury_report_json(tmp_path)
+    runner = CliRunner()
+    # --target with only --pdf is meaningless.
+    result = runner.invoke(
+        app,
+        ["publish", str(run_dir), "--pdf", str(tmp_path / "out.pdf"),
+         "--target", "Acme"],
+    )
+    assert result.exit_code == 2
+    # F8 CR pass-1 M1: assert against ``.output``.
+    assert "--target is only meaningful" in result.output
+
+
+def test_cli_publish_three_card_flags_invoke_all_three_builders(tmp_path, monkeypatch):
+    """F8 CR pass-1 M3: the three card-flag branches at cli.py:1855-
+    1869 are independent ``if`` blocks. A future refactor to ``elif``
+    or a moved ``_validate_target_company`` call could silently regress
+    the "all three at once" behaviour without test coverage. Mock the
+    builders and assert all three are called and all three paths
+    echoed.
+    """
+    from typer.testing import CliRunner
+    from topofuzz.cli import app
+    from topofuzz import publish as publish_module
+
+    run_dir = _make_run_with_jury_report_json(tmp_path)
+    calls: list[str] = []
+
+    def fake_build_publish_pdf(*args, out_path, **kwargs):
+        calls.append("publish")
+        out_path.write_bytes(b"%PDF-pub")
+        return out_path
+
+    def fake_build_ceo_card_pdf(*args, out_path, target_company=None, **kwargs):
+        calls.append(f"ceo_card:{target_company}")
+        out_path.write_bytes(b"%PDF-ceo")
+        return out_path
+
+    def fake_build_consistency_card_pdf(*args, out_path, target_company=None, **kwargs):
+        calls.append(f"consistency_card:{target_company}")
+        out_path.write_bytes(b"%PDF-con")
+        return out_path
+
+    monkeypatch.setattr(publish_module, "build_publish_pdf", fake_build_publish_pdf)
+    monkeypatch.setattr(publish_module, "build_ceo_card_pdf", fake_build_ceo_card_pdf)
+    monkeypatch.setattr(
+        publish_module, "build_consistency_card_pdf", fake_build_consistency_card_pdf
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "publish", str(run_dir),
+            "--pdf", str(tmp_path / "full.pdf"),
+            "--ceo-card", str(tmp_path / "ceo.pdf"),
+            "--consistency-card", str(tmp_path / "consistency.pdf"),
+            "--target", "Acme Bank",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == [
+        "publish",
+        "ceo_card:Acme Bank",
+        "consistency_card:Acme Bank",
+    ]
+    # Three echo lines, one per builder.
+    assert result.output.count("\n") >= 3
+
+
+def test_build_consistency_card_pdf_rejects_single_judge_with_present_block(tmp_path):
+    """F8 RT pass-1 M1: refuse a single-judge run even when the
+    ``judge_independence`` block is present-but-single-protocol. The
+    "missing block" check is not sufficient — a partial telemetry
+    path can populate the block with ``judge_protocol="single"``."""
+    from topofuzz.publish import build_consistency_card_pdf, PublishError
+    run_dir = _make_run_with_jury_report_json(
+        tmp_path, jury_models_resolved={"google": "google/gemini-2.5-flash"},
+    )
+    # Overwrite the report.json so independence claims single-judge.
+    report = json.loads((run_dir / "report.json").read_text())
+    report["headline"]["judge_independence"] = {
+        "judge_protocol": "single",
+        "judges": [{"vendor": "google", "model_id": "google/gemini-2.5-flash"}],
+        "vendor_overlap": [],
+        "vendor_disjoint": True,
+    }
+    # Manifest must also drop the jury_of_3 flag.
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    manifest["cli_args"]["jury_of_3"] = False
+    manifest["cli_args"]["jury_models_resolved"] = {
+        "google": "google/gemini-2.5-flash",
+    }
+    (run_dir / "report.json").write_text(json.dumps(report), encoding="utf-8")
+    (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(PublishError, match="no signal indicates the source was a jury-of-N"):
+        build_consistency_card_pdf(run_dir, out_path=tmp_path / "card.pdf")
+
+
+def test_normalize_vendor_name_strips_disambiguator():
+    """F8 RT pass-1 B1: the IR uses ``google``, ``google_2`` to
+    disambiguate two jurors from the same vendor. The PDF should see
+    ``google`` for both."""
+    from topofuzz.publish import _normalize_vendor_name
+    assert _normalize_vendor_name("google") == "google"
+    assert _normalize_vendor_name("google_2") == "google"
+    assert _normalize_vendor_name("openai_42") == "openai"
+    # An underscore that's not a trailing disambiguator stays.
+    assert _normalize_vendor_name("my_vendor") == "my_vendor"
+
+
+def test_extract_vendor_independence_normalises_google_2(tmp_path):
+    """F8 RT pass-1 B1 regression: the real lending-tricky-jury data
+    has ``google_2`` as the third juror vendor. Without normalisation
+    the distinct count was 3 while overlap=['google'] said 2 — a
+    contradiction a procurement reviewer spots immediately."""
+    from topofuzz.publish import _extract_vendor_independence
+    independence = {
+        "judges": [
+            {"vendor": "deepseek", "model_id": "deepseek/deepseek-chat"},
+            {"vendor": "google", "model_id": "google/gemini-2.5-flash"},
+            {"vendor": "google_2", "model_id": "google/gemini-2.5-pro"},
+        ],
+        "vendor_overlap": ["google"],
+        "vendor_disjoint": False,
+        "vendor_call_failure_rate": 0.075,
+    }
+    _, _, _, jurors, dvc, total = _extract_vendor_independence(
+        independence, {"cli_args": {}}
+    )
+    assert total == 3
+    # The CRITICAL assertion: distinct_vendor_count agrees with overlap.
+    assert dvc == 2
+    assert [j["vendor"] for j in jurors] == ["deepseek", "google", "google"]
+
+
+def test_extract_vendor_independence_position_renumbered_after_filter():
+    """F8 CR pass-1 N1: if malformed entries are dropped, the rendered
+    table must not have a gap (positions ``1, 3`` with no ``2``)."""
+    from topofuzz.publish import _extract_vendor_independence
+    independence = {
+        "judges": [
+            {"vendor": "openai", "model_id": "openai/gpt-5"},
+            "not-a-dict",
+            {"vendor": 123},
+            {"vendor": "google", "model_id": "google/gemini-2.5-flash"},
+            {"vendor": "anthropic", "model_id": "anthropic/claude-sonnet-4-6"},
+        ],
+    }
+    _, _, _, jurors, _, total = _extract_vendor_independence(
+        independence, {"cli_args": {}}
+    )
+    assert total == 3
+    assert [j["position"] for j in jurors] == ["1", "2", "3"]
+
+
+def test_extract_vendor_independence_overlap_dedups_disambiguator():
+    """F8 RT pass-1 B1: a producer that returns ``['google', 'google_2']``
+    in the overlap list should not double-count after normalisation."""
+    from topofuzz.publish import _extract_vendor_independence
+    independence = {"vendor_overlap": ["google", "google_2", "openai"]}
+    overlap, _, _, _, _, _ = _extract_vendor_independence(
+        independence, {"cli_args": {}}
+    )
+    assert overlap == ["google", "openai"]
+
+
+def test_build_consistency_card_context_stable_refuses_when_total_jurors_lt_2(tmp_path):
+    """F8 BLOCKER B1/B2 regression: the STABLE branch used hardcoded
+    ``or 3`` literals when juror data was absent — fabricating a
+    "3 / 3" headline from nothing. Must collapse to ``unknown``."""
+    from topofuzz.publish import (
+        _build_consistency_card_context, load_publish_metadata, _load_manifest,
+    )
+    run_dir = _make_run_with_jury_report_json(
+        tmp_path,
+        vendor_overlap=[],
+        vendor_call_failure_rate=0.02,
+        vendor_disjoint=True,
+        # Empty resolved + no judges → no juror evidence.
+        jury_models_resolved={},
+    )
+    # Drop the judges array too so the fallback path also fails.
+    report = json.loads((run_dir / "report.json").read_text())
+    report["headline"]["judge_independence"]["judges"] = []
+    (run_dir / "report.json").write_text(json.dumps(report), encoding="utf-8")
+
+    md = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    ind = report["headline"]["judge_independence"]
+    ctx = _build_consistency_card_context(
+        metadata=md, manifest=manifest, independence=ind, target_company=None
+    )
+    assert ctx["severity"] == "unknown"
+    assert ctx["stat_headline"] == "?"
+    # And the headline must not claim "jury-of-3" out of thin air.
+    assert "jury-of-3" not in ctx["headline_title"]
+
+
+def test_build_consistency_card_context_singular_vendor_grammar(tmp_path):
+    """F8 CR pass-1 M2: all-same-vendor fixture must say "1 distinct
+    vendor", not "1 distinct vendors"."""
+    from topofuzz.publish import (
+        _build_consistency_card_context, load_publish_metadata, _load_manifest,
+    )
+    run_dir = _make_run_with_jury_report_json(
+        tmp_path,
+        vendor_overlap=["google"],
+        vendor_call_failure_rate=0.0,
+        vendor_disjoint=False,
+        jury_models_resolved={
+            "google": "google/gemini-2.5-flash",
+            "google_2": "google/gemini-2.5-pro",
+            "google_3": "google/gemini-2.5-ultra",
+        },
+    )
+    md = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    ind = report["headline"]["judge_independence"]
+    ctx = _build_consistency_card_context(
+        metadata=md, manifest=manifest, independence=ind, target_company=None
+    )
+    assert ctx["severity"] == "concentrated"
+    assert "1 distinct vendor." in ctx["headline_title"]
+    assert "vendors" not in ctx["headline_title"].split("distinct ")[1]
+    # And the stat label is singular too.
+    assert "vendor" in ctx["stat_label"]
+    assert "distinct vendor backing" in ctx["stat_label"]
+
+
+def test_build_consistency_card_context_surfaces_self_preference_warning(tmp_path):
+    """F8 RT pass-1 B4: the real lending-tricky-jury data has a
+    ``self_preference_warning`` ("Agents and judges share vendor(s):
+    google..."). Silently dropping it is a credibility hit when a
+    procurement reader diffs the PDF against report.json."""
+    from topofuzz.publish import (
+        _build_consistency_card_context, load_publish_metadata, _load_manifest,
+    )
+    run_dir = _make_run_with_jury_report_json(tmp_path)
+    report = json.loads((run_dir / "report.json").read_text())
+    report["headline"]["judge_independence"]["self_preference_warning"] = (
+        "Agents and judges share vendor(s): google. Same-vendor scoring "
+        "can inflate apparent agreement"
+    )
+    (run_dir / "report.json").write_text(json.dumps(report), encoding="utf-8")
+
+    md = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    ind = report["headline"]["judge_independence"]
+    ctx = _build_consistency_card_context(
+        metadata=md, manifest=manifest, independence=ind, target_company=None
+    )
+    assert "share vendor(s): google" in ctx["self_preference_warning"]
+
+
+def test_build_consistency_card_context_donut_hole_at_displayed_10pct(tmp_path):
+    """F8 RT pass-1 M3: a failure_rate that displays as ``10.0%`` must
+    enter the ``degraded`` branch — not slip through to ``stable``
+    with a "stable but 10%" contradiction in the panel."""
+    from topofuzz.publish import (
+        _build_consistency_card_context, load_publish_metadata, _load_manifest,
+    )
+    run_dir = _make_run_with_jury_report_json(
+        tmp_path,
+        vendor_overlap=[],
+        vendor_call_failure_rate=0.0999,  # displays as 10.0% under .1f
+        vendor_disjoint=True,
+        jury_models_resolved={
+            "google": "google/gemini-2.5-flash",
+            "openai": "openai/gpt-5",
+            "anthropic": "anthropic/claude-sonnet-4-6",
+        },
+    )
+    md = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    ind = report["headline"]["judge_independence"]
+    ctx = _build_consistency_card_context(
+        metadata=md, manifest=manifest, independence=ind, target_company=None
+    )
+    # ``0.0999 >= 0.0995`` → degraded, not stable.
+    assert ctx["severity"] == "degraded"
+    assert "10.0%" in ctx["failure_rate_str"] or "10.0%" in ctx["headline_title"]
+
+
+def test_build_consistency_card_context_n_evals_falls_back_to_n_eval_rows(tmp_path):
+    """F8 RT pass-1 M5: real production manifests write
+    ``n_eval_rows``, not ``n_evals``. The card must not display
+    ``Evals: —`` on the real gallery run."""
+    from topofuzz.publish import (
+        _build_consistency_card_context, load_publish_metadata, _load_manifest,
+    )
+    run_dir = _make_run_with_jury_report_json(tmp_path)
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    manifest.pop("n_evals", None)
+    manifest["n_eval_rows"] = 42
+    (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    md = load_publish_metadata(run_dir)
+    manifest_reloaded = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    ind = report["headline"]["judge_independence"]
+    ctx = _build_consistency_card_context(
+        metadata=md, manifest=manifest_reloaded, independence=ind, target_company=None
+    )
+    assert ctx["n_evals"] == 42
+
+
+def test_build_consistency_card_context_topology_name_length_cap(tmp_path):
+    """F8 CR pass-1 N3: operator-controlled ``topology_name`` cannot
+    blow the ``<title>`` tag or the meta-row line."""
+    from topofuzz.publish import (
+        _build_consistency_card_context, load_publish_metadata, _load_manifest,
+    )
+    run_dir = _make_run_with_jury_report_json(tmp_path)
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    manifest["topology_name"] = "X" * 5000
+    (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    md = load_publish_metadata(run_dir)
+    manifest_reloaded = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    ind = report["headline"]["judge_independence"]
+    ctx = _build_consistency_card_context(
+        metadata=md, manifest=manifest_reloaded, independence=ind, target_company=None
+    )
+    assert len(ctx["topology_name"]) <= 60
+    assert ctx["topology_name"].endswith("…")
+
+
+def test_build_consistency_card_context_overlap_join_bounded(tmp_path):
+    """F8 RT pass-1 M6: a hostile manifest with 20+ overlap vendors
+    must not blow the 13pt serif lede onto a second line."""
+    from topofuzz.publish import (
+        _build_consistency_card_context, load_publish_metadata, _load_manifest,
+    )
+    overlap = [f"vendor{i}" for i in range(20)]
+    run_dir = _make_run_with_jury_report_json(tmp_path, vendor_overlap=overlap)
+    md = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    ind = report["headline"]["judge_independence"]
+    ctx = _build_consistency_card_context(
+        metadata=md, manifest=manifest, independence=ind, target_company=None
+    )
+    assert "+17 more" in ctx["headline_lede"]
+    # vendor0..vendor2 + the truncation token = 4 comma-separated items
+    assert ctx["headline_lede"].count(", ") == 3
+
+
+def test_build_consistency_card_context_concentrated_lede_surfaces_compound_degradation(tmp_path):
+    """F8 RT pass-2 R1: when concentrated AND degraded both fire, the
+    procurement reader scanning bold copy must see BOTH signals — not
+    just the concentration headline with degradation hidden in a 9pt
+    sub-line. The lede gets a tail sentence interpolating the same
+    formatted failure rate the body footer carries.
+    """
+    from topofuzz.publish import (
+        _build_consistency_card_context, load_publish_metadata, _load_manifest,
+    )
+    run_dir = _make_run_with_jury_report_json(
+        tmp_path,
+        vendor_overlap=["google"],
+        vendor_call_failure_rate=0.40,
+        vendor_disjoint=False,
+    )
+    md = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    ind = report["headline"]["judge_independence"]
+    ctx = _build_consistency_card_context(
+        metadata=md, manifest=manifest, independence=ind, target_company=None
+    )
+    # Branch precedence: concentrated wins.
+    assert ctx["severity"] == "concentrated"
+    # Tail sentence interpolating failure_rate_str must be visible.
+    assert "40.0%" in ctx["headline_lede"]
+    assert "compounding" in ctx["headline_lede"]
+
+
+def test_build_consistency_card_context_concentrated_lede_no_tail_when_failure_rate_low(tmp_path):
+    """F8 RT pass-2 R1 boundary: when concentrated AND failure rate is
+    below the 10% threshold, the lede does NOT get the compound tail.
+    Otherwise a clean run with overlap would look procurement-worse
+    than it is."""
+    from topofuzz.publish import (
+        _build_consistency_card_context, load_publish_metadata, _load_manifest,
+    )
+    run_dir = _make_run_with_jury_report_json(
+        tmp_path,
+        vendor_overlap=["google"],
+        vendor_call_failure_rate=0.02,
+        vendor_disjoint=False,
+    )
+    md = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    ind = report["headline"]["judge_independence"]
+    ctx = _build_consistency_card_context(
+        metadata=md, manifest=manifest, independence=ind, target_company=None
+    )
+    assert ctx["severity"] == "concentrated"
+    assert "compounding" not in ctx["headline_lede"]
+    assert "Jury votes also failed" not in ctx["headline_lede"]
+
+
+def test_build_consistency_card_context_all_share_vendor_lede(tmp_path):
+    """F8 RT pass-2 R3: when distinct_vendor_count == 1 (all jurors
+    share a single vendor), the lede must read "All jurors share a
+    vendor", not "Two or more jurors share a vendor"."""
+    from topofuzz.publish import (
+        _build_consistency_card_context, load_publish_metadata, _load_manifest,
+    )
+    run_dir = _make_run_with_jury_report_json(
+        tmp_path,
+        vendor_overlap=["google"],
+        vendor_call_failure_rate=0.0,
+        vendor_disjoint=False,
+        jury_models_resolved={
+            "google": "google/gemini-2.5-flash",
+            "google_2": "google/gemini-2.5-pro",
+            "google_3": "google/gemini-2.5-ultra",
+        },
+    )
+    md = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    ind = report["headline"]["judge_independence"]
+    ctx = _build_consistency_card_context(
+        metadata=md, manifest=manifest, independence=ind, target_company=None
+    )
+    assert ctx["severity"] == "concentrated"
+    assert ctx["headline_lede"].startswith("All jurors share a vendor")
+    assert "Two or more jurors share" not in ctx["headline_lede"]
+
+
+def test_build_consistency_card_context_two_jurors_share_vendor_lede(tmp_path):
+    """F8 RT pass-2 R3 boundary: the "Two or more" copy still applies
+    when there are 2+ distinct vendors and at least one is shared."""
+    from topofuzz.publish import (
+        _build_consistency_card_context, load_publish_metadata, _load_manifest,
+    )
+    run_dir = _make_run_with_jury_report_json(tmp_path)  # default: 2 google + 1 deepseek
+    md = load_publish_metadata(run_dir)
+    manifest = _load_manifest(run_dir)
+    report = json.loads((run_dir / "report.json").read_text())
+    ind = report["headline"]["judge_independence"]
+    ctx = _build_consistency_card_context(
+        metadata=md, manifest=manifest, independence=ind, target_company=None
+    )
+    assert ctx["severity"] == "concentrated"
+    assert ctx["headline_lede"].startswith("Two or more jurors share a vendor")
+    assert "All jurors share a vendor" not in ctx["headline_lede"]
+
+
+def test_build_consistency_card_context_severity_whitelist_falls_back_to_unknown():
+    """F8 RT pass-1 M10: a future producer typo cannot ship an
+    unstyled white card. The context-builder pipeline only outputs
+    one of the four whitelisted severities."""
+    # No new branch in the builder produces an off-list severity, but
+    # the whitelist guard at the assignment site is the regression
+    # surface. Re-affirm by directly testing the membership.
+    from topofuzz.publish import _VALID_SEVERITIES
+    # F8 Stage A added "attribution" — the F4-per-agent-headline mode
+    # uses a neutral-blue chip distinct from concentrated red / degraded
+    # amber / stable green / unknown grey.
+    assert _VALID_SEVERITIES == frozenset(
+        {"concentrated", "degraded", "stable", "unknown", "attribution"}
+    )
+
+
+# ---------------------------------------------------------------------------
+# F8 Stage A — F4 attribution headline rework
+# ---------------------------------------------------------------------------
+
+
+def _stage_a_independence_with_overlap() -> dict:
+    """Return an independence block matching the lending-tricky-jury
+    gallery run (2 distinct vendors, concentrated severity). Used by
+    Stage A tests to confirm vendor-concentration demotes correctly."""
+    return {
+        "vendor_overlap": ["google"],
+        "vendor_call_failure_rate": 0.0,
+        "vendor_disjoint": False,
+        "judges": [
+            {"vendor": "deepseek", "model": "deepseek-chat"},
+            {"vendor": "google",   "model": "gemini-2.5-flash"},
+            {"vendor": "google_2", "model": "gemini-2.5-pro"},
+        ],
+    }
+
+
+def _stage_a_ablation_lending_tricky() -> dict:
+    """Replica of the canonical 2026-05-15-f4-lending-tricky-jury
+    ablation.json shape — risk 63.64%, policy 60.0%, intake 54.55%,
+    decision 100% (terminal — must NOT appear in the headline)."""
+    return {
+        "schema_version": 1,
+        "n_flipping_pairs": 12,
+        "by_node": {
+            "intake": {
+                "flips_closed": 6, "total_meaningful": 11,
+                "attribution_pct": 54.55, "is_terminal": False,
+            },
+            "risk": {
+                "flips_closed": 7, "total_meaningful": 11,
+                "attribution_pct": 63.64, "is_terminal": False,
+            },
+            "policy": {
+                "flips_closed": 6, "total_meaningful": 10,
+                "attribution_pct": 60.0, "is_terminal": False,
+            },
+            "decision": {
+                "flips_closed": 10, "total_meaningful": 10,
+                "attribution_pct": 100.0, "is_terminal": True,
+            },
+        },
+    }
+
+
+def test_stage_a_attribution_headline_lands_when_ablation_present(tmp_path):
+    """F4 attribution headline wins when ablation.json is supplied:
+    title leads with top non-terminal role, decision (terminal) does
+    NOT appear in the headline. Severity flips to 'attribution'."""
+    from topofuzz.publish import _build_consistency_card_context
+    ctx = _build_consistency_card_context(
+        metadata={"run_id": "r1", "tds_version": "0.6.0", "signed_at": "t"},
+        manifest={"topology_name": "lending-4role", "n_variants": 4,
+                  "n_eval_rows": 1, "cost_actual_usd": 3.07,
+                  "cli_args": {"jury_of_3": True, "jury_models_resolved": {
+                      "1": "deepseek/deepseek-chat",
+                      "2": "google/gemini-2.5-flash",
+                      "3": "google_2/gemini-2.5-pro",
+                  }}},
+        independence=_stage_a_independence_with_overlap(),
+        target_company="Acme Bank",
+        ablation=_stage_a_ablation_lending_tricky(),
+    )
+    # Headline leads with the top non-terminal role (risk).
+    # Post-pass-2 RT-MAJOR: title now surfaces the per-role
+    # numerator/denominator IN THE TITLE itself so a CRO scanning
+    # the headline can reconcile the % against the ratio without
+    # scrolling. For lending-tricky-jury demo: risk closes 7 of 11
+    # (63.6%).
+    assert "The risk role closed 7 of 11 ablation-eligible" in ctx["headline_title"]
+    assert "(63.6%)" in ctx["headline_title"]
+    assert "lending-4role" in ctx["headline_title"]
+    # Decision (terminal) must NOT appear in headline despite 100% attribution.
+    assert "decision" not in ctx["headline_title"].lower()
+    # Severity is the new 'attribution' chip.
+    assert ctx["severity"] == "attribution"
+    # Stat headline is the top percentage.
+    assert ctx["stat_headline"] == "63.6%"
+    # 3 non-terminal rows in the table (intake/risk/policy), terminal filtered.
+    assert len(ctx["attribution_rows"]) == 3
+    names = [r["name"] for r in ctx["attribution_rows"]]
+    assert "decision" not in names
+    assert names[0] == "risk"  # sorted by attribution desc
+    # Post-pass-1 RT-B1: per-role denominator MUST be in the lede so
+    # a reader who divides reaches the headline ratio. "7 of 11" is
+    # the risk role's flips_closed/total_meaningful.
+    assert "7 of 11" in ctx["headline_lede"]
+
+
+def test_stage_a_falls_back_to_vendor_concentration_without_ablation(tmp_path):
+    """Regression: when ablation.json is absent, the existing vendor-
+    concentration headline wins — severity stays 'concentrated', no
+    attribution rows, no vendor_independence_note (it IS the headline)."""
+    from topofuzz.publish import _build_consistency_card_context
+    ctx = _build_consistency_card_context(
+        metadata={"run_id": "r1", "tds_version": "0.6.0", "signed_at": "t"},
+        manifest={"topology_name": "lending-4role", "n_variants": 4,
+                  "n_eval_rows": 1, "cost_actual_usd": 3.07,
+                  "cli_args": {"jury_of_3": True, "jury_models_resolved": {
+                      "1": "deepseek/deepseek-chat",
+                      "2": "google/gemini-2.5-flash",
+                      "3": "google_2/gemini-2.5-pro",
+                  }}},
+        independence=_stage_a_independence_with_overlap(),
+        target_company=None,
+        ablation=None,  # explicit absent
+    )
+    assert ctx["severity"] == "concentrated"
+    assert ctx["attribution_rows"] == []
+    # Vendor concentration is the headline, not a note — so the note slot is empty.
+    assert ctx["vendor_independence_note"] == ""
+    assert "distinct" in ctx["headline_title"]
+
+
+def test_stage_a_vendor_concentration_demotes_to_notes_when_attribution_leads(tmp_path):
+    """Stage A intent: in attribution mode, the vendor-concentration
+    narrative must still surface — as a secondary notes block, not
+    discarded. A CRO who skims the card sees BOTH the actionable F4
+    headline AND the independence-check caveat below it."""
+    from topofuzz.publish import _build_consistency_card_context
+    ctx = _build_consistency_card_context(
+        metadata={"run_id": "r1", "tds_version": "0.6.0", "signed_at": "t"},
+        manifest={"topology_name": "lending-4role", "n_variants": 4,
+                  "n_eval_rows": 1, "cost_actual_usd": 3.07,
+                  "cli_args": {"jury_of_3": True, "jury_models_resolved": {
+                      "1": "deepseek/deepseek-chat",
+                      "2": "google/gemini-2.5-flash",
+                      "3": "google_2/gemini-2.5-pro",
+                  }}},
+        independence=_stage_a_independence_with_overlap(),
+        target_company=None,
+        ablation=_stage_a_ablation_lending_tricky(),
+    )
+    note = ctx["vendor_independence_note"]
+    assert note  # non-empty
+    # Note mentions the vendor that overlaps (google) somewhere.
+    assert "google" in note.lower()
+    # Note describes the jury topology — distinct vendor count is 2-of-3
+    # because google + google_2 normalise to one vendor.
+    assert "2" in note and "3" in note
+
+
+def test_stage_a_attribution_skips_terminal_node(tmp_path):
+    """Terminal node attribution is always ~100% by construction
+    (substitute_terminal kind). Headline must filter it so we don't
+    publish a non-finding."""
+    from topofuzz.publish import _extract_attribution_rows
+    rows = _extract_attribution_rows(_stage_a_ablation_lending_tricky())
+    assert all(r["name"] != "decision" for r in rows)
+    assert len(rows) == 3
+
+
+def test_stage_a_attribution_rows_capped_at_limit(tmp_path):
+    """`_ATTRIBUTION_TABLE_LIMIT` enforces a 1-page budget. Extra
+    non-terminal nodes drop off the table but are counted in
+    n_truncated so the stat-label can disclose the truncation."""
+    from topofuzz.publish import (
+        _build_consistency_card_context, _ATTRIBUTION_TABLE_LIMIT,
+    )
+    by_node = {
+        f"role_{i}": {
+            "flips_closed": 1, "total_meaningful": 10,
+            "attribution_pct": 10.0 + i, "is_terminal": False,
+        }
+        for i in range(_ATTRIBUTION_TABLE_LIMIT + 2)
+    }
+    by_node["terminal"] = {
+        "flips_closed": 10, "total_meaningful": 10,
+        "attribution_pct": 100.0, "is_terminal": True,
+    }
+    ctx = _build_consistency_card_context(
+        metadata={"run_id": "r1", "tds_version": "0.6.0", "signed_at": "t"},
+        manifest={"topology_name": "wide-pipeline", "n_variants": 4,
+                  "n_eval_rows": 1,
+                  "cli_args": {"jury_of_3": True, "jury_models_resolved": {
+                      "1": "deepseek/deepseek-chat",
+                      "2": "google/gemini-2.5-flash",
+                      "3": "google_2/gemini-2.5-pro",
+                  }}},
+        independence=_stage_a_independence_with_overlap(),
+        target_company=None,
+        ablation={"n_flipping_pairs": 5, "by_node": by_node},
+    )
+    assert len(ctx["attribution_rows"]) == _ATTRIBUTION_TABLE_LIMIT
+    assert ctx["attribution_n_truncated"] == 2
+    assert "top of 5" in ctx["stat_label"]
+
+
+def test_stage_a_corrupt_ablation_falls_back_safely(tmp_path):
+    """Malformed ablation payload (wrong type at root, missing by_node)
+    falls back to vendor-concentration headline without raising."""
+    from topofuzz.publish import _build_consistency_card_context
+    # ablation is a dict but by_node is missing — no attribution rows
+    # extractable.
+    ctx = _build_consistency_card_context(
+        metadata={"run_id": "r1", "tds_version": "0.6.0", "signed_at": "t"},
+        manifest={"topology_name": "lending-4role", "n_variants": 4,
+                  "n_eval_rows": 1, "cost_actual_usd": 3.07,
+                  "cli_args": {"jury_of_3": True, "jury_models_resolved": {
+                      "1": "deepseek/deepseek-chat",
+                      "2": "google/gemini-2.5-flash",
+                      "3": "google_2/gemini-2.5-pro",
+                  }}},
+        independence=_stage_a_independence_with_overlap(),
+        target_company=None,
+        ablation={"schema_version": 1, "n_flipping_pairs": 12},
+    )
+    # No attribution data → vendor-concentration headline wins.
+    assert ctx["attribution_rows"] == []
+    assert ctx["severity"] == "concentrated"
+
+
+def test_stage_a_attribution_what_paragraph_branch():
+    """The 'attribution' severity has its own _format_consistency_what_paragraph
+    branch — must describe per-role ablation as the actionable headline,
+    and must NOT use 're-engineering' language the engine can't
+    substantiate (F8 Stage A pass-1 RT-M2)."""
+    from topofuzz.publish import _format_consistency_what_paragraph
+    text = _format_consistency_what_paragraph("Acme Bank", "attribution")
+    assert "Acme Bank" in text
+    assert "ablation" in text.lower()
+    assert "role" in text.lower()
+    # MUST not overclaim — re-engineering is a remediation claim
+    # leave-one-out attribution can't substantiate.
+    assert "re-engineering" not in text.lower()
+    # The bridging sentence to the vendor-independence notes block
+    # below must be present so a CRO reading the body paragraph and
+    # skipping notes still sees the caveat exists (pass-1 RT-MINOR).
+    assert "vendor-independence" in text.lower()
+
+
+def test_stage_a_extract_attribution_rows_rejects_nan_and_out_of_range():
+    """Defensive: a malformed ablation entry (NaN, negative, >100)
+    must be silently skipped so the headline never renders 'nan%' or
+    a negative percentage."""
+    from topofuzz.publish import _extract_attribution_rows
+    rows = _extract_attribution_rows({
+        "by_node": {
+            "good": {"attribution_pct": 50.0, "is_terminal": False,
+                     "flips_closed": 1, "total_meaningful": 2},
+            "nan_role": {"attribution_pct": float("nan"), "is_terminal": False},
+            "negative": {"attribution_pct": -1.0, "is_terminal": False},
+            "overflow": {"attribution_pct": 150.0, "is_terminal": False},
+            "bool_trap": {"attribution_pct": True, "is_terminal": False},
+            "missing_pct": {"is_terminal": False},
+        }
+    })
+    assert [r["name"] for r in rows] == ["good"]
+
+
+def test_stage_a_build_pdf_e2e_reads_ablation_json(tmp_path):
+    """build_consistency_card_pdf must auto-resolve run_dir/ablation.json
+    and use it for the headline. Doesn't render Chromium (would require
+    playwright); just confirms the context-build path picks it up by
+    monkey-patching the renderer."""
+    import json as _json
+    from unittest.mock import patch
+    from topofuzz.publish import build_consistency_card_pdf
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "manifest.json").write_text(_json.dumps({
+        "run_id": "r-stage-a",
+        "tds_version": "0.6.0",
+        "topology_name": "lending-4role",
+        "n_variants": 4,
+        "n_eval_rows": 1,
+        "cost_actual_usd": 3.07,
+        "cli_args": {
+            "jury_of_3": True,
+            "jury_models_resolved": {
+                "1": "deepseek/deepseek-chat",
+                "2": "google/gemini-2.5-flash",
+                "3": "google_2/gemini-2.5-pro",
+            },
+        },
+    }), encoding="utf-8")
+    (run_dir / "report.json").write_text(_json.dumps({
+        "headline": {
+            "judge_independence": _stage_a_independence_with_overlap() | {
+                "judge_protocol": "jury_of_3",
+            }
+        }
+    }), encoding="utf-8")
+    (run_dir / "ablation.json").write_text(
+        _json.dumps(_stage_a_ablation_lending_tricky()), encoding="utf-8"
+    )
+
+    # Real minimal 1-page PDF bytes so build_consistency_card_pdf's
+    # pypdf page-count validation passes. Generated via pypdf to avoid
+    # hand-tuning a brittle byte literal.
+    import io as _io
+    import pypdf as _pypdf
+    _writer = _pypdf.PdfWriter()
+    _writer.add_blank_page(width=72, height=72)
+    _buf = _io.BytesIO()
+    _writer.write(_buf)
+    MINIMAL_PDF_BYTES = _buf.getvalue()
+
+    captured_html: list[str] = []
+    def fake_render_pages(html_paths, footer_text):
+        from pathlib import Path as _P
+        for p in html_paths:
+            captured_html.append(_P(p).read_text(encoding="utf-8"))
+        return [MINIMAL_PDF_BYTES]
+
+    with patch("topofuzz.publish._render_html_pages_to_pdfs", fake_render_pages):
+        out = build_consistency_card_pdf(
+            run_dir, out_path=tmp_path / "card.pdf"
+        )
+
+    assert out.exists()
+    assert captured_html
+    html = captured_html[0]
+    # F4 attribution headline landed in the rendered HTML.
+    # Pass-2 RT-MAJOR fix: title includes per-role denominator in
+    # the headline itself ("7 of 11 ablation-eligible verdict
+    # flips ... (63.6%)") so a CRO reconciles without scrolling.
+    assert "The risk role closed 7 of 11 ablation-eligible" in html
+    assert "(63.6%)" in html
+    # Vendor-concentration demoted to the notes block.
+    assert "Vendor independence check:" in html
+    # Decision (terminal) not in the attribution table.
+    assert ">decision<" not in html.lower()
+
+
+# ---------------------------------------------------------------------------
+# F8 Stage A — pass-1 audit-fix regressions
+# ---------------------------------------------------------------------------
+
+
+def test_stage_a_pass1_b1_per_role_denominator_in_lede():
+    """RT pass-1 BLOCKER B1: the lede MUST publish the per-role
+    numerator/denominator so a reader who divides reaches the same
+    63.6% the headline quotes — not 7/12 (n_flipping_pairs)."""
+    from topofuzz.publish import _format_attribution_headline
+    rows = [
+        {"name": "risk", "attribution_pct": 63.64,
+         "attribution_pct_str": "63.6%",
+         "flips_closed": 7, "total_meaningful": 11},
+        {"name": "policy", "attribution_pct": 60.0,
+         "attribution_pct_str": "60.0%",
+         "flips_closed": 6, "total_meaningful": 10},
+    ]
+    _title, lede, _stat, _label, _sub = _format_attribution_headline(
+        attribution_rows=rows,
+        topology_name="lending-4role",
+        n_flipping_pairs=12,
+        n_truncated=0,
+        partial=False,
+    )
+    # Per-role numerator/denominator must appear for the top role.
+    assert "7 of 11" in lede
+    # The "next contributor" clause must publish policy's 6/10 too.
+    assert "6/10" in lede
+    # The lede must NOT lead with the misleading "Across 12 measured
+    # verdict flips" framing that triggered the BLOCKER pre-fix.
+    assert "Across 12 measured" not in lede
+
+
+def test_stage_a_pass1_b2_partial_flag_surfaces_in_lede():
+    """RT pass-1 BLOCKER B2: ablation.partial=True must surface in
+    the lede so a CRO who opens ablation.json can't catch us
+    silently dropping the flag."""
+    from topofuzz.publish import _format_attribution_headline
+    rows = [
+        {"name": "risk", "attribution_pct": 63.64,
+         "attribution_pct_str": "63.6%",
+         "flips_closed": 7, "total_meaningful": 11},
+    ]
+    _t, lede_partial, _s, _l, sub_partial = _format_attribution_headline(
+        attribution_rows=rows,
+        topology_name="lending-4role",
+        n_flipping_pairs=12,
+        n_truncated=0,
+        partial=True,
+    )
+    _t, lede_full, _s, _l, sub_full = _format_attribution_headline(
+        attribution_rows=rows,
+        topology_name="lending-4role",
+        n_flipping_pairs=12,
+        n_truncated=0,
+        partial=False,
+    )
+    assert "partial" in lede_partial.lower()
+    assert "partial" not in lede_full.lower()
+    # Sub-line also exposes "F4 run partial" when partial=True.
+    assert "partial" in sub_partial.lower()
+    assert "partial" not in sub_full.lower()
+
+
+def test_stage_a_pass1_m1_drops_agent_suffix_and_capitalize():
+    """RT pass-1 MAJOR M1: title no longer uses '.capitalize()' or
+    '-agent' suffix grafting — those produced 'Risk-agent' and were
+    fragile against non-lowercase / multi-token operator role IDs."""
+    from topofuzz.publish import _format_attribution_headline
+    rows = [{
+        "name": "RISK", "attribution_pct": 50.0,
+        "attribution_pct_str": "50.0%",
+        "flips_closed": 5, "total_meaningful": 10,
+    }]
+    title, _l, _s, _label, _sub = _format_attribution_headline(
+        attribution_rows=rows,
+        topology_name="pipe",
+        n_flipping_pairs=10,
+        n_truncated=0,
+        partial=False,
+    )
+    # Bare role name preserved as-typed (RISK, not Risk).
+    assert "RISK" in title
+    assert "-agent" not in title
+    # Title leads with "The {role} role" — no .capitalize() fragility.
+    # Post-pass-2: title also includes per-role denom "5 of 10".
+    assert title.startswith("The RISK role closed 5 of 10")
+
+
+def test_stage_a_pass1_m3_attribution_mode_replaces_failure_rate_subline():
+    """RT pass-1 MAJOR M3: in attribution mode the chip sub-line is
+    flip count + role count + (optionally) 'F4 run partial' — NOT
+    'Jury-vote failure rate: X%' which is a vendor-concentration
+    sub-line that mis-leads under an attribution headline."""
+    from topofuzz.publish import _build_consistency_card_context
+    ctx_attr = _build_consistency_card_context(
+        metadata={"run_id": "r1", "tds_version": "0.6.0", "signed_at": "t"},
+        manifest={"topology_name": "lending-4role", "n_variants": 4,
+                  "n_eval_rows": 1, "cost_actual_usd": 3.07,
+                  "cli_args": {"jury_of_3": True, "jury_models_resolved": {
+                      "1": "deepseek/deepseek-chat",
+                      "2": "google/gemini-2.5-flash",
+                      "3": "google_2/gemini-2.5-pro",
+                  }}},
+        independence=_stage_a_independence_with_overlap(),
+        target_company=None,
+        ablation=_stage_a_ablation_lending_tricky(),
+    )
+    sub_attr = ctx_attr["headline_sub_line"]
+    assert "Jury-vote failure rate" not in sub_attr
+    assert "measured verdict flips" in sub_attr
+    assert "non-terminal roles ablated" in sub_attr
+
+    # Vendor-concentration mode (no ablation) — chip sub-line is the
+    # original failure-rate phrasing preserved for back-compat.
+    ctx_vc = _build_consistency_card_context(
+        metadata={"run_id": "r1", "tds_version": "0.6.0", "signed_at": "t"},
+        manifest={"topology_name": "lending-4role", "n_variants": 4,
+                  "n_eval_rows": 1, "cost_actual_usd": 3.07,
+                  "cli_args": {"jury_of_3": True, "jury_models_resolved": {
+                      "1": "deepseek/deepseek-chat",
+                      "2": "google/gemini-2.5-flash",
+                      "3": "google_2/gemini-2.5-pro",
+                  }}},
+        independence=_stage_a_independence_with_overlap(),
+        target_company=None,
+        ablation=None,
+    )
+    assert ctx_vc["headline_sub_line"].startswith("Jury-vote failure rate:")
+
+
+def test_stage_a_pass1_cr_m2_role_name_length_bounded():
+    """Code-review pass-1 MINOR M-CR2: an operator-supplied
+    by_node key of pathological length must be truncated before it
+    inflates the rendered title / HTML <title> tag."""
+    from topofuzz.publish import (
+        _extract_attribution_rows, _ATTRIBUTION_ROLE_NAME_DISPLAY_LIMIT,
+    )
+    hostile_name = "x" * 5000
+    rows = _extract_attribution_rows({
+        "by_node": {
+            hostile_name: {"attribution_pct": 50.0, "is_terminal": False,
+                           "flips_closed": 1, "total_meaningful": 2},
+        }
+    })
+    assert len(rows) == 1
+    assert len(rows[0]["name"]) <= _ATTRIBUTION_ROLE_NAME_DISPLAY_LIMIT
+    assert rows[0]["name"].endswith("…")
+
+
+def test_stage_a_pass1_stat_label_uses_attributable_framing():
+    """The stat-label string must avoid 'attributed to' (which implies
+    causal claim) and instead use the F4-honest 'closed by removing the
+    {role} role' wording (RT pass-1 alignment with the title fix)."""
+    from topofuzz.publish import _format_attribution_headline
+    rows = [{
+        "name": "risk", "attribution_pct": 63.64,
+        "attribution_pct_str": "63.6%",
+        "flips_closed": 7, "total_meaningful": 11,
+    }]
+    _t, _l, _s, label, _sub = _format_attribution_headline(
+        attribution_rows=rows,
+        topology_name="lending-4role",
+        n_flipping_pairs=12,
+        n_truncated=0,
+        partial=False,
+    )
+    assert "closed by removing the risk role" in label
+
+
+# ---------------------------------------------------------------------------
+# F8 Stage A — pass-2 audit-fix regressions
+# ---------------------------------------------------------------------------
+
+
+def test_stage_a_pass2_title_includes_per_role_denominator():
+    """RT pass-2 MAJOR: title must surface flips_closed/total_meaningful
+    so a CRO scanning the headline can reconcile the % against the
+    ratio without scrolling to the lede. Pre-fix, title said
+    '63.6% of attributable verdict flips' and a reader who computed
+    7 of n_flipping_pairs (12) got 58.3%, diffing against 63.6%."""
+    from topofuzz.publish import _format_attribution_headline
+    rows = [{
+        "name": "risk", "attribution_pct": 63.64,
+        "attribution_pct_str": "63.6%",
+        "flips_closed": 7, "total_meaningful": 11,
+    }]
+    title, _l, _s, _label, _sub = _format_attribution_headline(
+        attribution_rows=rows,
+        topology_name="lending-4role",
+        n_flipping_pairs=12,
+        n_truncated=0,
+        partial=False,
+    )
+    assert "7 of 11 ablation-eligible" in title
+    assert "(63.6%)" in title
+
+
+def test_stage_a_pass2_title_falls_back_when_counts_missing():
+    """If flips_closed / total_meaningful are absent from the ablation
+    row, the title falls back to '% of ablation-eligible verdict flips'
+    rather than crashing or rendering 'None of None'."""
+    from topofuzz.publish import _format_attribution_headline
+    rows = [{
+        "name": "risk", "attribution_pct": 50.0,
+        "attribution_pct_str": "50.0%",
+        "flips_closed": None, "total_meaningful": None,
+    }]
+    title, _l, _s, _label, _sub = _format_attribution_headline(
+        attribution_rows=rows,
+        topology_name="pipe",
+        n_flipping_pairs=10,
+        n_truncated=0,
+        partial=False,
+    )
+    assert "50.0% of ablation-eligible" in title
+    # Must NOT print "None" anywhere.
+    assert "None" not in title
+
+
+def test_stage_a_pass2_what_paragraph_discloses_overlap_caveat():
+    """RT pass-2 MINOR: leave-one-out shares can overlap (the demo's
+    63.6 + 60 + 54.5 = 178% would trigger a 'numbers don't add up'
+    pattern match without the caveat). The attribution what_paragraph
+    must disclose the overlap semantics."""
+    from topofuzz.publish import _format_consistency_what_paragraph
+    text = _format_consistency_what_paragraph("Acme Bank", "attribution")
+    assert "overlap" in text.lower()
+    assert "sum to 100" in text or "100%" in text
+
+
+def test_stage_a_pass2_extract_skips_zero_denominator_rows():
+    """Code-review pass-2 MINOR: a degenerate ablation row with
+    total_meaningful == 0 must be silently skipped (would otherwise
+    produce '0 of 0 ablation-eligible' copy in the lede)."""
+    from topofuzz.publish import _extract_attribution_rows
+    rows = _extract_attribution_rows({
+        "by_node": {
+            "good": {"attribution_pct": 50.0, "is_terminal": False,
+                     "flips_closed": 5, "total_meaningful": 10},
+            "degenerate": {"attribution_pct": 0.0, "is_terminal": False,
+                           "flips_closed": 0, "total_meaningful": 0},
+        }
+    })
+    names = [r["name"] for r in rows]
+    assert names == ["good"]
