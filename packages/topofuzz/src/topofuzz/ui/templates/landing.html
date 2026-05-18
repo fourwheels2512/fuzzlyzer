@@ -1,39 +1,144 @@
 {% extends "base.html" %}
-{% block title %}topofuzz · test your AI pipeline{% endblock %}
+{% block title %}topofuzz · check your AI for unfair decisions{% endblock %}
+
+{% macro vendor_paste_card(row, error, remember_default) %}
+<form method="post" action="/key/{{ row.vendor }}" autocomplete="off" class="key-card">
+  <div class="key-card-head">
+    <strong>{{ row.label }}</strong>
+    {% if row.required %}<span class="tag-required">required</span>{% endif %}
+  </div>
+  {% if error %}
+  <p class="key-card-error">{{ error }}</p>
+  {% endif %}
+  <label for="key-{{ row.vendor }}" class="muted" style="font-size: 13px;">
+    Paste your key (starts with <code>{{ row.prefix }}</code>):
+  </label>
+  <input type="password"
+         id="key-{{ row.vendor }}"
+         name="key"
+         placeholder="{{ row.prefix }}..."
+         required />
+  <label class="checkbox-row" style="margin-top: 10px; font-weight: 400;">
+    <input type="checkbox" name="remember" value="1"
+           {% if remember_default %}checked{% endif %} />
+    Remember this key on this computer
+  </label>
+  <div class="btn-row" style="margin-top: 14px;">
+    <button type="submit" class="btn">Save key</button>
+  </div>
+</form>
+{% endmacro %}
+
+{% macro vendor_saved_row(row) %}
+<div class="key-saved-row">
+  <div>
+    <strong style="color: var(--success);">✓ {{ row.label }}</strong>
+    <span class="muted">
+      {% if row.tail %}· ends in <code>…{{ row.tail }}</code>{% endif %}
+      {% if row.source == "env" %} · from your shell's <code>{{ row.env_var }}</code>
+      {% elif row.source == "disk" %} · saved on this computer
+      {% endif %}
+    </span>
+  </div>
+  <form method="post" action="/key/{{ row.vendor }}/remove" style="margin: 0;"
+        onsubmit="return confirm('Forget the {{ row.label }} key?');">
+    <button type="submit" class="btn muted">Remove</button>
+  </form>
+</div>
+{% endmacro %}
+
 {% block content %}
 <section class="hero">
-  <h1>Test your AI pipeline.</h1>
+  <h1>Check your AI for unfair decisions.</h1>
   <p class="lede">
-    See if your AI gives different answers when we change the order of
-    its steps. No coding required.
+    topofuzz runs your AI's decisions twice — once normally, once with the
+    order of its helpers shuffled. If the answer changes, that's a problem
+    you'd want to know before customers see it.
   </p>
-  <div class="btn-row" style="justify-content: center;">
-    <a class="btn large" href="/setup">Start a test</a>
-    <a class="btn large ghost" href="/runs">See past runs</a>
-  </div>
-  {% if not key_present %}
-  <p class="muted mt-32" style="max-width: 480px; margin-left: auto; margin-right: auto;">
-    You'll need a Google Gemini API key the first time. We'll walk you
-    through it.
-  </p>
-  {% endif %}
 </section>
 
+{# Required vendor (Google) — always shown, takes the visual top slot. #}
+{% set required_row = vendor_rows | selectattr("required") | first %}
+{% set optional_rows = vendor_rows | rejectattr("required") | list %}
+
+{% if not required_row.present %}
 <section class="card mt-32">
-  <h2>How it works</h2>
-  <p class="muted">
-    Pick a real-world workflow (loan approval, insurance claim triage).
-    Describe a few cases your AI has to handle. We run those cases through
-    the AI, then shuffle the order of its steps and run them again. If the
-    AI's answer flips depending on the order, that's a fairness or
-    reliability issue you'd want to catch before shipping.
+  <h3 style="margin-top: 0;">Step 1 — paste your Google AI key</h3>
+  <p class="field-hint">
+    topofuzz needs a Google AI key to run your test (the test workflows
+    use Gemini). It's free. Your key stays on your computer.
   </p>
-  <ol class="muted">
-    <li>Pick a workflow.</li>
-    <li>Write or edit a few scenarios in plain English.</li>
-    <li>Pick a thoroughness level — Quick, Balanced, or Premium.</li>
-    <li>Click <strong>Test for flips</strong> and wait a few minutes.</li>
-    <li>Read your plain-English report.</li>
-  </ol>
+  <p>
+    <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">
+      Don't have one? Get a key from Google →
+    </a>
+  </p>
+  {{ vendor_paste_card(
+       required_row,
+       (key_error if error_vendor == required_row.vendor else None),
+       remember_default
+  ) }}
 </section>
+{% else %}
+<section class="card mt-32">
+  {{ vendor_saved_row(required_row) }}
+</section>
+{% endif %}
+
+{# Optional vendors — collapsed in a disclosure unless one is missing AND
+   the user has expressed intent (we don't surface this without prompting). #}
+<details class="disclosure mt-24" {% if error_vendor and error_vendor != required_row.vendor %}open{% endif %}>
+  <summary>
+    <strong>Add more judges for cross-vendor testing (optional)</strong>
+    <span class="muted">
+      — turns on the "3 referees" option on the next page.
+      {% if n_vendors_saved >= 3 %}
+        You're ready: {{ n_vendors_saved }} of 4 saved.
+      {% elif n_vendors_saved == 2 %}
+        1 more vendor to enable 3 referees.
+      {% elif n_vendors_saved == 1 %}
+        Add 2 more to enable 3 referees.
+      {% else %}
+        Save Google above first, then 2 more here.
+      {% endif %}
+    </span>
+  </summary>
+  <p class="field-hint" style="margin-top: 12px;">
+    Adding OpenAI, Anthropic, or DeepSeek keys lets topofuzz use them as
+    extra referees during the test. Three different vendors disagreeing
+    is a stronger signal than one vendor flipping. Get keys from
+    <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer">OpenAI</a>,
+    <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener noreferrer">Anthropic</a>,
+    or <a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noopener noreferrer">DeepSeek</a>.
+  </p>
+  {% for row in optional_rows %}
+    {% if row.present %}
+      <div class="card flush" style="margin-top: 12px; padding: 14px 18px;">
+        {{ vendor_saved_row(row) }}
+      </div>
+    {% else %}
+      <div class="card flush" style="margin-top: 12px; padding: 18px;">
+        {{ vendor_paste_card(
+             row,
+             (key_error if error_vendor == row.vendor else None),
+             remember_default
+        ) }}
+      </div>
+    {% endif %}
+  {% endfor %}
+</details>
+
+<div class="btn-row" style="justify-content: center; margin-top: 32px;">
+  {% if key_present %}
+  <a class="btn large" href="/setup">Start a test</a>
+  <a class="btn ghost large" href="/runs">Past tests</a>
+  {% else %}
+  <button type="button" class="btn large" disabled>Start a test</button>
+  {% endif %}
+</div>
+{% if not key_present %}
+<p class="muted" style="text-align: center; margin-top: 12px;">
+  Save your Google AI key above to turn this on.
+</p>
+{% endif %}
 {% endblock %}

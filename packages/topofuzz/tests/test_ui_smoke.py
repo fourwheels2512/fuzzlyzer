@@ -234,9 +234,29 @@ class TestRegistryConcurrency:
 # --------- app.py: route surface ----------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _isolate_keystore(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the in-browser keystore at a tmp dir and clear runtime cache.
+
+    Without this, tests on a developer's machine inherit
+    ``~/.topofuzz/keys/{vendor}`` (set via the browser UI) and the no-key
+    paths look like they have keys. Also clear every non-Google env var
+    so a developer with OPENAI_API_KEY set doesn't surprise the tests.
+    """
+    from topofuzz.ui import _keystore as _ks
+    monkeypatch.setattr(_ks, "_KEY_DIR", tmp_path / "keys-isolated")
+    monkeypatch.setattr(_ks, "_KEY_FILE", tmp_path / "keys-isolated" / "google")
+    monkeypatch.setattr(_ks, "_runtime", {})
+    for spec in _ks.VENDORS.values():
+        if spec.vendor != "google":
+            # Google is set/unset per-fixture; clear the rest unconditionally
+            # so multi-vendor tests start from a clean slate.
+            monkeypatch.delenv(spec.env_var, raising=False)
+
+
 @pytest.fixture()
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
-    # Pretend a key is set so we don't bounce into the no_key page.
+    # Pretend a key is set via env so we don't bounce into the key-entry card.
     monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
     app = build_app(runs_root=tmp_path / "ui-runs")
     c = TestClient(app)
@@ -251,7 +271,9 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
 def client_no_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     app = build_app(runs_root=tmp_path / "ui-runs")
-    return TestClient(app)
+    c = TestClient(app)
+    c.headers["Origin"] = "http://testserver"  # for POST /key
+    return c
 
 
 class TestRoutes:
@@ -263,16 +285,18 @@ class TestRoutes:
     def test_landing_renders(self, client: TestClient) -> None:
         r = client.get("/")
         assert r.status_code == 200
-        assert "Test your AI pipeline" in r.text
+        assert "Check your AI for unfair decisions" in r.text
+        # Env-var Google key is present → landing shows the "saved" row,
+        # not the paste-key card.
+        assert "Google (Gemini)" in r.text
+        assert "Remove" in r.text  # the saved-state button
 
     def test_setup_renders_with_key(self, client: TestClient) -> None:
         r = client.get("/setup")
         assert r.status_code == 200
-        assert "Pick a workflow" in r.text
-        # "Start the test" is the primary CTA copy. Was once "Test for
-        # flips" — the RT-audit's plain-English review flagged "flips"
-        # as confusing for a 5th grader (could read as gymnastics).
-        assert "Start the test" in r.text
+        assert "What kind of AI is this" in r.text
+        # "Run the test" is the primary CTA copy.
+        assert "Run the test" in r.text
         # Cost row uses the 2.75x divisor — the page must show a SMALL
         # real-dollar number, never the inflated raw topofuzz cap.
         # Balanced preset = $8.00 raw → ~$2.91 real (10 scenarios) or
@@ -289,12 +313,155 @@ class TestRoutes:
             f"cost row shows raw topofuzz dollars instead of real: {amounts!r}"
         )
 
-    def test_setup_no_key_redirects_to_setup_page(
+    def test_setup_no_key_redirects_to_landing_with_paste_card(
         self, client_no_key: TestClient
     ) -> None:
+        # /setup is gated by key presence. With no key, the server redirects
+        # to / so the user can paste one in-browser. TestClient follows
+        # redirects by default.
         r = client_no_key.get("/setup")
         assert r.status_code == 200
-        assert "Gemini API key" in r.text
+        assert "paste your Google AI key" in r.text
+        assert "AIza" in r.text  # the format hint
+        # No more "stop the server" instructions.
+        assert "environment variable" not in r.text
+        assert "Ctrl+C" not in r.text
+
+    def test_post_google_key_valid_saves_and_redirects(
+        self, client_no_key: TestClient
+    ) -> None:
+        valid = "AIza" + "x" * 35  # 39 chars, starts with AIza
+        r = client_no_key.post(
+            "/key/google",
+            data={"key": valid, "remember": "1"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+        assert r.headers["location"] == "/"
+        # Following the redirect shows the "saved" state for Google.
+        r2 = client_no_key.get("/")
+        assert "Google (Gemini)" in r2.text
+        # Tail of the key is the last 4 chars.
+        assert valid[-4:] in r2.text
+        # Full key is never echoed back into HTML.
+        assert valid not in r2.text
+
+    def test_post_key_malformed_returns_400_with_error(
+        self, client_no_key: TestClient
+    ) -> None:
+        r = client_no_key.post(
+            "/key/google",
+            data={"key": "not-a-real-key"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 400
+        assert "starts with AIza" in r.text
+        # The paste card is still shown so the user can try again.
+        assert "paste your Google AI key" in r.text
+
+    def test_post_key_empty_returns_400(
+        self, client_no_key: TestClient
+    ) -> None:
+        r = client_no_key.post(
+            "/key/google", data={"key": ""}, follow_redirects=False
+        )
+        assert r.status_code == 400
+        assert "Paste your key" in r.text
+
+    def test_post_key_remove_clears_runtime_and_disk(
+        self, client_no_key: TestClient, tmp_path: Path
+    ) -> None:
+        from topofuzz.ui import _keystore as _ks
+        valid = "AIza" + "y" * 35
+        r = client_no_key.post(
+            "/key/google",
+            data={"key": valid, "remember": "1"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+        disk_path = _ks._KEY_DIR / "google"
+        assert disk_path.exists(), "remember=1 should write to disk"
+        r2 = client_no_key.post("/key/google/remove", follow_redirects=False)
+        assert r2.status_code == 303
+        assert r2.headers["location"] == "/"
+        assert not disk_path.exists(), "remove must delete the disk file"
+        # Landing is back to the paste-key state.
+        r3 = client_no_key.get("/")
+        assert "paste your Google AI key" in r3.text
+
+    def test_post_key_no_remember_does_not_write_disk(
+        self, client_no_key: TestClient
+    ) -> None:
+        from topofuzz.ui import _keystore as _ks
+        valid = "AIza" + "z" * 35
+        r = client_no_key.post(
+            "/key/google", data={"key": valid}, follow_redirects=False
+        )
+        assert r.status_code == 303
+        assert not (_ks._KEY_DIR / "google").exists(), (
+            "no remember checkbox should NOT persist to disk"
+        )
+        # But the key is still active for this session.
+        r2 = client_no_key.get("/")
+        assert "Google (Gemini)" in r2.text
+
+    def test_post_key_unknown_vendor_404(
+        self, client_no_key: TestClient
+    ) -> None:
+        valid = "AIza" + "x" * 35
+        r = client_no_key.post(
+            "/key/bogus", data={"key": valid}, follow_redirects=False
+        )
+        assert r.status_code == 404
+
+    def test_post_openai_key_saves_then_appears_in_optional_list(
+        self, client: TestClient
+    ) -> None:
+        valid = "sk-" + "x" * 25
+        r = client.post(
+            "/key/openai", data={"key": valid}, follow_redirects=False
+        )
+        assert r.status_code == 303
+        r2 = client.get("/")
+        assert "OpenAI" in r2.text
+        assert valid[-4:] in r2.text
+
+    def test_post_anthropic_wrong_prefix_rejected(
+        self, client_no_key: TestClient
+    ) -> None:
+        # Anthropic requires sk-ant-, not bare sk-.
+        r = client_no_key.post(
+            "/key/anthropic",
+            data={"key": "sk-" + "x" * 30},
+            follow_redirects=False,
+        )
+        assert r.status_code == 400
+        assert "sk-ant-" in r.text
+
+    def test_jury_unlocks_when_three_vendor_keys_saved(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Start from clean — only Google env var is set via the `client`
+        # fixture. /setup should NOT show the jury checkbox yet.
+        r = client.get("/setup")
+        assert "Use 3 referees" not in r.text
+        # Save OpenAI + Anthropic via the browser.
+        client.post(
+            "/key/openai",
+            data={"key": "sk-" + "x" * 25},
+            follow_redirects=False,
+        )
+        client.post(
+            "/key/anthropic",
+            data={"key": "sk-ant-" + "x" * 30},
+            follow_redirects=False,
+        )
+        # Now we have 3 saved → checkbox appears on /setup.
+        r2 = client.get("/setup")
+        assert "Use 3 referees" in r2.text
+        assert "Google (Gemini)" in r2.text
+        assert "OpenAI" in r2.text
+        assert "Anthropic (Claude)" in r2.text
 
     def test_runs_history_empty(self, client: TestClient) -> None:
         r = client.get("/runs")
@@ -1160,7 +1327,7 @@ class TestDegradedRunResultsBanners:
         SDK rate-limit, an OOM, or a version-mismatched ``langgraph``
         import inside ``topofuzz run`` all hit this path. The original
         Bug-B fix's bare ``elif exit_code == 1`` would have masked
-        those as "Completed with warnings" with a fabricated headline.
+        those as "Finished with warnings" with a fabricated headline.
         The ``_has_completed_report`` probe makes the fix surgical:
         only exit-1 runs that wrote a valid report.json classify as
         succeeded; the rest fall through to ``failed``.
@@ -1295,7 +1462,7 @@ class TestDegradedRunResultsBanners:
         self, tmp_path: Path
     ) -> None:
         """End-to-end via TestClient: a completed degraded run renders
-        the warn banner with "Completed with warnings" — NOT the
+        the warn banner with "Finished with warnings" — NOT the
         "cancelled" banner and NOT the "couldn't read summary file"
         headline."""
         import time as _time
@@ -1338,7 +1505,7 @@ class TestDegradedRunResultsBanners:
         assert r.status_code == 200, r.text
 
         # Bug B fix assertions: the two false banners are GONE.
-        assert "This run was cancelled before it finished" not in r.text, (
+        assert "This test was cancelled before it finished" not in r.text, (
             "Bug B regression: a successful-but-degraded run is being "
             "mislabelled as cancelled."
         )
@@ -1347,7 +1514,7 @@ class TestDegradedRunResultsBanners:
             "is being reported as having an unreadable summary."
         )
         # And the new warn banner IS shown.
-        assert "Completed with warnings" in r.text, (
+        assert "Finished with warnings" in r.text, (
             "Bug B fix: a degraded run must surface a warn banner "
             "explaining the judge-failure caveat."
         )
@@ -1410,10 +1577,10 @@ class TestDegradedRunResultsBanners:
 
         r = c.get("/runs/fake-run-cancelled")
         assert r.status_code == 200, r.text
-        assert "This run was cancelled before it finished" in r.text, (
+        assert "This test was cancelled before it finished" in r.text, (
             "user-driven cancel must surface the cancelled banner."
         )
-        assert "Completed with warnings" not in r.text, (
+        assert "Finished with warnings" not in r.text, (
             "CR M3 precedence: cancelled banner must take precedence "
             "over the degraded banner — a cancelled run with a partial "
             "degraded report.json should NOT show 'Completed with "

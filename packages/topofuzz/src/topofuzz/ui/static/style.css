@@ -832,6 +832,64 @@ details.disclosure[open] summary {
   border-radius: 6px;
 }
 
+/* Multi-vendor key entry (landing). */
+
+.key-card {
+  margin: 0;
+}
+
+.key-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 0 0 10px;
+}
+
+.key-card-error {
+  margin: 4px 0 12px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--danger);
+  background: #fae3e7;
+  border: 1px solid #ecbcc6;
+  border-radius: 6px;
+}
+
+.key-saved-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+
+.checkbox-row input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  flex-shrink: 0;
+}
+
+.tag-required {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--mustard);
+  background: var(--mustard-soft);
+  border: 1px solid #e8d18b;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
 /* Reduce motion for users who prefer it. */
 @media (prefers-reduced-motion: reduce) {
   *,

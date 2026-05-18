@@ -43,6 +43,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from topofuzz import __version__
+from topofuzz.ui import _keystore
 from topofuzz.ui.cost import format_dollars, real_dollars
 from topofuzz.ui.presets import (
     ALLOWED_CUSTOM_MODELS,
@@ -157,7 +158,8 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
     # ---------- helpers --------------------------------------------------
 
     def _gemini_key_present() -> bool:
-        return bool(os.environ.get("GEMINI_API_KEY", "").strip())
+        """The required vendor (Google) gates the run form."""
+        return _keystore.required_present()
 
     def _scenarios_from_form(form: dict[str, Any]) -> list[Scenario]:
         """Parse posted scenario_case[]/scenario_why[]/scenario_expected[]
@@ -265,13 +267,74 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
     async def healthz() -> dict[str, str]:
         return {"status": "ok", "version": __version__}
 
+    def _vendor_rows() -> list[dict[str, Any]]:
+        """One row per vendor for the landing-page card stack."""
+        rows: list[dict[str, Any]] = []
+        for vendor, spec in _keystore.VENDORS.items():
+            key = _keystore.get_key(vendor)
+            rows.append({
+                "vendor": vendor,
+                "label": spec.label,
+                "env_var": spec.env_var,
+                "prefix": spec.prefix,
+                "required": spec.required,
+                "present": bool(key),
+                "tail": _keystore.key_tail(key) if key else None,
+                "source": _keystore.source(vendor),
+            })
+        return rows
+
+    def _key_context(
+        *,
+        key_error: str | None = None,
+        error_vendor: str | None = None,
+        remembered_value: bool = True,
+    ) -> dict[str, Any]:
+        """Template context for the landing-page multi-vendor key card."""
+        return {
+            "key_present": _keystore.required_present(),
+            "vendor_rows": _vendor_rows(),
+            "key_error": key_error,
+            "error_vendor": error_vendor,
+            "remember_default": remembered_value,
+            "n_vendors_saved": len(_keystore.vendors_present()),
+            "jury_ready": len(_keystore.vendors_present()) >= 3,
+        }
+
     @app.get("/", response_class=HTMLResponse)
     async def landing(request: Request) -> HTMLResponse:
-        return templates.TemplateResponse(
-            request,
-            "landing.html",
-            {"key_present": _gemini_key_present()},
-        )
+        return templates.TemplateResponse(request, "landing.html", _key_context())
+
+    @app.post("/key/{vendor}", response_model=None)
+    async def key_post(request: Request, vendor: str):  # noqa: ANN202
+        _csrf_guard(request)
+        if vendor not in _keystore.VENDORS:
+            raise HTTPException(status_code=404, detail=f"unknown vendor: {vendor}")
+        form = await request.form()
+        raw = (form.get("key") or "").strip()
+        remember = bool(form.get("remember"))
+        ok, err = _keystore.validate_shape(vendor, raw)
+        if not ok:
+            return templates.TemplateResponse(
+                request,
+                "landing.html",
+                _key_context(
+                    key_error=err,
+                    error_vendor=vendor,
+                    remembered_value=remember,
+                ),
+                status_code=400,
+            )
+        _keystore.set_key(vendor, raw, remember=remember)
+        return RedirectResponse(url="/", status_code=303)
+
+    @app.post("/key/{vendor}/remove", response_model=None)
+    async def key_remove(request: Request, vendor: str):  # noqa: ANN202
+        _csrf_guard(request)
+        if vendor not in _keystore.VENDORS:
+            raise HTTPException(status_code=404, detail=f"unknown vendor: {vendor}")
+        _keystore.clear_key(vendor)
+        return RedirectResponse(url="/", status_code=303)
 
     @app.get("/setup", response_class=HTMLResponse)
     async def setup_get(
@@ -280,9 +343,7 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
         thoroughness: str = DEFAULT_THOROUGHNESS,
     ) -> HTMLResponse:
         if not _gemini_key_present():
-            return templates.TemplateResponse(
-                request, "no_key.html", {}, status_code=200
-            )
+            return RedirectResponse(url="/", status_code=303)
         all_workflows = _all_workflows_for_setup()
         # Resolve selected workflow against built-ins AND custom; fall back
         # to the default if the requested key has been deleted.
@@ -316,6 +377,12 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
                 "cost": cost,
                 "active_run_id": active.run_id if active else None,
                 "custom_prefix": CUSTOM_WORKFLOW_KEY_PREFIX,
+                "jury_ready": _keystore.jury_trio_for_subprocess() is not None,
+                "n_vendors_saved": len(_keystore.vendors_present()),
+                "vendors_saved_labels": [
+                    _keystore.VENDORS[v].label
+                    for v in _keystore.vendors_present()
+                ],
             },
         )
 
@@ -335,66 +402,73 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
             thoroughness_obj = THOROUGHNESS[DEFAULT_THOROUGHNESS]
 
         scenarios = _scenarios_from_form(form)
+        jury_of_3 = bool(form.get("jury_of_3"))
+        jury_trio = _keystore.jury_trio_for_subprocess() if jury_of_3 else None
+        if jury_of_3 and jury_trio is None:
+            # Box was checked but we don't have 3 vendors — fall through to
+            # single-judge mode silently. The UI hides the box when it
+            # can't be honored, so this only fires on form-tamper.
+            jury_of_3 = False
         # Minimum-scenario floor: with fewer than 3, the noise floor swamps
         # any signal. RT axis 2 — refuse with an inline error rather than
         # spawning a meaningless run.
+
+        # Common context for any 4xx re-render path below.
+        def _setup_ctx_for_error(form_error: str, active_run_id: str | None) -> dict[str, Any]:
+            return {
+                "workflows": _all_workflows_for_setup(),
+                "thoroughnesses": list(THOROUGHNESS.values()),
+                "selected_workflow": workflow_obj,
+                "selected_thoroughness": thoroughness_obj,
+                "starters": _hydrate_starters_from_form(scenarios),
+                "cost": _cost_preview(
+                    workflow_key=workflow_obj.key,
+                    thoroughness_key=thoroughness_obj.key,
+                    n_scenarios=max(len(scenarios), 1),
+                ),
+                "form_error": form_error,
+                "active_run_id": active_run_id,
+                "jury_ready": _keystore.jury_trio_for_subprocess() is not None,
+                "n_vendors_saved": len(_keystore.vendors_present()),
+                "vendors_saved_labels": [
+                    _keystore.VENDORS[v].label
+                    for v in _keystore.vendors_present()
+                ],
+                "jury_of_3_checked": jury_of_3,
+            }
+
         if len(scenarios) < 3:
-            cost = _cost_preview(
-                workflow_key=workflow_obj.key,
-                thoroughness_key=thoroughness_obj.key,
-                n_scenarios=max(len(scenarios), 1),
-            )
             return templates.TemplateResponse(
                 request,
                 "setup.html",
-                {
-                    "workflows": _all_workflows_for_setup(),
-                    "thoroughnesses": list(THOROUGHNESS.values()),
-                    "selected_workflow": workflow_obj,
-                    "selected_thoroughness": thoroughness_obj,
-                    "starters": _hydrate_starters_from_form(scenarios),
-                    "cost": cost,
-                    "form_error": (
-                        "Write at least three scenarios. With fewer than that, "
-                        "the result isn't trustworthy enough to demo."
-                    ),
-                    "active_run_id": None,
-                },
+                _setup_ctx_for_error(
+                    "Write at least three scenarios. With fewer than that, "
+                    "the result isn't trustworthy enough to demo.",
+                    None,
+                ),
                 status_code=400,
             )
 
         if not _gemini_key_present():
-            return templates.TemplateResponse(
-                request, "no_key.html", {}, status_code=400
-            )
+            return RedirectResponse(url="/", status_code=303)
 
         try:
             run = registry.launch(
                 workflow=workflow_obj,
                 thoroughness=thoroughness_obj,
                 scenarios=scenarios,
+                jury_of_3=jury_of_3,
+                jury_models=jury_trio,
             )
         except RunInProgressError as exc:
             return templates.TemplateResponse(
                 request,
                 "setup.html",
-                {
-                    "workflows": _all_workflows_for_setup(),
-                    "thoroughnesses": list(THOROUGHNESS.values()),
-                    "selected_workflow": workflow_obj,
-                    "selected_thoroughness": thoroughness_obj,
-                    "starters": _hydrate_starters_from_form(scenarios),
-                    "cost": _cost_preview(
-                        workflow_key=workflow_obj.key,
-                        thoroughness_key=thoroughness_obj.key,
-                        n_scenarios=len(scenarios),
-                    ),
-                    "form_error": (
-                        "Another run is already going. Wait for it to finish "
-                        "or cancel it before starting a new one."
-                    ),
-                    "active_run_id": str(exc),
-                },
+                _setup_ctx_for_error(
+                    "Another run is already going. Wait for it to finish "
+                    "or cancel it before starting a new one.",
+                    str(exc),
+                ),
                 status_code=409,
             )
 
@@ -514,6 +588,25 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="unknown run") from exc
         if run.status == "running":
             return RedirectResponse(url=f"/runs/{run_id}/live", status_code=303)
+        # Race fix: the drain thread flips status BEFORE rendering
+        # report.html and BEFORE hydrating cost from report.json (see
+        # RT-audit M7 in runs.py — done that way so a Cancel click during
+        # render isn't dropped). If we land here in that ~1s window,
+        # report.html is missing and cost shows $0.00. Render-on-demand
+        # closes the gap: best-effort, surfaced as a normal "no report"
+        # banner if it still fails.
+        if (
+            run.status == "succeeded"
+            and not run.report_html_path.exists()
+            and run.inner_run_dir is not None
+        ):
+            from topofuzz.ui.runs import _hydrate_cost_from_report_json
+            try:
+                from topofuzz.report import render_report
+                render_report(run.inner_run_dir)
+            except Exception:  # noqa: BLE001 — fall through to no-report branch
+                pass
+            _hydrate_cost_from_report_json(run)
         snap = run.snapshot()
         summary = run.read_summary()
         workflow_obj = _resolve_workflow_or_default(run.workflow_key)

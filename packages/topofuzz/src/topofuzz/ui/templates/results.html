@@ -3,25 +3,25 @@
 {% block title %}Results · topofuzz{% endblock %}
 {% block content %}
 <p class="muted mb-16">
-  <a href="/runs">← All runs</a>
+  <a href="/runs">← Past tests</a>
 </p>
 
 {% if run.status == "failed" %}
 <div class="banner danger">
-  <strong>The run stopped before it finished.</strong>
+  <strong>The test stopped before it finished.</strong>
   {{ run.failure_reason }}
 </div>
 {% elif run.status == "cancelled" %}
 <div class="banner warn">
-  This run was cancelled before it finished. The numbers below are
+  This test was cancelled before it finished. The numbers below are
   partial.
 </div>
 {% elif summary and summary.get("headline", {}).get("status") == "degraded" %}
 <div class="banner warn">
-  <strong>Completed with warnings.</strong>
-  Some judge calls failed during the run — see the
-  <em>judge_failure_rate</em> in the full report for the exact share.
-  The numbers below are based on the cells that did succeed.
+  <strong>Finished with warnings.</strong>
+  The referee couldn't decide on some cases — see the full report for
+  the exact share. The numbers below are based on the cases that did
+  succeed.
 </div>
 {% endif %}
 
@@ -29,18 +29,18 @@
 <p class="subhead">{{ headline.subtitle }}</p>
 
 <section class="card">
-  <h3>Run details</h3>
+  <h3>Test details</h3>
   <dl class="kv">
-    <dt>Workflow</dt><dd>{{ workflow.label }}</dd>
-    <dt>Status</dt>
+    <dt>AI type</dt><dd>{{ workflow.label }}</dd>
+    <dt>Result</dt>
     <dd><span class="status-pill {{ run.status }}">{{ run.status }}</span></dd>
-    <dt>Time</dt><dd>{{ "%d"|format(snap.elapsed_seconds) }} seconds</dd>
-    <dt>Real cost</dt><dd>{{ format_dollars(snap.real_spend_usd) }}</dd>
-    <dt>Scenarios tested</dt><dd>{{ headline.n_total }}</dd>
+    <dt>How long it took</dt><dd>{{ "%d"|format(snap.elapsed_seconds) }} seconds</dd>
+    <dt>What it cost</dt><dd>{{ format_dollars(snap.real_spend_usd) }}</dd>
+    <dt>Cases tested</dt><dd>{{ headline.n_total }}</dd>
   </dl>
   <div class="btn-row">
-    <a class="btn" href="/setup">Run again</a>
-    <a class="btn ghost" href="/runs">See all runs</a>
+    <a class="btn" href="/setup">Test another AI</a>
+    <a class="btn ghost" href="/runs">Past tests</a>
   </div>
 </section>
 
@@ -53,7 +53,7 @@
       <a class="btn ghost"
          href="/runs/{{ run.run_id }}/inspect"
          target="_blank"
-         rel="noopener noreferrer">Inspect a flip &rarr;</a>
+         rel="noopener noreferrer">See an example that changed &rarr;</a>
       {% endif %}
       <a href="/runs/{{ run.run_id }}/report" target="_blank" rel="noopener noreferrer">Open in new tab</a>
     </div>
@@ -73,11 +73,11 @@
 {% else %}
 <section class="card">
   <p class="muted">
-    The full report wasn't written — the run may have failed early. Open
-    the run log below for details.
+    The full report wasn't written — the test may have failed early. Open
+    the log below for details.
   </p>
   <details class="disclosure mt-16" open>
-    <summary>Run log</summary>
+    <summary>Test log</summary>
     <pre class="log">{% for line in snap.log_tail %}{{ line }}
 {% endfor %}</pre>
   </details>

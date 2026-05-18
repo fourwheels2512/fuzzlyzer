@@ -1,11 +1,11 @@
 {% extends "base.html" %}
 {% block title %}Running · topofuzz{% endblock %}
 {% block content %}
-<h1>Running your test…</h1>
+<h1>Testing your AI…</h1>
 <p class="lede">
-  We're shuffling the order of your AI's steps and checking whether the
-  decision changes. You can leave this tab open — or come back later to
-  <code>/runs/{{ run.run_id }}</code>.
+  We're shuffling the order of your AI's helpers and checking whether
+  the decision changes. You can leave this tab open — or close it and
+  open <a href="/runs">Past tests</a> at the top whenever you want.
 </p>
 
 <section class="card flush">
@@ -45,7 +45,7 @@
   </div>
   <div class="card-body" style="border-top: 1px solid var(--border);">
     <form method="post" action="/runs/{{ run.run_id }}/cancel">
-      <button type="submit" class="btn danger">Cancel this run</button>
+      <button type="submit" class="btn danger">Cancel this test</button>
     </form>
   </div>
 </section>

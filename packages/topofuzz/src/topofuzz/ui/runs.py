@@ -96,6 +96,11 @@ class _ParsedProgress:
     current_variant: int = 0
     variants_total: int = 0
     raw_spend_usd: float = 0.0
+    # When set, the snapshot uses this directly and bypasses the
+    # raw→real cost divisor. Populated post-run from report.json's
+    # ``headline.total_cost_usd`` which is the authentic measured spend
+    # — already in real dollars, not topofuzz's exaggerated raw meter.
+    real_spend_usd_override: float | None = None
     error_class: str = ""  # "" | "rate_limit" | "auth"
 
 
@@ -238,7 +243,14 @@ class Run:
         Returns a plain dict — JSON-serializable, no shared mutable state.
         """
         with self._lock:
-            real_spend = real_dollars(self.parsed.raw_spend_usd)
+            # Prefer the post-run override (sourced from report.json's
+            # authentic measured spend — already in real dollars). Fall
+            # back to dividing the regex-parsed raw spend by the topofuzz
+            # cost-meter calibration ratio.
+            if self.parsed.real_spend_usd_override is not None:
+                real_spend = self.parsed.real_spend_usd_override
+            else:
+                real_spend = real_dollars(self.parsed.raw_spend_usd)
             real_cap = real_dollars(self.raw_cost_cap_usd)
             return {
                 "run_id": self.run_id,
@@ -392,6 +404,8 @@ class RunRegistry:
         thoroughness: Thoroughness,
         scenarios: list[Scenario],
         env: dict[str, str] | None = None,
+        jury_of_3: bool = False,
+        jury_models: list[str] | None = None,
     ) -> Run:
         """Spawn ``topofuzz run`` for the given workflow + scenarios.
 
@@ -418,12 +432,18 @@ class RunRegistry:
             rubric_path=workflow.rubric_path,
             raw_cost_cap_usd=thoroughness.raw_cost_cap_usd,
             out_dir=out_dir,
+            jury_of_3=jury_of_3,
+            jury_models=jury_models,
         )
 
-        # Subprocess env: inherit the UI process env (so GEMINI_API_KEY
-        # set in the user's shell propagates), plus PYTHONIOENCODING=utf-8
-        # for Windows console safety.
+        # Subprocess env: inherit the UI process env, plus PYTHONIOENCODING=utf-8
+        # for Windows console safety. Inject every vendor key the user has
+        # saved in the browser. Shell-set env vars still work because
+        # _keystore.get_key() honors the env var as a fallback per vendor.
+        from topofuzz.ui import _keystore  # local import to avoid cycle at module load
         proc_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        for env_var, key in _keystore.get_all_keys().items():
+            proc_env[env_var] = key
         if env:
             proc_env.update(env)
 
@@ -504,6 +524,8 @@ def _build_topofuzz_cmd(
     rubric_path: Path,
     raw_cost_cap_usd: float,
     out_dir: Path,
+    jury_of_3: bool = False,
+    jury_models: list[str] | None = None,
 ) -> list[str]:
     """Compose the ``topofuzz run`` argv.
 
@@ -512,6 +534,11 @@ def _build_topofuzz_cmd(
     confirmation prompt — the UI surfaces a confirmation step BEFORE
     spawning, so the prompt would just leave the subprocess hung waiting
     on stdin.
+
+    When ``jury_of_3`` is set, appends ``--jury-of-3`` and (if
+    ``jury_models`` is non-None) ``--jury-models`` with an explicit
+    comma-separated trio. The CLI raises a usage error if exactly 3
+    aren't supplied; the caller is responsible for that contract.
     """
     fixture_spec = f"{fixture_path}:build_graph"
     # Use sys.executable, not bare "python" — the UI runs in the same
@@ -519,7 +546,7 @@ def _build_topofuzz_cmd(
     # + LLM SDKs). A bare "python" on PATH may resolve to a different
     # interpreter (e.g. the user's system Python) where topofuzz exists
     # but litellm doesn't, and every cell will fail at import.
-    return [
+    cmd = [
         sys.executable,
         "-m",
         "topofuzz",
@@ -541,6 +568,11 @@ def _build_topofuzz_cmd(
         str(out_dir),
         "-y",
     ]
+    if jury_of_3:
+        cmd.append("--jury-of-3")
+        if jury_models:
+            cmd.extend(["--jury-models", ",".join(jury_models)])
+    return cmd
 
 
 def _drain_subprocess(run: Run) -> None:
@@ -657,12 +689,20 @@ def _drain_subprocess(run: Run) -> None:
 
 
 def _hydrate_cost_from_report_json(run: Run) -> None:
-    """Populate run.parsed.raw_spend_usd from the run's report.json.
+    """Populate ``run.parsed.real_spend_usd_override`` from report.json.
 
     The subprocess's stdout doesn't emit a per-line spend marker in v0.5,
-    so the regex-based live counter stays at $0.00. Once the run is done
-    we have ``report.json`` on disk; lift the authoritative number from
-    there so the results page shows the real spend instead of $0.00.
+    so the regex-based live counter stays at $0.00 throughout the run.
+    Once the run is done we have ``report.json`` on disk; lift the
+    authoritative ``headline.total_cost_usd`` value so the results page
+    shows the real spend instead of $0.00.
+
+    NOTE: ``total_cost_usd`` is the AUTHENTIC measured spend already in
+    real dollars (per :mod:`topofuzz.cost` accounting in the runner),
+    so we write it to the override field that :meth:`Run.snapshot`
+    surfaces without re-applying the raw→real divisor. Writing to
+    ``raw_spend_usd`` instead would double-divide and show ~36% of the
+    real cost on the results page.
     """
     summary = run.read_summary()
     if not summary:
@@ -673,7 +713,7 @@ def _hydrate_cost_from_report_json(run: Run) -> None:
     total = headline.get("total_cost_usd")
     if isinstance(total, (int, float)) and total >= 0:
         with run._lock:
-            run.parsed.raw_spend_usd = float(total)
+            run.parsed.real_spend_usd_override = float(total)
 
 
 def _was_cancelled(exit_code: int) -> bool:

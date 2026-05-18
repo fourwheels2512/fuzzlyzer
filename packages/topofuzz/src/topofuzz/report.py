@@ -572,21 +572,34 @@ def _strip_svg_preamble(svg_bytes: bytes) -> str:
     return _SVG_PRE_TAG_RE.sub(b"", svg_bytes).decode("utf-8")
 
 
-def _placeholder_svg(message: str) -> str:
-    """Tiny static SVG used when the score matrix is empty."""
-    # Hand-written so it doesn't pull matplotlib when the matrix is
-    # empty (common for aborted-very-early runs). Inline so it embeds
-    # straight into the template without escaping.
-    safe = message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    return (
-        '<svg xmlns="http://www.w3.org/2000/svg" width="480" height="120" '
-        'viewBox="0 0 480 120">'
-        '<rect width="480" height="120" fill="#f3f3f3" stroke="#bbb"/>'
-        '<text x="240" y="65" text-anchor="middle" '
+def _placeholder_svg(message: str, *, subtitle: str | None = None) -> str:
+    """Tiny static SVG used when a chart can't be rendered.
+
+    ``message`` is the headline — keep under ~55 chars to fit.
+    ``subtitle`` is an optional second line below it, e.g. plain-English
+    explanation of why the chart is empty.
+    """
+    def _safe(s: str) -> str:
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    height = 120 if subtitle is None else 150
+    y_head = 65 if subtitle is None else 58
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="480" height="{height}" '
+        f'viewBox="0 0 480 {height}">',
+        f'<rect width="480" height="{height}" fill="#f3f3f3" stroke="#bbb"/>',
+        f'<text x="240" y="{y_head}" text-anchor="middle" '
         'font-family="ui-monospace, Menlo, Consolas, monospace" '
-        f'font-size="14" fill="#666">{safe}</text>'
-        "</svg>"
-    )
+        f'font-size="14" fill="#444">{_safe(message)}</text>',
+    ]
+    if subtitle:
+        parts.append(
+            '<text x="240" y="92" text-anchor="middle" '
+            'font-family="-apple-system, Segoe UI, sans-serif" '
+            f'font-size="12" fill="#777">{_safe(subtitle)}</text>'
+        )
+    parts.append("</svg>")
+    return "".join(parts)
 
 
 def _render_voo_bar_svg(
@@ -824,8 +837,18 @@ def _render_influence_bar_svg(rows: list[dict[str, Any]]) -> str:
 
     plot_rows = [r for r in rows if r["influence"] is not None]
     if not plot_rows:
+        # Every agent's per-agent attribution collapsed — no row has a
+        # usable influence number. Most common cause: zero verdict flips
+        # in the run (nothing to split between agents). Less common
+        # causes: each agent moved <2 times, or no scored cells covered
+        # the contrast. Surface this in plain English instead of the old
+        # cryptic "every agent is degenerate" line.
         return _placeholder_svg(
-            "influence available but every agent is degenerate"
+            "No agent stood out as the cause.",
+            subtitle=(
+                "Most likely your AI gave the same answer no matter how the "
+                "agents were ordered."
+            ),
         )
 
     plt = _setup_matplotlib()
