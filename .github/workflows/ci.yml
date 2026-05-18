@@ -1,10 +1,31 @@
 name: CI
 
+# 2026-05-17 — TRIGGERS DISABLED after hitting 100% of GitHub Actions free tier.
+# Root cause: 14-job matrix (4 ubuntu pytest + 3 OS × 2 py verify-install +
+# 3 OS full-install + 1 copyright) running on every push to main, all failing
+# for 2 days. macOS at 10× billing × 3 jobs = ~600-900 min-equivalents per push.
+# Re-enable after: (1) diagnosing why all 14 jobs fail, (2) right-sizing the
+# matrix (drop macOS unless release-only, drop py3.14, narrow os×py grid),
+# (3) adding `paths-ignore: ['**.md', '.planning/**', 'docs/**']` so docs
+# commits don't trigger CI. Until then, runs ONLY via workflow_dispatch.
+#
+# To re-enable temporarily for a single run: GitHub Actions tab → CI →
+# "Run workflow" button.
+
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
+  # push:
+  #   branches: [main]
+  #   paths-ignore:
+  #     - '**.md'
+  #     - '.planning/**'
+  #     - 'docs/**'
+  # pull_request:
+  #   branches: [main]
+  #   paths-ignore:
+  #     - '**.md'
+  #     - '.planning/**'
+  #     - 'docs/**'
 
 jobs:
   copyright-headers:
