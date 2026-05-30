@@ -527,6 +527,51 @@ def test_verdict_stability_drops_judge_failures():
     assert res.point == pytest.approx(1.0)
 
 
+def test_verdict_stability_conditional_class_is_unanimous():
+    """2026-05-30 3-state: when rows carry verdict_class, three CONDITIONAL
+    repeats (the lending_042 shape) are UNANIMOUS — not a fake flip. Old
+    behaviour binarised the 0.5 conditional score and coin-flipped it."""
+    ref = [
+        # All three re-runs land CONDITIONAL (score 0.5 but class is the
+        # load-bearing signal). Without class-compare these would binarise
+        # to APPROVE (0.5 >= 0.5) and any noise would flip them.
+        {"eval_id": "lending_042", "score_value": 0.5, "verdict_class": "conditional"},
+        {"eval_id": "lending_042", "score_value": 0.5, "verdict_class": "conditional"},
+        {"eval_id": "lending_042", "score_value": 0.5, "verdict_class": "conditional"},
+    ]
+    res = compute_verdict_stability(ref)
+    assert res.n_evals == 1
+    assert res.n_unanimous == 1
+    assert res.point == pytest.approx(1.0)
+
+
+def test_verdict_stability_class_distinguishes_approve_from_conditional():
+    """A genuine class flip (approve vs conditional across re-runs) is NOT
+    unanimous — the metric still catches real instability."""
+    ref = [
+        {"eval_id": "e1", "score_value": 1.0, "verdict_class": "approve"},
+        {"eval_id": "e1", "score_value": 0.5, "verdict_class": "conditional"},
+    ]
+    res = compute_verdict_stability(ref)
+    assert res.n_evals == 1
+    assert res.n_unanimous == 0
+    assert res.point == pytest.approx(0.0)
+
+
+def test_verdict_stability_falls_back_to_threshold_without_class():
+    """Rows with no usable verdict_class keep the legacy bool path —
+    byte-identical to pre-3-state behaviour."""
+    ref = [
+        {"eval_id": "e1", "score_value": 0.9, "verdict_class": ""},
+        {"eval_id": "e1", "score_value": 0.1, "verdict_class": "dryrun"},
+    ]
+    res = compute_verdict_stability(ref)
+    # 0.9 → APPROVE, 0.1 → DENY (both via threshold) → split, not unanimous.
+    assert res.n_evals == 1
+    assert res.n_unanimous == 0
+    assert res.point == pytest.approx(0.0)
+
+
 def test_verdict_stability_degenerate_when_no_rows():
     res = compute_verdict_stability([])
     assert res.point is None

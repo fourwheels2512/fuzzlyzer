@@ -137,17 +137,36 @@ def compute_verdict_stability(
             degenerate_flag=True,
         )
 
-    # Group binarised verdicts per eval_id. A judge-failure repeat
-    # (score_value is None) contributes nothing.
-    by_eval: dict[str, list[bool]] = {}
+    # Group verdicts per eval_id. A judge-failure repeat (no usable
+    # verdict) contributes nothing.
+    #
+    # 2026-05-30: when a row carries an explicit 3-state ``verdict_class``
+    # ("approve" / "deny" / "conditional"), compare CLASSES rather than the
+    # binarised score. This is what removes the fake-flip inflation: a
+    # genuinely conditional decision (e.g. lending_042's "approve only via
+    # FHA, pending appraisal") that re-runs to the SAME conditional class
+    # every time is now UNANIMOUS — whereas the old 0.5-threshold binarised
+    # it to APPROVE/DENY and the judge coin-flipped it across re-runs. Rows
+    # WITHOUT a usable ``verdict_class`` fall back to the legacy
+    # ``score_value >= threshold`` bool exactly as before, so existing
+    # callers and tests are unchanged. The unanimity test below
+    # (``len(set(...)) == 1``) works identically over bools or class
+    # strings.
+    by_eval: dict[str, list] = {}
     for row in reference_rows:
         eid = row.get("eval_id")
         if not isinstance(eid, str) or not eid:
             continue
-        score = row.get("score_value")
-        if score is None:
-            continue  # judge failure / no verdict — missing data
-        verdict = bool(score >= threshold)
+        vclass = row.get("verdict_class")
+        if isinstance(vclass, str) and vclass in (
+            "approve", "deny", "conditional"
+        ):
+            verdict: object = vclass
+        else:
+            score = row.get("score_value")
+            if score is None:
+                continue  # judge failure / no verdict — missing data
+            verdict = bool(score >= threshold)
         by_eval.setdefault(eid, []).append(verdict)
 
     # An eval needs >= 2 scored repeats to be meaningfully "unanimous";

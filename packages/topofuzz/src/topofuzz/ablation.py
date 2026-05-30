@@ -786,6 +786,7 @@ async def _ablate_async(
 ) -> AblationSummary:
     from fuzzeval.costest import cost_for_call
 
+    from topofuzz.loaders import get_prompt_builder
     from topofuzz.runner import (
         _call_llm,
         _default_prompt,
@@ -1049,9 +1050,22 @@ async def _ablate_async(
                         hybrid_prior_dicts.append(swapped)
                     else:
                         hybrid_prior_dicts.append(p)
-                # Build prior tuple in the shape _default_prompt expects.
+                # Build prior tuple in the shape the prompt builder expects.
                 hybrid_prior = _dicts_to_node_outputs(hybrid_prior_dicts)
-                prompt = _default_prompt(
+                # 2026-05-30: use the fixture-exported prompt_builder when
+                # present so the terminal re-execution sees the SAME
+                # deterministic per-role prompt the kickoff run used (the
+                # lending fixture's domain rules + last-writer-wins fault).
+                # ``v_topology`` came through ``confirm._reconstruct_variants``
+                # → ``load_topology``, which re-attaches the builder from the
+                # fixture module the manifest records — so there is one source
+                # of truth for kickoff and re-exec. Falls back to
+                # ``_default_prompt`` for fixtures that export none (v0.5
+                # behaviour, byte-identical). This is what makes F4
+                # attribution measure the real pipeline rather than a bare
+                # generic prompt.
+                _builder = get_prompt_builder(v_topology) or _default_prompt
+                prompt = _builder(
                     terminal_node, eval_row, tuple(hybrid_prior)
                 )
                 # Re-execute the terminal.

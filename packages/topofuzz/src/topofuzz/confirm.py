@@ -196,6 +196,19 @@ def read_flip_confirmations(
     con = sqlite3.connect(str(db_path))
     con.row_factory = sqlite3.Row
     try:
+        # v7 added a nullable ``verdict_class``. Select it only when the
+        # column exists so a legacy (pre-v7) run.sqlite still reads — the
+        # 3-state ``verdict_stability`` compare falls back to the score
+        # threshold when the key is absent.
+        _flip_cols = {
+            r[1]
+            for r in con.execute(
+                "PRAGMA table_info(flip_confirmations)"
+            ).fetchall()
+        }
+        _vclass_sel = (
+            ", verdict_class" if "verdict_class" in _flip_cols else ""
+        )
         clauses: list[str] = []
         params: list[Any] = []
         if run_id is not None:
@@ -209,7 +222,7 @@ def read_flip_confirmations(
             rows = con.execute(
                 "SELECT run_id, variant_id, eval_id, repeat_idx, role, "
                 "node_outputs_json, judge_kind, score_value, rationale, "
-                "failure_reason, error, cell_cost_usd "
+                "failure_reason, error, cell_cost_usd" + _vclass_sel + " "
                 "FROM flip_confirmations" + where + " "
                 "ORDER BY eval_id, variant_id, repeat_idx",
                 params,

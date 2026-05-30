@@ -1098,8 +1098,13 @@ def compute_verdict_flip_for_attestation(
     if orig_idx is None:
         return None
     try:
+        # Pass the 3-state class_matrix when present (v7+ runs) so the
+        # headline flip rate counts ONLY clear APPROVE↔DENY swings and
+        # excludes conditional transitions. ``None`` on pre-3-state runs
+        # keeps the legacy score-threshold path byte-identical.
         result = compute_verdict_flip_rate(
-            sm.matrix, orig_idx, n_resamples=n_resamples, conf=conf, seed=seed
+            sm.matrix, orig_idx, n_resamples=n_resamples, conf=conf, seed=seed,
+            class_matrix=sm.class_matrix,
         )
     except (ValueError, ImportError) as e:
         log.warning(

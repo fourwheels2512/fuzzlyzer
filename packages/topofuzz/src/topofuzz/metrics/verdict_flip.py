@@ -74,6 +74,18 @@ class VerdictFlipResult:
     degenerate_flag: bool
     numerator: int | None = None
     denominator: int | None = None
+    # 2026-05-30 (3-state). Populated ONLY on the class-aware path (a
+    # ``class_matrix`` was supplied). ``clear_pairs`` is the count of
+    # (original, permuted) pairs where BOTH sides are a clear verdict
+    # (APPROVE or DENY) — i.e. the denominator the point estimate is
+    # computed over. ``conditional_pairs`` is the count of pairs where
+    # both cells produced a verdict but at least one is CONDITIONAL;
+    # these are tracked separately and are NEITHER a flip nor a non-flip
+    # (a clear↔conditional transition is not a clear verdict flip). Both
+    # are ``None`` on the legacy threshold path so existing callers see
+    # no change.
+    clear_pairs: int | None = None
+    conditional_pairs: int | None = None
 
 
 def wilson_score_interval(
@@ -189,6 +201,7 @@ def compute_verdict_flip_rate(
     n_resamples: int = 5000,
     conf: float = 0.95,
     seed: int | None = None,
+    class_matrix: "np.ndarray | None" = None,
 ) -> VerdictFlipResult:
     """Verdict-flip rate of permuted variants vs the original variant.
 
@@ -200,6 +213,19 @@ def compute_verdict_flip_rate(
             the permuted cell are both finite. This matches the
             §9 metric convention (failed cells are missing data, not
             "non-flips").
+        class_matrix: Optional ``(n_variants, n_evals)`` integer matrix
+            of 3-state verdict CLASS codes aligned cell-for-cell with
+            ``score_matrix`` (``-1`` missing, ``0`` deny, ``1`` approve,
+            ``2`` conditional). 2026-05-30 clear-flip gate: when supplied,
+            a flip counts ONLY between APPROVE and DENY (a "clear" flip);
+            the denominator is restricted to pairs where BOTH cells are a
+            clear verdict, and pairs involving a CONDITIONAL cell are
+            tracked separately in ``conditional_pairs`` (neither flip nor
+            non-flip). This is what stops a hedged conditional from
+            inflating the flip rate. When ``None`` (the default) the metric
+            takes the legacy ``score >= threshold`` binarisation path,
+            byte-for-byte unchanged — so every existing caller and test is
+            unaffected.
         original_index: Row index of the "original" variant in
             ``score_matrix``. Caller resolves this from
             ``manifest.variant_canonical_hashes[0]`` via
@@ -277,8 +303,28 @@ def compute_verdict_flip_rate(
     # binary "did this cell pass" question deserves — but the cell
     # didn't actually produce a verdict, so we drop it from the
     # denominator rather than counting it as a non-flip.
-    valid = np.isfinite(arr)
-    preds = arr >= threshold
+    #
+    # Clear-flip gate (2026-05-30): with a ``class_matrix`` supplied,
+    # ``valid`` becomes "this cell is a CLEAR verdict (approve/deny)" so
+    # conditional and missing cells are both excluded from the flip
+    # denominator, and ``preds`` is approve-vs-deny — a flip is then a
+    # genuine APPROVE↔DENY swing. ``not_missing`` is retained to count
+    # conditional pairs separately below.
+    not_missing: "np.ndarray | None" = None
+    if class_matrix is not None:
+        cls = np.asarray(class_matrix)
+        if cls.shape != arr.shape:
+            raise ValueError(
+                f"class_matrix shape {cls.shape} must match score_matrix "
+                f"shape {arr.shape}"
+            )
+        is_clear = (cls == 0) | (cls == 1)
+        not_missing = cls != -1
+        valid = is_clear            # only clear↔clear pairs enter the denom
+        preds = cls == 1            # approve True / deny False
+    else:
+        valid = np.isfinite(arr)
+        preds = arr >= threshold
 
     orig_preds = preds[original_index, :]
     orig_valid = valid[original_index, :]
@@ -289,6 +335,19 @@ def compute_verdict_flip_rate(
     perm_valid = valid[perm_mask, :]
 
     denom_mask = perm_valid & orig_valid[None, :]
+    # Clear-flip gate: count (original, permuted) pairs where BOTH cells
+    # produced a verdict but at least one is CONDITIONAL — i.e. both
+    # not-missing yet NOT both clear (denom_mask is "both clear" on the
+    # class path). Tracked separately; these are neither a flip nor a
+    # non-flip. ``None`` on the legacy threshold path.
+    conditional_pairs_count: int | None = None
+    if not_missing is not None:
+        orig_nm = not_missing[original_index, :]
+        perm_nm = not_missing[perm_mask, :]
+        both_not_missing = perm_nm & orig_nm[None, :]
+        conditional_pairs_count = int(
+            (both_not_missing & ~denom_mask).sum()
+        )
     # Audit RT-M1: ``arr >= threshold`` evaluates NaN as False, so
     # ``preds[i, j]`` for a NaN cell is structurally False. Without
     # ``denom_mask`` the resulting "False == False == agreement"
@@ -304,6 +363,10 @@ def compute_verdict_flip_rate(
     col_denom = denom_mask.sum(axis=0).astype(np.float64)
     finite_cols = col_denom > 0
     if not finite_cols.any():
+        # No clear↔clear pair anywhere (e.g. the original variant is
+        # conditional / missing on every eval). The flip rate is undefined,
+        # but on the class path we still surface WHY: zero clear pairs and
+        # however many conditional pairs there were.
         return VerdictFlipResult(
             point=None,
             ci_lower=None,
@@ -313,6 +376,8 @@ def compute_verdict_flip_rate(
             degenerate_flag=True,
             numerator=None,
             denominator=None,
+            clear_pairs=0 if class_matrix is not None else None,
+            conditional_pairs=conditional_pairs_count,
         )
 
     total_num = float(col_num[finite_cols].sum())
@@ -356,6 +421,8 @@ def compute_verdict_flip_rate(
             degenerate_flag=True,
             numerator=0,
             denominator=denom_int,
+            clear_pairs=denom_int if class_matrix is not None else None,
+            conditional_pairs=conditional_pairs_count,
         )
 
     finite_idx = np.flatnonzero(finite_cols)
@@ -370,6 +437,8 @@ def compute_verdict_flip_rate(
             degenerate_flag=True,
             numerator=num_int,
             denominator=denom_int,
+            clear_pairs=denom_int if class_matrix is not None else None,
+            conditional_pairs=conditional_pairs_count,
         )
 
     rng = np.random.default_rng(seed)
@@ -392,4 +461,6 @@ def compute_verdict_flip_rate(
         degenerate_flag=False,
         numerator=num_int,
         denominator=denom_int,
+        clear_pairs=denom_int if class_matrix is not None else None,
+        conditional_pairs=conditional_pairs_count,
     )

@@ -1066,7 +1066,14 @@ def run(
     if dry_run:
         typer.echo("[DRY-RUN] No real judge LLM calls — every cell gets ContinuousScore(0.5).")
 
-    result = _run_with_signal_handling(plan, judge=judge)
+    # Thread the fixture-exported prompt_builder (if any) into the run.
+    # Sourced from the Topology side-channel attached by load_topology —
+    # deliberately NOT from cli_args (which would trip the F4/F7
+    # attribution refusal guards). None → orchestrator uses _default_prompt.
+    from topofuzz.loaders import get_prompt_builder
+    result = _run_with_signal_handling(
+        plan, judge=judge, prompt_builder=get_prompt_builder(topology)
+    )
 
     typer.echo("")
     typer.echo(f"Run id: {result.run_id}")
@@ -1345,7 +1352,9 @@ def _preflight_cost(
         raise typer.Exit(code=0)
 
 
-def _run_with_signal_handling(plan: RunPlan, *, judge: Any = None) -> Any:
+def _run_with_signal_handling(
+    plan: RunPlan, *, judge: Any = None, prompt_builder: Any = None
+) -> Any:
     """Run the orchestrator with SIGINT → cancel-event wiring.
 
     On Ctrl+C the orchestrator's cancel event is set; the runner stops
@@ -1368,7 +1377,7 @@ def _run_with_signal_handling(plan: RunPlan, *, judge: Any = None) -> Any:
     # and 5-10× cache miss amplification on warm runs.
     # (closes BACKLOG: model_served_version_resolver)
     from topofuzz.orchestrator import execute_run
-    from topofuzz.runner import default_resolver
+    from topofuzz.runner import _default_prompt, default_resolver
 
     loop_cancel = asyncio.Event()
 
@@ -1397,6 +1406,14 @@ def _run_with_signal_handling(plan: RunPlan, *, judge: Any = None) -> Any:
                 judge=judge,
                 judge_prompt_renderer=judge.render_prompt if judge is not None else None,
                 resolver=default_resolver,
+                # Fixture-exported deterministic prompt builder (or the
+                # runner default when the fixture exported none). NOT
+                # sourced from manifest cli_args — see load_topology /
+                # get_prompt_builder for the F4/F7-safety rationale.
+                prompt_builder=(
+                    prompt_builder if prompt_builder is not None
+                    else _default_prompt
+                ),
             )
         )
     finally:

@@ -1634,7 +1634,17 @@ async def _leave_one_out_for_triple(
             hybrid_prior = _dicts_to_node_outputs(
                 hybrid_prior_dicts, NodeOutput
             )
-            prompt = _default_prompt(
+            # 2026-05-30: use the fixture-exported prompt_builder when the
+            # source fixture pinned one (the lending gallery's deterministic
+            # domain rules + planted last-writer-wins fault). ``variant_topology``
+            # was rebuilt via ``confirm._reconstruct_variants`` → ``load_topology``,
+            # which re-attaches the builder from the fixture module the
+            # manifest records, so the F7 terminal re-execution sees the same
+            # prompt the kickoff run used. Falls back to ``_default_prompt``
+            # for fixtures exporting none (v0.5 behaviour, byte-identical).
+            from topofuzz.loaders import get_prompt_builder
+            _builder = get_prompt_builder(variant_topology) or _default_prompt
+            prompt = _builder(
                 terminal_node, cf_row, tuple(hybrid_prior)
             )
             # F7 Phase-2 cache-architecture fix (BACKLOG BLOCKER):

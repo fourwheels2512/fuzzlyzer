@@ -969,7 +969,7 @@ async def _run_judge(
 # pre-existing user_version (0 for fresh DBs, 1 for legacy step-5 DBs,
 # 99+ for a hypothetical future DB) is observable when migrate decides
 # whether to ALTER or refuse.
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 
 # Hard cap on the persisted ``judge_results.votes_json`` payload.
 # Per-vendor rationale is already _RATIONALE_MAX_CHARS=1000-bounded;
@@ -1017,6 +1017,7 @@ CREATE TABLE IF NOT EXISTS judge_results (
     rationale TEXT,
     failure_reason TEXT,
     votes_json TEXT,
+    verdict_class TEXT,
     PRIMARY KEY (run_id, variant_id, eval_id)
 );
 CREATE TABLE IF NOT EXISTS flip_confirmations (
@@ -1032,6 +1033,7 @@ CREATE TABLE IF NOT EXISTS flip_confirmations (
     failure_reason TEXT,
     error TEXT,
     cell_cost_usd REAL,
+    verdict_class TEXT,
     PRIMARY KEY (run_id, variant_id, eval_id, repeat_idx)
 );
 """
@@ -1137,20 +1139,54 @@ def _migrate(db: sqlite3.Connection) -> None:
         }
         if "votes_json" not in judge_cols_v6:
             db.execute("ALTER TABLE judge_results ADD COLUMN votes_json TEXT")
+    if current < 7:
+        # v7: nullable 3-state ``verdict_class`` on judge_results AND
+        # flip_confirmations ("approve" / "deny" / "conditional" / "dryrun"
+        # / "" / NULL). NULL on legacy rows and on pre-3-state runs; readers
+        # fall back to the 0.5-threshold binarisation when the class is
+        # absent, so a v6 DB opened by v7 code reads identically to before.
+        # Each ALTER is conditional so a fresh DB (CREATE TABLE already
+        # produced the column) is a no-op.
+        judge_cols_v7 = {
+            row[1]
+            for row in db.execute(
+                "PRAGMA table_info(judge_results)"
+            ).fetchall()
+        }
+        if "verdict_class" not in judge_cols_v7:
+            db.execute(
+                "ALTER TABLE judge_results ADD COLUMN verdict_class TEXT"
+            )
+        flip_cols_v7 = {
+            row[1]
+            for row in db.execute(
+                "PRAGMA table_info(flip_confirmations)"
+            ).fetchall()
+        }
+        if "verdict_class" not in flip_cols_v7:
+            db.execute(
+                "ALTER TABLE flip_confirmations ADD COLUMN verdict_class TEXT"
+            )
     db.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
     db.commit()
 
 
 def _judge_row(
     cell: Cell,
-) -> tuple[str, float | None, int | None, str | None, str | None, str | None]:
+) -> tuple[
+    str, float | None, int | None, str | None, str | None, str | None,
+    str | None,
+]:
     """Pack a Cell's judge state into the judge_results column tuple.
 
     Returns ``(judge_kind, score_value, passed, rationale,
-    failure_reason, votes_json)``. The trailing ``votes_json`` slot
+    failure_reason, votes_json, verdict_class)``. The ``votes_json`` slot
     carries the JuryJudge per-vendor breakdown when available — a JSON
     array of ``{"vendor": str, "score": float, "rationale": str}``
-    objects — or ``None`` for SingleJudge / dry-run / failure rows.
+    objects — or ``None`` for SingleJudge / dry-run / failure rows. The
+    trailing ``verdict_class`` slot carries the 3-state class
+    ("approve" / "deny" / "conditional" / "dryrun" / "") for continuous
+    judgements, or ``None`` for binary / failure / absent rows.
 
     judge_kind:
         "continuous" — ContinuousScore
@@ -1159,7 +1195,9 @@ def _judge_row(
         "absent"     — no judge supplied
     """
     if cell.judge_failure:
-        return "failure", None, None, None, cell.judge_failure_reason, None
+        return (
+            "failure", None, None, None, cell.judge_failure_reason, None, None,
+        )
     if isinstance(cell.judge_result, ContinuousScore):
         # Write rationale verbatim — including "" — matching the
         # BinaryScore branch below. Both judge kinds then use "" as the
@@ -1204,11 +1242,17 @@ def _judge_row(
             cell.judge_result.rationale,
             None,
             votes_json,
+            # "" sentinel (no explicit class) round-trips to the
+            # threshold-fallback path, identical to a pre-3-state run.
+            cell.judge_result.verdict_class,
         )
     if isinstance(cell.judge_result, BinaryScore):
         passed = 1 if cell.judge_result.passed else 0
-        return "binary", None, passed, cell.judge_result.rationale, None, None
-    return "absent", None, None, None, None, None
+        return (
+            "binary", None, passed, cell.judge_result.rationale, None, None,
+            None,
+        )
+    return "absent", None, None, None, None, None, None
 
 
 def _cell_cost_usd(cell: Cell) -> float | None:
@@ -1505,10 +1549,11 @@ class RunWriter:
             rationale,
             failure_reason,
             votes_json,
+            verdict_class,
         ) = _judge_row(cell)
         self._db.execute(
             "INSERT OR REPLACE INTO judge_results VALUES "
-            "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 self._run_id,
                 cell.variant_id,
@@ -1519,6 +1564,7 @@ class RunWriter:
                 rationale,
                 failure_reason,
                 votes_json,
+                verdict_class,
             ),
         )
         self._db.commit()
@@ -1599,6 +1645,7 @@ class RunWriter:
             rationale,
             failure_reason,
             _votes_json,
+            verdict_class,
         ) = _judge_row(cell)
         # judge_results packs binary verdicts into ``passed``; the
         # flip_confirmations table has no ``passed`` column (the v0.5
@@ -1610,8 +1657,8 @@ class RunWriter:
             "INSERT OR REPLACE INTO flip_confirmations "
             "(run_id, variant_id, eval_id, repeat_idx, role, "
             " node_outputs_json, judge_kind, score_value, rationale, "
-            " failure_reason, error, cell_cost_usd) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " failure_reason, error, cell_cost_usd, verdict_class) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 self._run_id,
                 cell.variant_id,
@@ -1625,6 +1672,7 @@ class RunWriter:
                 failure_reason,
                 cell.error,
                 cell_cost,
+                verdict_class,
             ),
         )
         self._db.commit()

@@ -38,6 +38,28 @@ from topofuzz.ir import LLMConfig, Topology
 
 _log = logging.getLogger(__name__)
 
+# Side-channel attribute name under which a fixture-exported
+# ``prompt_builder`` is stashed on the Topology. Set via
+# ``object.__setattr__`` (bypassing the frozen-model guard) so it never
+# enters ``model_dump`` / ``canonical_hash``. Read back with
+# :func:`get_prompt_builder`. Underscore-prefixed so it cannot collide
+# with a declared IR field name.
+_PROMPT_BUILDER_ATTR = "_topofuzz_prompt_builder"
+
+
+def get_prompt_builder(topology: Topology) -> Any:
+    """Return the fixture-exported ``prompt_builder`` attached to a Topology.
+
+    Returns ``None`` when the fixture exported none (the common case —
+    callers then fall back to ``runner._default_prompt``). The attribute
+    is attached by :func:`load_topology` (and therefore survives the IR
+    regeneration in ``confirm._reconstruct_variants``, which is what makes
+    the F4 ablation / F7 audit terminal re-execution reconstruct the same
+    builder the kickoff run used).
+    """
+    return getattr(topology, _PROMPT_BUILDER_ATTR, None)
+
+
 # Tracks which fixture paths we've already warned about in this process,
 # so the "executes arbitrary Python" warning fires once per path rather
 # than once per call. Cleared between processes (no need to persist).
@@ -226,7 +248,7 @@ def load_topology(spec: str) -> Topology:
         _label_forwards[kwarg] = raw
     verdict_label_true = _label_forwards["verdict_label_true"]
     verdict_label_false = _label_forwards["verdict_label_false"]
-    return from_langgraph(
+    topology = from_langgraph(
         compiled,
         name=name,
         llm_configs=llm_configs,
@@ -234,6 +256,31 @@ def load_topology(spec: str) -> Topology:
         verdict_label_true=verdict_label_true,
         verdict_label_false=verdict_label_false,
     )
+
+    # 2026-05-30: forward an optional fixture-exported ``prompt_builder``.
+    # A fixture that pins deterministic per-role prompts (e.g. the lending
+    # gallery's domain-rules + planted last-writer-wins fault) exports a
+    # ``prompt_builder(node, eval_row, prior) -> str`` on its module. We
+    # attach it to the Topology as a side-channel (NOT a Pydantic field, so
+    # ``canonical_hash`` / ``model_dump`` stay byte-identical) via the
+    # ``_PROMPT_BUILDER_ATTR`` slot. Because ``confirm._reconstruct_variants``
+    # regenerates the IR through THIS loader, the same builder is rebuilt
+    # for the F4 ablation / F7 audit terminal re-execution from one source
+    # of truth — the fixture module the manifest already records. This is
+    # the F4/F7-safe alternative to a ``--prompt-builder`` CLI flag, which
+    # would land in ``cli_args`` and trip the attribution refusal guards
+    # (``ablation.py`` / ``counterfactual_audit.py``) — silently disabling
+    # attribution.
+    builder = getattr(module, "prompt_builder", None)
+    if builder is not None:
+        if not callable(builder):
+            raise TypeError(
+                f"{path_str}:prompt_builder must be callable "
+                f"(node, eval_row, prior) -> str; got "
+                f"{type(builder).__name__}."
+            )
+        object.__setattr__(topology, _PROMPT_BUILDER_ATTR, builder)
+    return topology
 
 
 def load_eval_rows(path: str | Path) -> list[dict]:
