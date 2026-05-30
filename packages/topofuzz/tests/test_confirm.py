@@ -326,10 +326,15 @@ LLM_CONFIGS = {
 """
 
 
-def _build_real_run_dir(tmp_path: Path) -> tuple[Path, list[str]]:
+def _build_real_run_dir(
+    tmp_path: Path, fixture_src: str = _FIXTURE_SRC
+) -> tuple[Path, list[str]]:
     """Write a langgraph fixture, regenerate the variant set the same way
     ``topofuzz run`` does, and lay down a manifest + run.sqlite whose
     judge_results make at least one variant a flip candidate.
+
+    ``fixture_src`` overrides the fixture module body (e.g. to export a
+    ``prompt_builder`` for the builder-threading regression test).
 
     Returns ``(run_dir, variant_hashes)``.
     """
@@ -343,7 +348,7 @@ def _build_real_run_dir(tmp_path: Path) -> tuple[Path, list[str]]:
     )
 
     fixture = tmp_path / "fx.py"
-    fixture.write_text(_FIXTURE_SRC, encoding="utf-8")
+    fixture.write_text(fixture_src, encoding="utf-8")
     eval_file = tmp_path / "e.csv"
     eval_file.write_text(
         "id,input\neval_001,q1\neval_002,q2\n", encoding="utf-8"
@@ -438,6 +443,35 @@ def test_run_confirm_pass_reruns_candidates_and_reference(tmp_path):
     assert all(r["variant_id"] == hashes[1] for r in cand)
     # The mocked LLM was actually invoked (2 nodes × 6 cells = 12 calls).
     assert len(fake.calls) == 12
+
+
+def test_run_confirm_pass_threads_fixture_prompt_builder(tmp_path):
+    """RT 2026-05-30: the confirm pass MUST re-run the pipeline with the
+    fixture-exported ``prompt_builder``, not the bare ``_default_prompt``.
+
+    The bug this guards: ``_confirm_async`` passed ``resolver=`` but no
+    ``prompt_builder=``, so ``run_variant`` defaulted to ``_default_prompt``
+    and confirm silently re-ran a DOMAIN-RULE-LESS pipeline — different from
+    the kickoff — making its reproducibility/noise-floor number a
+    measurement of the WRONG pipeline. Proven here by asserting the
+    builder's marker reaches the LLM call. Fails (marker absent) on the bare
+    fallback; passes once the builder is threaded.
+    """
+    marker = "MARKER_FROM_FIXTURE_PROMPT_BUILDER"
+    src = _FIXTURE_SRC + (
+        "\n\ndef prompt_builder(node, eval_row, prior):\n"
+        f"    return {marker!r} + ' ' + node.id\n"
+    )
+    run_dir, _hashes = _build_real_run_dir(tmp_path, src)
+    fake = FakeLLM()
+    run_confirm_pass(run_dir, repeats=2, llm_callable=fake)
+    assert fake.calls, "no LLM calls recorded"
+    blob = repr(fake.calls)
+    assert marker in blob, (
+        "confirm did not thread the fixture prompt_builder into the "
+        "re-execution — it fell back to the bare _default_prompt (the RT "
+        "bug that made the confirm pass measure the wrong pipeline)."
+    )
 
 
 def test_run_confirm_pass_max_cost_hard_stop(tmp_path, monkeypatch):

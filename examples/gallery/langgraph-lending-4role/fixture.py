@@ -183,14 +183,21 @@ CONFLICT-RESOLUTION RULE (apply exactly, step by step):
      one of each role-position emitting the same recommendation text): adopt
      the recommendation that is actually stated. Do not invent a conflict.
 
-Emit EXACTLY ONE machine-readable verdict line, and nothing hedged:
+Your verdict is the APPROVE or DENY selected by the CONFLICT-RESOLUTION RULE
+above. That rule ALWAYS resolves to exactly one of APPROVE or DENY (the
+last-writer's recommendation, or the shared one when they agree). Emit it as
+a single machine-readable line and nothing else:
   VERDICT: APPROVE
   VERDICT: DENY
-  VERDICT: CONDITIONAL - conditions: <comma-separated list of the specific
-           future steps the applicant must still complete>
-Use CONDITIONAL only when approval genuinely HINGES on a future unmet step
-(e.g. "pending FHA appraisal", "pending proof of reserves"). Do not use
-CONDITIONAL merely to avoid committing.
+
+HARD CONSTRAINT — read carefully: the verdict MUST be exactly APPROVE or
+DENY. You are FORBIDDEN from emitting "CONDITIONAL", "conditional approval",
+"approve pending ...", "FHA path", "decline conventional / recommend FHA", or
+any hedged, qualified, or split verdict. An approval that is only viable
+through an FHA product is STILL a full "VERDICT: APPROVE" — route it through
+FHA, but commit to APPROVE. A denial is "VERDICT: DENY". Do not soften, defer,
+or condition the last-writer's recommendation; restate the projected DTI, then
+commit to the single binary verdict the rule produced.
 """,
 }
 

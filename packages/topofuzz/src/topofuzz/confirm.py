@@ -832,6 +832,21 @@ async def _confirm_async(
     rubric_hash = getattr(judge, "rubric_hash", "")
     judge_renderer = getattr(judge, "render_prompt", None)
 
+    # 2026-05-30 BUG FIX (RT): thread the fixture-exported ``prompt_builder``
+    # into the re-execution, exactly as the F4 ablation does
+    # (ablation.py:1067). Without this, ``run_variant`` defaults to the bare
+    # ``_default_prompt`` and the confirm pass silently re-runs a DIFFERENT,
+    # domain-rule-less pipeline than the kickoff — so its "reproducibility"
+    # measurement was of the wrong pipeline (no lending rules / no verdict
+    # instruction → the agent free-forms a hedged answer regardless of the
+    # variant). The reconstructed variants carry the builder (load_topology
+    # re-attaches it); resolve it per variant, falling back to the default
+    # only when a fixture exports none.
+    from topofuzz.loaders import get_prompt_builder
+    from topofuzz.runner import _default_prompt
+
+    original_builder = get_prompt_builder(original_variant) or _default_prompt
+
     total_cost = 0.0
     reference_repeats_run = 0
     candidate_repeats_run = 0
@@ -872,6 +887,7 @@ async def _confirm_async(
                     rubric_hash=rubric_hash,
                     judge_model_version=judge_model,
                     judge_prompt_renderer=judge_renderer,
+                    prompt_builder=original_builder,
                     model_served_version_resolver=resolver,
                     llm_callable=llm_callable,
                 )
@@ -892,6 +908,7 @@ async def _confirm_async(
                 variant = candidate_variants.get(vid)
                 if variant is None:
                     continue  # unmatched — warned by the caller
+                cand_builder = get_prompt_builder(variant) or _default_prompt
                 eval_row = eval_rows_by_id.get(eid)
                 if eval_row is None:
                     _log.warning(
@@ -914,6 +931,7 @@ async def _confirm_async(
                         rubric_hash=rubric_hash,
                         judge_model_version=judge_model,
                         judge_prompt_renderer=judge_renderer,
+                        prompt_builder=cand_builder,
                         model_served_version_resolver=resolver,
                         llm_callable=llm_callable,
                     )
