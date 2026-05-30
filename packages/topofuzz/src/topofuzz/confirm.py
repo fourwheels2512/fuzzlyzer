@@ -434,6 +434,18 @@ def _reconstruct_variants(
         # label slip past the IR's hardening. Going through the
         # constructor fires every validator (label normalize + pair
         # collision check + structural integrity + tds_version derive).
+        # Preserve the side-channel ``prompt_builder`` across this
+        # validator-rerun reconstruction. ``load_topology`` attached it via
+        # ``object.__setattr__`` (it is NOT a Pydantic field), so the fresh
+        # ``Topology(...)`` below would drop it — and the order/role/decoding
+        # swaps a few lines down rebuild their variants off THIS object, so
+        # every confirm-pass variant would silently fall back to the bare
+        # ``_default_prompt`` with no domain rules. That is exactly the
+        # F4/F7 regression #4 guards against, reintroduced on the v0.6
+        # rebind branch. Capture before, re-attach after. (RT 2026-05-30.)
+        from topofuzz.loaders import _PROMPT_BUILDER_ATTR, get_prompt_builder
+
+        _preserved_builder = get_prompt_builder(topology)
         try:
             topology = Topology(
                 name=topology.name,
@@ -470,6 +482,10 @@ def _reconstruct_variants(
                 f"verdict_label_false={m_label_false!r}, "
                 f"run_id={manifest.get('run_id')!r}): {e}"
             ) from e
+        if _preserved_builder is not None:
+            object.__setattr__(
+                topology, _PROMPT_BUILDER_ATTR, _preserved_builder
+            )
 
     ord_list = list(order_swap(topology, rng_seed=rng_seed))
     role_list = list(role_swap(topology))

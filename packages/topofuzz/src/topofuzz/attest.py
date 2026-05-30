@@ -1144,6 +1144,14 @@ def compute_verdict_flip_for_attestation(
         "wilson_ci_lower": wilson_lo,
         "wilson_ci_upper": wilson_hi,
         "wilson_conf_level": conf if wilson_lo is not None else None,
+        # Surface the clear-flip gate's bookkeeping so the signed
+        # attestation records HOW MANY pairs entered the (clear-only)
+        # denominator vs were excluded as conditional. Without this a
+        # reader cannot distinguish a genuinely low flip rate from one
+        # driven down by excluding most cells as conditional (RT
+        # 2026-05-30). ``getattr`` keeps pre-3-state result shapes safe.
+        "clear_pairs": getattr(result, "clear_pairs", None),
+        "conditional_pairs": getattr(result, "conditional_pairs", None),
     }
 
 

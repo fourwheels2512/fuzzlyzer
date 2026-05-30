@@ -148,10 +148,12 @@ def compute_verdict_stability(
     # every time is now UNANIMOUS — whereas the old 0.5-threshold binarised
     # it to APPROVE/DENY and the judge coin-flipped it across re-runs. Rows
     # WITHOUT a usable ``verdict_class`` fall back to the legacy
-    # ``score_value >= threshold`` bool exactly as before, so existing
-    # callers and tests are unchanged. The unanimity test below
-    # (``len(set(...)) == 1``) works identically over bools or class
-    # strings.
+    # ``score_value >= threshold`` rule, but normalised to the SAME
+    # "approve"/"deny" class strings (see below) so every entry in
+    # ``by_eval`` is a class string and the unanimity test
+    # (``len(set(...)) == 1``) compares like-for-like — a bare bool and a
+    # class string are never equal and would corrupt the ratio on a mixed
+    # block.
     by_eval: dict[str, list] = {}
     for row in reference_rows:
         eid = row.get("eval_id")
@@ -166,7 +168,13 @@ def compute_verdict_stability(
             score = row.get("score_value")
             if score is None:
                 continue  # judge failure / no verdict — missing data
-            verdict = bool(score >= threshold)
+            # Normalise the legacy threshold fallback to the SAME canonical
+            # class strings (not a bare bool): within one eval's repeat
+            # list a class-carrying row ("approve") and a legacy row
+            # (bool True) would never compare equal, reading a genuinely
+            # unanimous block as non-unanimous and deflating stability
+            # (RT 2026-05-30). All verdicts in ``by_eval`` are now strings.
+            verdict = "approve" if score >= threshold else "deny"
         by_eval.setdefault(eid, []).append(verdict)
 
     # An eval needs >= 2 scored repeats to be meaningfully "unanimous";

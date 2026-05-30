@@ -215,7 +215,7 @@ class JudgeUnparseableError(RuntimeError):
 # The ``(?i)`` flag makes the token match case-insensitively; _parse_score
 # upper-cases the capture before branching.
 _SCORE_RE = re.compile(
-    r"(?im)^[\s*#>\-]*\**\s*Score:\**\s*\**\s*(10|[0-9]|COND|NONE)\**(?!\.\d)(?!\d)"
+    r"(?im)^[\s*#>\-]*\**\s*Score:\**\s*\**\s*(10|[0-9]|COND(?:ITIONAL)?|NONE)(?![A-Za-z])\**(?!\.\d)(?!\d)"
 )
 # Rationale LABEL. ``[\s*#>\-]*`` allows the same markdown leaders as
 # Score; ``\**`` tolerates ``**Rationale:**`` bold-wrapping. This only
@@ -306,9 +306,13 @@ def _parse_score(response_text: str) -> tuple[int, str, str]:
             "contained no verdict). Treated as a missing verdict. "
             f"Response was:\n{response_text[:500]}"
         )
-    if token == "COND":
+    if token.startswith("COND"):
         # Real third class: the decision hinges on a future unmet step.
         # raw=5 → 0.5 continuous; the class carries the actual signal.
+        # Accepts both the mandated bare ``COND`` token and the natural
+        # long form ``CONDITIONAL`` a real judge may emit; the
+        # ``(?![A-Za-z])`` boundary in ``_SCORE_RE`` still rejects
+        # accidental prefixes like ``CONDoning``.
         raw = 5
         verdict_class = "conditional"
     else:

@@ -192,13 +192,32 @@ def test_parse_score_handles_markdown_decoration(text, expected_score):
         "Score: COND\nRationale: approve only if FHA appraisal clears",
         "score: cond\nRationale: lowercase tolerated",
         "**Score: COND**\nRationale: bold tolerated",
+        # Natural long form a real judge may emit instead of the bare token.
+        "Score: CONDITIONAL\nRationale: approve pending appraisal",
+        "score: conditional\nRationale: long form, lowercase",
     ],
 )
 def test_parse_score_cond_token_is_conditional(text):
     raw, verdict_class, _ = _parse_score(text)
-    # COND maps to mid-scale 0.5 (raw 5) with the class carrying the signal.
+    # COND / CONDITIONAL map to mid-scale 0.5 (raw 5) with the class
+    # carrying the signal.
     assert raw == 5
     assert verdict_class == "conditional"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Words that merely START with COND/NONE must NOT be misparsed as a
+        # class token (the ``(?![A-Za-z])`` boundary, RT 2026-05-30). They
+        # carry no valid Score → missing verdict / judge_failure.
+        "Score: CONDoning the risk\nRationale: not a class token",
+        "Score: NONETHELESS a clear approve\nRationale: prose, no verdict",
+    ],
+)
+def test_parse_score_rejects_alpha_suffixed_class_lookalikes(text):
+    with pytest.raises(JudgeUnparseableError):
+        _parse_score(text)
 
 
 @pytest.mark.parametrize(
