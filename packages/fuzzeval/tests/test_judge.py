@@ -1179,6 +1179,23 @@ def test_jury_judge_dry_run_returns_majority_approve_with_no_llm(tmp_path):
     assert j.judge_failure_rate == 0.0
 
 
+def test_jury_judge_dry_run_verdict_class_is_dryrun_not_approve(tmp_path):
+    """The jury-level ``verdict_class`` on a dry-run must be the
+    ``"dryrun"`` sentinel, NOT ``"approve"``. The per-vendor dry-run
+    votes binarise to APPROVE at the inclusive 0.5 threshold (which is
+    what keeps the long-standing ``value == 1.0`` scalar contract), but
+    persisting class "approve" would make a $0 dry-run cell
+    indistinguishable from a real unanimous approve in run.sqlite — and
+    would trip the score-matrix reader's "at least one explicit class"
+    gate, building a class_matrix out of cells no judge ever scored.
+    """
+    j = _make_jury(tmp_path, dry_run=True)
+    r = j.score(_payload())
+    assert r.verdict_class == "dryrun"
+    # Scalar contract unchanged (see the two tests around this one).
+    assert r.value == pytest.approx(1.0)
+
+
 # --- rubric_hash invariants ----------------------------------------------
 
 

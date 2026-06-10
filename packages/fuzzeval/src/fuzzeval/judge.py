@@ -751,9 +751,10 @@ def _effective_verdict_class(
       an unrecognised label) is binarised from the continuous value at
       ``threshold`` — the same 0.5 cut the headline verdict pill uses — so
       a plain numeric jury behaves exactly as it did before the 3-state
-      change. This is the single place the "class, else threshold"
-      precedence lives, shared by the jury aggregator and the metrics
-      layer.
+      change. The jury aggregator is the only caller; the metrics layer
+      applies the same precedence to persisted DB rows via its own
+      row-shaped twin (``topofuzz.metrics._verdict.verdict_of``) — keep
+      the two rules in sync.
     """
     cls = getattr(score, "verdict_class", "") or ""
     if cls in ("approve", "deny", "conditional"):
@@ -1196,6 +1197,19 @@ class JuryJudge:
             # conditional majority and every no-majority split) → the
             # conservative conditional middle.
             majority_value, jury_class = 0.5, "conditional"
+        if self._dry_run:
+            # Dry-run: every vendor vote is the 0.5 "dryrun" sentinel,
+            # which the class resolver binarises to APPROVE — so the
+            # majority above lands on the long-standing, test-asserted
+            # dry-run scalar (1.0). But persisting class "approve" would
+            # erase the sentinel: a $0 dry-run cell would be
+            # indistinguishable from a real unanimous approve in
+            # run.sqlite, and the score-matrix reader's "at least one
+            # EXPLICIT class" gate would build a class_matrix out of
+            # cells no judge ever scored — exactly the aliasing
+            # ``verdict_class="dryrun"`` exists to prevent. Keep the
+            # scalar contract, restore the sentinel.
+            jury_class = "dryrun"
         # Rationale aggregates only the parseable vendors that actually
         # emitted a Rationale: line, vendor-prefixed and joined. Vendors
         # with an empty rationale contribute nothing — so an all-empty

@@ -48,6 +48,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from topofuzz.metrics._verdict import verdict_of as _verdict_of
 from topofuzz.metrics.verdict_flip import DEFAULT_FLIP_THRESHOLD
 
 
@@ -140,41 +141,23 @@ def compute_verdict_stability(
     # Group verdicts per eval_id. A judge-failure repeat (no usable
     # verdict) contributes nothing.
     #
-    # 2026-05-30: when a row carries an explicit 3-state ``verdict_class``
-    # ("approve" / "deny" / "conditional"), compare CLASSES rather than the
-    # binarised score. This is what removes the fake-flip inflation: a
-    # genuinely conditional decision (e.g. lending_042's "approve only via
-    # FHA, pending appraisal") that re-runs to the SAME conditional class
-    # every time is now UNANIMOUS — whereas the old 0.5-threshold binarised
-    # it to APPROVE/DENY and the judge coin-flipped it across re-runs. Rows
-    # WITHOUT a usable ``verdict_class`` fall back to the legacy
-    # ``score_value >= threshold`` rule, but normalised to the SAME
-    # "approve"/"deny" class strings (see below) so every entry in
-    # ``by_eval`` is a class string and the unanimity test
-    # (``len(set(...)) == 1``) compares like-for-like — a bare bool and a
-    # class string are never equal and would corrupt the ratio on a mixed
-    # block.
+    # 2026-05-30: verdicts are 3-state class strings resolved by the
+    # SHARED :func:`topofuzz.metrics._verdict.verdict_of` rule (explicit
+    # ``verdict_class`` wins; legacy rows threshold-binarise to the same
+    # "approve"/"deny" strings — see that module's docstring for why this
+    # removes the fake-flip inflation and why bools must never mix in).
+    # ``confirmed_verdict_flip`` resolves rows through the SAME function,
+    # so the noise floor and the corrected rate cannot disagree on what
+    # verdict a repeat produced. The unanimity test below
+    # (``len(set(...)) == 1``) then compares like-for-like strings.
     by_eval: dict[str, list] = {}
     for row in reference_rows:
         eid = row.get("eval_id")
         if not isinstance(eid, str) or not eid:
             continue
-        vclass = row.get("verdict_class")
-        if isinstance(vclass, str) and vclass in (
-            "approve", "deny", "conditional"
-        ):
-            verdict: object = vclass
-        else:
-            score = row.get("score_value")
-            if score is None:
-                continue  # judge failure / no verdict — missing data
-            # Normalise the legacy threshold fallback to the SAME canonical
-            # class strings (not a bare bool): within one eval's repeat
-            # list a class-carrying row ("approve") and a legacy row
-            # (bool True) would never compare equal, reading a genuinely
-            # unanimous block as non-unanimous and deflating stability
-            # (RT 2026-05-30). All verdicts in ``by_eval`` are now strings.
-            verdict = "approve" if score >= threshold else "deny"
+        verdict = _verdict_of(row, threshold)
+        if verdict is None:
+            continue  # judge failure / no verdict — missing data
         by_eval.setdefault(eid, []).append(verdict)
 
     # An eval needs >= 2 scored repeats to be meaningfully "unanimous";

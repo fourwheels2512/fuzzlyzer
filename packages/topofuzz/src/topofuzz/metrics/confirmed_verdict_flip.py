@@ -51,6 +51,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 
+from topofuzz.metrics._verdict import verdict_of as _verdict_of
 from topofuzz.metrics.verdict_flip import DEFAULT_FLIP_THRESHOLD
 
 
@@ -129,29 +130,6 @@ def _majority(verdicts: list) -> object | None:
         return ranked[0][0]
     (top_verdict, top_n), (_, runner_n) = ranked[0], ranked[1]
     return top_verdict if top_n > runner_n else None  # equal top → tie
-
-
-def _verdict_of(row: dict, threshold: float) -> object | None:
-    """3-state verdict for a ``flip_confirmations`` row, as a canonical
-    class string.
-
-    Uses an explicit ``verdict_class`` ("approve" / "deny" /
-    "conditional") when the row carries one; otherwise falls back to the
-    legacy ``score_value >= threshold`` rule, NORMALISED to the
-    "approve" / "deny" strings (never a bare bool) so a block that mixes
-    class-carrying rows with legacy rows is compared like-for-like — a
-    bool ``True`` never equals the string ``"approve"``, which would
-    otherwise read a genuinely unanimous block as non-unanimous. Returns
-    ``None`` when the row produced no usable verdict (judge failure /
-    missing score), which the callers treat as missing data.
-    """
-    vclass = row.get("verdict_class")
-    if isinstance(vclass, str) and vclass in ("approve", "deny", "conditional"):
-        return vclass
-    score = row.get("score_value")
-    if score is None:
-        return None
-    return "approve" if score >= threshold else "deny"
 
 
 def compute_confirmed_verdict_flip_rate(
