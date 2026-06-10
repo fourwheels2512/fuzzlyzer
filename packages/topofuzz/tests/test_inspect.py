@@ -28,6 +28,21 @@ from topofuzz.inspect import (
 )
 
 
+def _combined_output(result) -> str:
+    """Stdout + stderr joined, regardless of Click version (mirrors
+    ``test_cli_audit._combined_output``). Click 8.2's ``CliRunner``
+    captures stderr separately; Click 8.1's default runner mixes it
+    into ``result.output`` and RAISES ``ValueError`` on ``.stderr`` —
+    so a bare ``result.stderr or result.output`` fallback never engages.
+    """
+    out = result.output or ""
+    try:
+        err = result.stderr or ""
+    except (AttributeError, ValueError):
+        err = ""  # Click 8.1: stderr already mixed into output.
+    return out + err
+
+
 # ---------------------------------------------------------------------------
 # Synthetic run fixture builder
 # ---------------------------------------------------------------------------
@@ -480,14 +495,14 @@ def test_cli_inspect_no_flip_exit1(tmp_path):
     runner = CliRunner()
     result = runner.invoke(app, ["inspect", str(run_dir)])
     assert result.exit_code == 1
-    assert "No verdict flip" in (result.stderr or result.output)
+    assert "No verdict flip" in _combined_output(result)
 
 
 def test_cli_inspect_missing_dir_exit2(tmp_path):
     runner = CliRunner()
     result = runner.invoke(app, ["inspect", str(tmp_path / "nope")])
     assert result.exit_code == 2
-    assert "not a directory" in (result.stderr or result.output)
+    assert "not a directory" in _combined_output(result)
 
 
 def test_cli_inspect_eval_option_plumbed(tmp_path):
