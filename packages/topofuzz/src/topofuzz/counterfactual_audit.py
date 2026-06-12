@@ -1364,6 +1364,23 @@ async def _run_counterfactual_cell(
     keys stay aligned in either monkey-patched state).
     """
     extra: dict[str, Any] = {}
+    # 2026-06-11 BLOCKER fix: thread the fixture-exported ``prompt_builder``
+    # into Phase-1 counterfactual cells. The canonical cells these are
+    # diffed against were produced under the fixture's builder, and the
+    # Phase-2 leave-one-out terminal re-execution already reconstructs it
+    # (see ``_leave_one_out_for_triple``) — Phase-1 was the one
+    # re-execution site still silently falling back to
+    # ``runner._default_prompt``, i.e. measuring the counterfactual under
+    # a DIFFERENT prompt pipeline than the canonical it's compared to
+    # (the same bug class the 2026-05-30 confirm fix closed). Forwarded
+    # only when the fixture ships a builder — same conditional-propagation
+    # shape as the resolver kwarg — so builderless topologies keep the
+    # historical ``run_variant`` call signature.
+    from topofuzz.loaders import get_prompt_builder
+
+    prompt_builder = get_prompt_builder(variant_topology)
+    if prompt_builder is not None:
+        extra["prompt_builder"] = prompt_builder
     if llm_cache is not None:
         extra["llm_cache"] = llm_cache
     if model_served_version_resolver is not None:
