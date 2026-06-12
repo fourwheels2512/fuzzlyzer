@@ -42,11 +42,13 @@ from topofuzz.ir import LLMConfig
 
 AGENT_IDS: tuple[str, ...] = ("intake", "product", "underwriting", "decision")
 
+# All-DeepSeek (V4 Flash) agents, temperature 0; see hiring fixture for the
+# cost/instruction-following rationale. Judge vendor chosen at run time.
 LLM_CONFIGS: dict[str, LLMConfig] = {
-    "intake": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
-    "product": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
-    "underwriting": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
-    "decision": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
+    "intake": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
+    "product": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
+    "underwriting": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
+    "decision": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
 }
 
 

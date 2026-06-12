@@ -43,13 +43,17 @@ from topofuzz.ir import LLMConfig
 
 AGENT_IDS: tuple[str, ...] = ("screening", "standards", "potential", "decision")
 
-# All-Flash, temperature 0 so role_swap finds swappable same-model pairs and
-# decoding_param_swap produces N variants. Mirrors the lending gallery config.
+# All-DeepSeek (V4 Flash), temperature 0. Single agent vendor so role_swap
+# finds swappable same-model pairs and decoding_param_swap produces N
+# variants. DeepSeek V4 Flash ($0.14/$0.28 per 1M) is ~9x cheaper on output
+# than Gemini Flash and a strong deterministic instruction-follower, which
+# suits these threshold-pinned role prompts. Judge vendor is chosen at run
+# time (a single Gemini-Flash extraction judge keeps judge != agent).
 LLM_CONFIGS: dict[str, LLMConfig] = {
-    "screening": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
-    "standards": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
-    "potential": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
-    "decision": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
+    "screening": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
+    "standards": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
+    "potential": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
+    "decision": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
 }
 
 
