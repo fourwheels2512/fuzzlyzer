@@ -221,6 +221,45 @@ def test_find_inspect_pair_named_eval_with_no_flip_raises(tmp_path):
         find_inspect_pair(run_dir, eval_id="eval_001")
 
 
+def test_find_inspect_pair_excludes_explicit_conditional_cells(tmp_path):
+    """3-state regression (2026-06-11): a cell carrying an explicit v7
+    ``verdict_class='conditional'`` must contribute NEITHER side of a
+    flip. The §14 headline metric counts clear APPROVE↔DENY pairs only —
+    before this fix the inspector binarised the conditional cell via
+    ``passed``/threshold and rendered a "flip" the published rate never
+    counted."""
+    run_dir = _make_run(tmp_path, with_flip=True)  # legacy: flip exists
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    db.execute("ALTER TABLE judge_results ADD COLUMN verdict_class TEXT")
+    db.execute(
+        "UPDATE judge_results SET verdict_class = 'conditional' "
+        "WHERE variant_id = ?",
+        (_FLIPPING_HASH,),
+    )
+    db.commit()
+    db.close()
+    with pytest.raises(InspectError, match="No verdict flip"):
+        find_inspect_pair(run_dir)
+
+
+def test_find_inspect_pair_explicit_class_outranks_passed(tmp_path):
+    """3-state regression (2026-06-11): an explicit ``verdict_class``
+    wins over the legacy ``passed`` column — same precedence as the
+    shared :func:`topofuzz.metrics._verdict.verdict_of` rule."""
+    run_dir = _make_run(tmp_path, with_flip=False)  # legacy: no flip
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    db.execute("ALTER TABLE judge_results ADD COLUMN verdict_class TEXT")
+    db.execute(
+        "UPDATE judge_results SET verdict_class = 'deny' "
+        "WHERE variant_id = ?",
+        (_FLIPPING_HASH,),
+    )
+    db.commit()
+    db.close()
+    eid, c_idx, f_idx = find_inspect_pair(run_dir)
+    assert (eid, c_idx, f_idx) == ("eval_001", 0, 1)
+
+
 def test_find_inspect_pair_skips_judge_failures(tmp_path):
     """NULL-score + NULL-passed rows contribute no side of the flip."""
     run_dir = _make_run(tmp_path, with_flip=True)

@@ -38,6 +38,11 @@ from typing import Any
 from topofuzz.metrics.verdict_flip import (
     DEFAULT_FLIP_THRESHOLD as DEFAULT_VERDICT_THRESHOLD,
 )
+# Shared 3-state class rule (2026-06-11): an explicit v7 ``verdict_class``
+# must outrank the score threshold HERE exactly as it does in the metrics
+# layer — otherwise the inspector could render a "flip" whose conditional
+# side the §14 headline metric excluded as a non-clear pair.
+from topofuzz.metrics._verdict import verdict_of as _verdict_of
 from topofuzz._verdict_labels import _normalize_verdict_label_for_consumer
 
 _log = logging.getLogger(__name__)
@@ -118,6 +123,9 @@ def find_inspect_pair(
 
     Cells where the original variant has no scored verdict (judge
     failure) are skipped — there's no reference frame to flip against.
+    Cells whose v7 ``verdict_class`` is explicitly ``"conditional"`` are
+    skipped too: the §14 headline metric counts clear APPROVE↔DENY pairs
+    only, and the inspector must agree with it.
 
     Raises:
         InspectError: no flip found, ``eval_id`` doesn't exist, the
@@ -138,9 +146,23 @@ def find_inspect_pair(
     con = sqlite3.connect(str(run_dir / "run.sqlite"))
     try:
         try:
+            # v7 ``verdict_class`` probe — same conditional-read shape as
+            # :func:`topofuzz.metrics.score_matrix.read_score_matrix`, so
+            # a pre-v7 DB still loads (its rows fall back to the legacy
+            # passed/threshold rule below).
+            judge_cols = {
+                row[1]
+                for row in con.execute(
+                    "PRAGMA table_info(judge_results)"
+                ).fetchall()
+            }
+            has_verdict_class = "verdict_class" in judge_cols
+            select_cols = "variant_id, eval_id, score_value, passed"
+            if has_verdict_class:
+                select_cols += ", verdict_class"
             rows = list(
                 con.execute(
-                    "SELECT variant_id, eval_id, score_value, passed "
+                    f"SELECT {select_cols} "
                     "FROM judge_results "
                     "ORDER BY eval_id, variant_id"
                 )
@@ -154,11 +176,26 @@ def find_inspect_pair(
         con.close()
 
     by_eval: dict[str, dict[int, bool]] = defaultdict(dict)
-    for vid, eid, score, passed in rows:
+    for row in rows:
+        vid, eid, score, passed = row[0], row[1], row[2], row[3]
+        vclass = row[4] if has_verdict_class else None
         idx = hash_to_idx.get(vid)
         if idx is None:
             continue
-        if passed is not None:
+        # 3-state rule, shared with the metrics layer via ``verdict_of``:
+        # an explicit ``verdict_class`` outranks both ``passed`` and the
+        # score threshold, and an explicitly CONDITIONAL cell contributes
+        # NEITHER side of a flip (the §14 metric counts clear
+        # APPROVE↔DENY pairs only — an inspect HTML presenting one as
+        # flip evidence would contradict the published number). Rows
+        # without an explicit class keep the legacy passed → threshold
+        # precedence byte-identically.
+        explicit = _verdict_of({"verdict_class": vclass}, threshold)
+        if explicit == "conditional":
+            continue
+        if explicit is not None:
+            verdict = explicit == "approve"
+        elif passed is not None:
             verdict = bool(passed)
         elif score is not None:
             verdict = bool(score >= threshold)
@@ -170,7 +207,8 @@ def find_inspect_pair(
         if eval_id not in by_eval:
             raise InspectError(
                 f"eval_id={eval_id!r} has no scored judge results in run "
-                f"{run_dir.name} (all rows may be judge-failures)"
+                f"{run_dir.name} (rows may be judge-failures or "
+                f"explicitly CONDITIONAL)"
             )
         candidates: list[str] = [eval_id]
     else:

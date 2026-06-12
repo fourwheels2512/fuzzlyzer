@@ -19,6 +19,7 @@ from topofuzz.repro import (
     DEFAULT_VERDICT_THRESHOLD,
     ReproError,
     build_repro_script,
+    find_all_flip_candidates,
     find_flip_candidate,
     read_eval_input,
     resolve_graph_import,
@@ -123,6 +124,78 @@ def test_find_flip_candidate_returns_deterministic_indices(tmp_path):
     # Variant b (idx=1) scored 0.1 → neg; variant a (idx=0) scored 0.9 → pos
     assert neg == 1
     assert pos == 0
+
+
+def test_find_flip_candidate_excludes_explicit_conditional_cells(tmp_path):
+    """3-state regression (2026-06-11): a cell carrying an explicit v7
+    ``verdict_class='conditional'`` must contribute NEITHER side of a
+    flip. The §14 headline metric counts clear APPROVE↔DENY pairs only —
+    before this fix, repro threshold-binarised the conditional cell and
+    emitted a reproducer for a "flip" the published rate never counted."""
+    run_dir = _make_synthetic_run(tmp_path, with_flip=True)
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    db.execute("ALTER TABLE judge_results ADD COLUMN verdict_class TEXT")
+    db.execute(
+        "UPDATE judge_results SET verdict_class = 'conditional' "
+        "WHERE variant_id = ?",
+        ("b" * 64,),  # the score-0.1 side of the legacy flip
+    )
+    db.commit()
+    db.close()
+    with pytest.raises(ReproError, match="No verdict flip"):
+        find_flip_candidate(run_dir)
+
+
+def test_find_flip_candidate_explicit_class_outranks_threshold(tmp_path):
+    """3-state regression (2026-06-11): an explicit ``verdict_class``
+    wins over the score threshold — same precedence as the shared
+    :func:`topofuzz.metrics._verdict.verdict_of` rule. The classes here
+    are deliberately the OPPOSITE of what the scores binarise to, so the
+    legacy threshold path would return the flip with its sides
+    reversed."""
+    run_dir = _make_synthetic_run(tmp_path, with_flip=True)
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    db.execute("ALTER TABLE judge_results ADD COLUMN verdict_class TEXT")
+    db.execute(
+        "UPDATE judge_results SET verdict_class = 'deny' "
+        "WHERE variant_id = ?",
+        ("a" * 64,),  # score 0.9 — legacy says approve
+    )
+    db.execute(
+        "UPDATE judge_results SET verdict_class = 'approve' "
+        "WHERE variant_id = ?",
+        ("b" * 64,),  # score 0.1 — legacy says deny
+    )
+    db.commit()
+    db.close()
+    eid, neg, pos = find_flip_candidate(run_dir)
+    # Explicit classes invert the legacy sides: a (idx 0) is now the
+    # DENY side, b (idx 1) the APPROVE side.
+    assert (eid, neg, pos) == ("eval_001", 0, 1)
+
+
+def test_find_all_flip_candidates_excludes_conditional_cells(tmp_path):
+    """3-state regression (2026-06-11, review pass 2): the BULK
+    enumerator — consumed by ``confirm`` (K-repeat billing), F4
+    ``ablate`` (attribution triples), and ``attest`` (consistency card)
+    — must apply the same conditional-exclusion rule as
+    :func:`find_flip_candidate`. Before this fix a conditional cell
+    (continuous score 0.5 → legacy APPROVE) could be screened as a flip
+    candidate, re-run K× at real cost, and attributed, while the §14
+    headline metric excluded it."""
+    run_dir = _make_synthetic_run(tmp_path, with_flip=True)
+    # Legacy behavior first: the score-0.1 cell on variant b is a candidate.
+    assert find_all_flip_candidates(run_dir) == [("eval_001", "b" * 64)]
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    db.execute("ALTER TABLE judge_results ADD COLUMN verdict_class TEXT")
+    db.execute(
+        "UPDATE judge_results SET verdict_class = 'conditional' "
+        "WHERE variant_id = ?",
+        ("b" * 64,),
+    )
+    db.commit()
+    db.close()
+    assert find_all_flip_candidates(run_dir) == []
 
 
 def test_find_flip_candidate_no_flip_raises(tmp_path):
