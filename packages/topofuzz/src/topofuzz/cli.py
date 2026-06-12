@@ -30,6 +30,8 @@ from __future__ import annotations
 import asyncio
 import atexit
 import logging
+import os
+import re
 import signal
 import sys
 from contextlib import ExitStack
@@ -51,6 +53,7 @@ from fuzzeval.keys import (
 from topofuzz import __version__
 from topofuzz.attest import load_and_verify_attestation
 from topofuzz.key_inspector import (
+    VENDORS,
     at_least_one_present,
     format_table,
     inspect_keys,
@@ -320,6 +323,98 @@ def _reject_unknown_extras(argv: list[str]) -> None:
 _LICENSE_EXEMPT_COMMANDS: frozenset[str] = frozenset({"verify"})
 
 
+# ---------------------------------------------------------------------------
+# .env auto-load (ops fix, 2026-06-11)
+# ---------------------------------------------------------------------------
+# LiteLLM reads vendor keys (GEMINI_API_KEY, DEEPSEEK_API_KEY, …) from the
+# process environment only. Before this hook, a key parked in the project's
+# ``.env`` was silently ignored unless the operator remembered to ``export``
+# it in every shell — the documented 2026-05-30 failure mode, where
+# API_KEY_INVALID surfaced from the vendor AFTER the license prompt and
+# cost estimate. The loader is deliberately tiny and stdlib-only (no
+# python-dotenv dependency — that would land in the verify-path import
+# graph): ``KEY=VALUE`` lines, ``#`` comments, optional ``export `` prefix,
+# optional matching single/double quotes, `` #``-prefixed inline comments.
+#
+# Two hard safety rules (RT 2026-06-11):
+#
+# * **Vendor-key allowlist.** Only the env var names in
+#   :data:`key_inspector.VENDORS` are ever filled. Topofuzz's pitch is
+#   auditing THIRD-PARTY multi-agent repos, so "operator runs topofuzz
+#   from a hostile checkout" is a realistic posture — an unrestricted
+#   loader would let a dropped ``.env`` set absent-by-default vars like
+#   ``OPENAI_API_BASE`` (silently rerouting the operator's vendor
+#   traffic AND keys to an attacker endpoint) or ``PYTHONPATH``
+#   (arbitrary import in the UI's ``subprocess`` children). The
+#   allowlist kills that entire class: worst case, a hostile ``.env``
+#   plants a *key*, which only ever bills the attacker.
+# * **Real environment variables ALWAYS win** — only absent keys are
+#   filled — and ``TOPOFUZZ_NO_DOTENV=1`` disables the hook entirely
+#   (the test suite sets it in ``conftest.py`` so the developer's
+#   repo-root ``.env`` cannot leak into CLI tests).
+_DOTENV_DISABLE_ENV = "TOPOFUZZ_NO_DOTENV"
+_DOTENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Env var names the ``.env`` loader may fill — sourced from the stable
+# public vendor list so a future vendor addition extends the loader
+# automatically (and inherits key_inspector's SECURITY.md drift guard).
+_DOTENV_ALLOWED_KEYS: frozenset[str] = frozenset(
+    env_name for _vendor, env_name in VENDORS
+)
+
+
+def _load_dotenv_if_present(directory: Path | None = None) -> int:
+    """Fill missing vendor API keys in ``os.environ`` from
+    ``<directory>/.env`` (default: cwd).
+
+    Best-effort: a missing, unreadable, or malformed file is a silent
+    no-op (per-line garbage is skipped, not fatal). Non-vendor keys are
+    ignored and existing environment variables are never overwritten —
+    see the block comment above for the threat model. Returns the number
+    of variables set so :func:`_root` can surface a one-line notice on
+    stderr.
+    """
+    if os.environ.get(_DOTENV_DISABLE_ENV):
+        return 0
+    path = (directory or Path.cwd()) / ".env"
+    try:
+        if not path.is_file():
+            return 0
+        # utf-8-sig: PowerShell's UTF-8 writers prepend a BOM; plain
+        # utf-8 would glue it onto the first key and silently drop it.
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return 0
+    loaded = 0
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if not sep or not _DOTENV_KEY_RE.match(key):
+            continue
+        value = value.strip()
+        if value[:1] in ("'", '"'):
+            # Quoted value: take up to the matching close quote, which
+            # also drops any `` # comment`` after it. A value with no
+            # close quote is kept verbatim (best-effort contract).
+            close = value.find(value[0], 1)
+            if close != -1:
+                value = value[1:close]
+        else:
+            comment_at = value.find(" #")
+            if comment_at != -1:
+                value = value[:comment_at].rstrip()
+        if key not in _DOTENV_ALLOWED_KEYS or key in os.environ:
+            continue
+        os.environ[key] = value
+        loaded += 1
+    return loaded
+
+
 @app.callback(invoke_without_command=True)
 def _root(
     ctx: typer.Context,
@@ -349,7 +444,23 @@ def _root(
     # / piped invocations MUST pass --accept-license or the command
     # refuses with exit code 2 and an actionable message.
     if ctx.invoked_subcommand in _LICENSE_EXEMPT_COMMANDS:
+        # Deliberately ABOVE the .env hook: ``verify`` is the
+        # auditor-facing, minimal-side-effect trust anchor — it needs no
+        # vendor keys, so it gets no cwd file read and no os.environ
+        # mutation (RT 2026-06-11).
         return
+    # Fill missing vendor keys from ``$CWD/.env`` before key-consuming
+    # subcommands run — see the loader's block comment for the failure
+    # mode this closes and the threat model. The notice goes to stderr
+    # so stdout-parsing CI pipelines are unaffected.
+    loaded_env = _load_dotenv_if_present()
+    if loaded_env:
+        typer.echo(
+            f"topofuzz: loaded {loaded_env} vendor key(s) from .env "
+            f"(existing environment variables win; set "
+            f"{_DOTENV_DISABLE_ENV}=1 to disable).",
+            err=True,
+        )
     non_interactive = not sys.stdin.isatty()
     try:
         accepted = prompt_and_record(

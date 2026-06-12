@@ -23,7 +23,12 @@ Topofuzz runs against the LLM vendor of your choice. **Your keys stay
 on your machine.** Topofuzz reads keys from environment variables only
 (`GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
 `DEEPSEEK_API_KEY`), never persists them, and never transmits anything
-other than your declared vendor API calls. See
+other than your declared vendor API calls. As a convenience, the CLI
+fills *missing* vendor API keys — only the four variables above, never
+arbitrary environment variables — from a `.env` file in the current
+directory (real environment variables always win; set
+`TOPOFUZZ_NO_DOTENV=1` to disable). Run `topofuzz keys` to pre-flight
+which keys are visible. See
 [SECURITY.md](../../SECURITY.md) for the full posture and
 [PRIVACY.md](../../PRIVACY.md) for the no-telemetry statement.
 

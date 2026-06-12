@@ -48,6 +48,22 @@ def _isolate_dev_key(
 
 
 @pytest.fixture(autouse=True)
+def _no_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep CLI invocations hermetic against the developer's ``.env``.
+
+    ``topofuzz.cli._root`` auto-loads ``$CWD/.env`` into ``os.environ``
+    (ops fix, 2026-06-11), and the test suite typically runs with cwd at
+    the repo root — which carries a real developer ``.env`` with live
+    vendor keys. Without this guard, every CliRunner test would silently
+    import those keys mid-suite, making key-presence assertions
+    machine-dependent and leaking real keys into test state. The dotenv
+    loader's own tests (``test_cli_dotenv.py``) delete this variable
+    explicitly and chdir to a tmp cwd to exercise the load path.
+    """
+    monkeypatch.setenv("TOPOFUZZ_NO_DOTENV", "1")
+
+
+@pytest.fixture(autouse=True)
 def _preaccept_license(
     tmp_path_factory: pytest.TempPathFactory,
     monkeypatch: pytest.MonkeyPatch,
