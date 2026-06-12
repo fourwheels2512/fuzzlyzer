@@ -43,17 +43,24 @@ from topofuzz.ir import LLMConfig
 
 AGENT_IDS: tuple[str, ...] = ("screening", "standards", "potential", "decision")
 
-# All-DeepSeek (V4 Flash), temperature 0. Single agent vendor so role_swap
-# finds swappable same-model pairs and decoding_param_swap produces N
-# variants. DeepSeek V4 Flash ($0.14/$0.28 per 1M) is ~9x cheaper on output
-# than Gemini Flash and a strong deterministic instruction-follower, which
-# suits these threshold-pinned role prompts. Judge vendor is chosen at run
-# time (a single Gemini-Flash extraction judge keeps judge != agent).
+# Per-node models are chosen so role_swap permutes ONLY the two reviewer
+# poles. role_swap pairs same-model nodes in declared-index order; if all four
+# shared one model it would also pair the normalizer (index 0) with a pole,
+# and at small --variants the SELECTED flipping variant routes through the
+# normalizer — attributing the flip to `screening` instead of the reviewer
+# that caused it (verified by replicating the CLI's _round_robin_select).
+# Giving the two poles ONE model and the normalizer + decision two OTHER
+# distinct models makes (standards, potential) the ONLY swappable pair, so the
+# role_swap flip axis is exactly the conservative<->lenient reviewer swap.
+# The two poles run the heavy threshold reasoning on DeepSeek V4 Flash
+# ($0.14/$0.28 per 1M, cheap + strong deterministic instruction-following);
+# the light bookend agents use Gemini. Run with --variants 2 (canonical + the
+# single flip axis). Judge is a single Gemini-Flash extraction pass at run time.
 LLM_CONFIGS: dict[str, LLMConfig] = {
-    "screening": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
+    "screening": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
     "standards": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
     "potential": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
-    "decision": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
+    "decision": LLMConfig(model="google/gemini-2.5-pro", temperature=0.0, max_tokens=4000),
 }
 
 

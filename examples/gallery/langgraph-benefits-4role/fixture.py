@@ -40,13 +40,16 @@ from topofuzz.ir import LLMConfig
 
 AGENT_IDS: tuple[str, ...] = ("intake", "hardship", "eligibility", "decision")
 
-# All-DeepSeek (V4 Flash) agents, temperature 0; see hiring fixture for the
-# cost/instruction-following rationale. Judge vendor chosen at run time.
+# Distinct models per non-pole agent so role_swap pairs ONLY the two reviewer
+# poles (hardship, eligibility) — see the hiring fixture for the full
+# rationale. First-writer domain, so the all-same-model setup would misattribute
+# the flip to the `intake` normalizer; the distinct-model split fixes that.
+# Poles on DeepSeek V4 Flash; bookends on Gemini. Run with --variants 2.
 LLM_CONFIGS: dict[str, LLMConfig] = {
-    "intake": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
+    "intake": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
     "hardship": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
     "eligibility": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
-    "decision": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
+    "decision": LLMConfig(model="google/gemini-2.5-pro", temperature=0.0, max_tokens=4000),
 }
 
 

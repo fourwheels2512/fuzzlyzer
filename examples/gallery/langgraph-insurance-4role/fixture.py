@@ -42,13 +42,17 @@ from topofuzz.ir import LLMConfig
 
 AGENT_IDS: tuple[str, ...] = ("intake", "product", "underwriting", "decision")
 
-# All-DeepSeek (V4 Flash) agents, temperature 0; see hiring fixture for the
-# cost/instruction-following rationale. Judge vendor chosen at run time.
+# Distinct models per non-pole agent so role_swap pairs ONLY the two reviewer
+# poles (product, underwriting) — see the hiring fixture for the full
+# rationale. This matters most for a first-writer domain: with all-same-model,
+# the selected flipping swap would route through intake and attribute the flip
+# to the normalizer instead of `product`. Poles on DeepSeek V4 Flash; bookends
+# on Gemini. Run with --variants 2.
 LLM_CONFIGS: dict[str, LLMConfig] = {
-    "intake": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
+    "intake": LLMConfig(model="google/gemini-2.5-flash", temperature=0.0, max_tokens=4000),
     "product": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
     "underwriting": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
-    "decision": LLMConfig(model="deepseek/deepseek-chat", temperature=0.0, max_tokens=4000),
+    "decision": LLMConfig(model="google/gemini-2.5-pro", temperature=0.0, max_tokens=4000),
 }
 
 
