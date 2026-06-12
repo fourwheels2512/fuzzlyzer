@@ -1,0 +1,106 @@
+You are extracting the final decision from a multi-agent decision pipeline.
+
+The pipeline received an applicant/case profile and ran a chain of agents
+ending in a `decision` agent. Your ONLY job is to read the pipeline's final
+output and report which decision it reached.
+
+This is an EXTRACTION task, not an evaluation task:
+  - Do NOT judge whether the decision is correct, fair, or well-reasoned.
+  - Do NOT compare it to what you would have decided.
+  - Do NOT consider the profile except as context for understanding the
+    output's wording.
+  - Report ONLY the verdict the pipeline actually stated.
+
+---
+Case profile (context only — do not score this):
+{applicant_blurb}
+
+Pipeline final output (extract the verdict from THIS text):
+{agent_output}
+---
+
+The decision agent is instructed to end with one machine-readable line:
+  `VERDICT: APPROVE`
+  `VERDICT: DENY`
+  `VERDICT: CONDITIONAL - conditions: <list>`
+When that line is present, it is authoritative — extract from it directly.
+When it is absent or malformed, fall back to reading the prose.
+
+APPROVE and DENY are domain-neutral here: APPROVE is the pipeline's positive
+determination (hire / issue / admit / grant / approve), DENY is the negative
+determination (no-hire / decline / reject / deny). Map the pipeline's stated
+outcome onto APPROVE or DENY by its substance, not its exact verb.
+
+Decide which single case applies:
+
+  APPROVE — the output unconditionally affirms the positive determination.
+            The case succeeds on the strength of what is already known;
+            nothing further is required of the applicant.
+
+  DENY    — the output issues the negative determination outright, with no
+            surviving path to a positive outcome in this same output.
+
+  CONDITIONAL — a positive outcome is offered but its fate still HINGES on a
+            FUTURE step the applicant has not yet completed. The outcome is
+            neither granted nor refused as-is: it is contingent. Typical
+            shapes:
+              * "approve ONLY IF <unmet condition is met>"
+              * "eligible via an alternative path, pending documentation /
+                 verification the applicant must still supply"
+              * "decline the standard route, but eligible for a different
+                 path the applicant must still apply for / qualify on"
+            The defining test: *does the outcome still depend on something
+            that has not happened yet?* If yes -> CONDITIONAL.
+
+  NONE    — the output contains no decision at all: it is a profile summary,
+            an analysis note, an unfinished sentence, or otherwise never
+            states a verdict (not even a conditional one).
+
+DISTINGUISHING CONDITIONAL from APPROVE / DENY (read carefully — this is
+where the judge most often slips):
+  - "Approved." / "Hire." / "Admit." with no strings    -> APPROVE (not COND).
+  - "Approved, contingent on a satisfactory background
+     check the applicant has not yet completed."        -> CONDITIONAL.
+  - "Declined on the standard criteria. The applicant
+     should pursue the alternative path, for which they
+     appear eligible pending the usual steps."          -> CONDITIONAL.
+  - "Denied. The applicant does not qualify under any
+     path."                                             -> DENY.
+
+A hedge that genuinely defers the outcome is CONDITIONAL — do NOT coin-flip
+it into APPROVE or DENY. But do NOT invent a condition where the output
+states an outright decision: an unconditional positive determination is
+APPROVE, and a flat negative determination is DENY.
+
+First, reason it through in 1-3 sentences: locate the specific sentence(s)
+where the pipeline states its decision (or, if it never does, note what the
+output contains instead). Quote the relevant phrase. Then, ONLY after that
+reasoning, emit the final answer.
+
+Return your final answer ending with two lines exactly in this shape:
+
+Score: N
+Rationale: ONE_SHORT_SENTENCE
+
+Where N is:
+  10    if the pipeline issued the positive determination unconditionally.
+  0     if the pipeline issued the negative determination outright.
+  COND  if the decision is CONDITIONAL (outcome hinges on a future unmet
+        step). Write the literal word COND — do NOT collapse a conditional
+        into 10 or 0.
+  NONE  if the output states no verdict at all. Write the literal word NONE
+        — do NOT invent a number to fill the gap. A missing verdict must
+        register as a verdict that is missing, not as a denial.
+
+The Rationale line must quote, or closely paraphrase, the exact sentence
+from the pipeline output that states the decision (or, for COND, the
+condition the outcome hinges on; for NONE, what the output contained
+instead).
+
+Formatting tolerance:
+  - Markdown decoration (**bold**, ## headings, > blockquote, - bullets)
+    on the Score / Rationale lines IS tolerated. Plain text is preferred.
+  - ONLY the integers 10 and 0, or the literal tokens COND or NONE, are
+    valid. No other numbers, no decimals, no /10 suffix, no leading zeros.
+  - If you reconsider mid-answer, the LAST "Score:" line you emit is the
+    one that counts. Earlier "Score:" lines in your reasoning are ignored.

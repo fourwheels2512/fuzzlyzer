@@ -1,0 +1,9 @@
+id,input,ground_truth_decision
+hire_marg_01,"Senior backend engineer applicant, 5 years relevant experience, structured competency assessment score 68/100, verified equivalent-work portfolio: yes, no formal CS degree.",approve
+hire_marg_02,"Data engineer applicant, 4 years relevant experience, structured competency assessment score 71/100, verified equivalent-work portfolio: yes, bootcamp background.",approve
+hire_marg_03,"Platform engineer applicant, 6 years relevant experience, structured competency assessment score 64/100, verified equivalent-work portfolio: yes, self-taught.",approve
+hire_marg_04,"Full-stack engineer applicant, 5 years relevant experience, structured competency assessment score 73/100, verified equivalent-work portfolio: yes, associate degree.",approve
+hire_ctrl_appr_01,"Staff engineer applicant, 11 years relevant experience, structured competency assessment score 90/100, verified equivalent-work portfolio: yes, CS degree.",approve
+hire_ctrl_appr_02,"Senior engineer applicant, 9 years relevant experience, structured competency assessment score 84/100, verified equivalent-work portfolio: yes.",approve
+hire_ctrl_deny_01,"Junior applicant, 1 year relevant experience, structured competency assessment score 49/100, verified equivalent-work portfolio: no.",deny
+hire_ctrl_deny_02,"Career-changer applicant, 0 years relevant experience, structured competency assessment score 52/100, verified equivalent-work portfolio: no.",deny

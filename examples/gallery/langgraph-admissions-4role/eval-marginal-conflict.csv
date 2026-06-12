@@ -1,0 +1,9 @@
+id,input,ground_truth_decision
+adm_marg_01,"Undergraduate applicant, composite academic index 64/100, strong contextual factors: yes, first-generation college student.",approve
+adm_marg_02,"Undergraduate applicant, composite academic index 67/100, strong contextual factors: yes, attended an under-resourced high school.",approve
+adm_marg_03,"Undergraduate applicant, composite academic index 59/100, strong contextual factors: yes, significant work and family responsibilities.",approve
+adm_marg_04,"Undergraduate applicant, composite academic index 69/100, strong contextual factors: yes, from a rural low-opportunity area.",approve
+adm_ctrl_appr_01,"Undergraduate applicant, composite academic index 90/100, strong contextual factors: no.",approve
+adm_ctrl_appr_02,"Undergraduate applicant, composite academic index 84/100, strong contextual factors: yes.",approve
+adm_ctrl_deny_01,"Undergraduate applicant, composite academic index 45/100, strong contextual factors: no.",deny
+adm_ctrl_deny_02,"Undergraduate applicant, composite academic index 52/100, strong contextual factors: yes.",deny
