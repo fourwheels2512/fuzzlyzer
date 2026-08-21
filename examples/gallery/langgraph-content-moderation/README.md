@@ -31,12 +31,6 @@ $0.79 cost), but the headline metrics flagged genuine stability.
 | `verdict_flip_rate.degenerate_flag` | true | Indicates the metric is not meaningful |
 | `kappa_original_vs_permuted` | 1.0 | Perfect agreement across all variants — Landis-Koch "almost perfect" |
 
-Per BLUEPRINT_v5plus.md line 439:
-
-> *Curation note: if a tutorial chain shows low variance, do not
-> include it — the gallery is "examples where ordering matters,"
-> not a benchmark.*
-
 A "stable" example in a "flippy examples" gallery is a credibility
 loss, so this candidate was excluded.
 

@@ -85,8 +85,7 @@ this package.
 
 1. Reads your compiled LangGraph and lifts it to a typed
    `Topology` (`fuzzeval.ir`).
-2. Generates permuted variants per
-   [BLUEPRINT §6](https://github.com/fourwheels2512/fuzzlyzer/blob/main/BLUEPRINT_v5plus.md):
+2. Generates permuted variants:
    `order_swap`, `role_swap`, `decoding_param_swap`.
 3. Runs every `(variant, eval_row)` cell through the LLM stack, judges
    each result against a rubric, persists traces.
@@ -230,7 +229,7 @@ calls until you start a run from inside it).
 
 | Subcommand | What it does | Cost |
 |---|---|---|
-| `topofuzz report`  | Render HTML report with voo bar + heatmap + per-agent influence panel (§6a) and [§A](https://github.com/fourwheels2512/fuzzlyzer/blob/main/BLUEPRINT_v5plus.md) banners. | Free |
+| `topofuzz report`  | Render HTML report with voo bar + heatmap + per-agent influence panel. | Free |
 | `topofuzz inspect` | Side-by-side HTML inspector for one verdict flip, agent-by-agent. | Free |
 | `topofuzz repro`   | Emit a standalone reproducer script for a verdict flip. | Free |
 | `topofuzz publish` | Bundle report.html + top flipping inspect pages into a PDF (or a CEO/consistency/counterfactual card). | Free |
@@ -307,10 +306,7 @@ export GEMINI_API_KEY=...
 topofuzz run <fixture>:build_graph --eval <rows.csv> --n 50 --jury-of-3
 ```
 
-Missing keys surface as `judge_failure` cells, not as a kickoff error
-(per the
-[BLUEPRINT §A](https://github.com/fourwheels2512/fuzzlyzer/blob/main/BLUEPRINT_v5plus.md)
-degraded-badge contract).
+Missing keys surface as `judge_failure` cells, not as a kickoff error.
 
 ### Cross-Vendor Consistency
 
@@ -435,13 +431,7 @@ v1.0.0 reference vectors.
 - [`fuzzeval`](https://github.com/fourwheels2512/fuzzlyzer/blob/main/packages/fuzzeval/README.md)
   — verify-path substrate (DSSE + judge + stats + cache + costest + key
   management).
-- [`BLUEPRINT_v5plus.md`](https://github.com/fourwheels2512/fuzzlyzer/blob/main/BLUEPRINT_v5plus.md)
-  — full design contract.
 - [`SECURITY.md`](https://github.com/fourwheels2512/fuzzlyzer/blob/main/SECURITY.md)
   — threat model + standalone verifier.
 - [`CHANGELOG.md`](https://github.com/fourwheels2512/fuzzlyzer/blob/main/packages/topofuzz/CHANGELOG.md)
   — release history.
-- [`BACKLOG.md`](https://github.com/fourwheels2512/fuzzlyzer/blob/main/packages/topofuzz/BACKLOG.md)
-  — polish + hardening items deferred from prior steps; the
-  v0.5.1 punch list. Contributors closing items reference this
-  file in commit messages (`closes BACKLOG: <description>`).

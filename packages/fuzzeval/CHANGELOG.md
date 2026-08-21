@@ -37,8 +37,6 @@ First public release. Ships alongside `topofuzz` v0.5.0rc1 as the
 verify-path substrate and the LLM-judge/statistics/attestation
 primitive layer.
 
-The 0.1.x public API is the contract defined in
-[BLUEPRINT_v5plus.md §17a](https://github.com/fourwheels2512/fuzzlyzer/blob/main/BLUEPRINT_v5plus.md).
 Consumers should depend on `fuzzeval>=0.1,<0.2`; the 0.2 line may shift
 signatures.
 

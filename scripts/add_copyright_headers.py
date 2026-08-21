@@ -1,6 +1,6 @@
 """Idempotent copyright-header inserter for the BSL-licensed packages.
 
-Closes ``packages/topofuzz/BACKLOG.md`` entry "MINOR -- Copyright + ``(C)``
+Adds SPDX-style copyright headers. Originally closed a backlog item "MINOR -- Copyright + ``(C)``
 notice headers in source files". Walks the four watched directories and
 prepends a 4-line header (3-line copyright/license/LICENSE pointer +
 1-line patent-pending placeholder) to every ``.py`` file whose canonical

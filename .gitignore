@@ -49,10 +49,10 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Internal launch / marketing artifacts (not for public repo)
+# Internal / local-only (never re-add)
 .launch/
-
-# Nested vendor checkout (its own git repo)
+.planning/
+RELEASE-PREP.md
 superpowers/
 
 # topofuzz local artifacts
@@ -60,9 +60,7 @@ runs/
 .cache/
 *.pem
 !keys/*.pub.pem
-# Published gallery runs (BLUEPRINT 19a) are committed deliberately
-!examples/gallery/*/runs/
-!examples/gallery/*/runs/**
+examples/gallery/*/runs/
 
 # topofuzz UI server runtime artifacts (local-only, ephemeral)
 ui_server.log
@@ -73,8 +71,6 @@ ui-*.png
 # uv lock state lives at workspace root only; per-package locks not used
 packages/*/uv.lock
 
-# Internal planning, patent drafts, and local run artifacts — never re-add
-.planning/
 runs-eu-*.log
 runs-eu-domains/
 runs-marginal/

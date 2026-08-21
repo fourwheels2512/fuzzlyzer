@@ -39,9 +39,8 @@ packages/
 ├── topofuzz/         the fuzzer
 └── fuzzeval/         the verify-path substrate
 examples/
-└── gallery/          5 worked fixtures (lending, insurance, content moderation, supervisor research, adversarial relay)
+└── gallery/          worked fixtures (lending, insurance, hiring, …)
 keys/                 DSSE public keys (development)
-BLUEPRINT_v5plus.md   design document
 SECURITY.md           security & threat-model posture
 PRIVACY.md            no-telemetry statement
 ```
