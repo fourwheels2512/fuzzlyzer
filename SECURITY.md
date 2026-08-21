@@ -27,9 +27,10 @@ For coordinated disclosure that prefers a non-email channel, GitHub Security Adv
 
 Topofuzz operates under a strict bring-your-own-key (BYO) model.
 
-- **Vendor** API keys are read from environment variables only: `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`.
-- **Vendor** API keys are never persisted to disk by Topofuzz, never written to any cache file, and never transmitted to any endpoint other than the declared vendor API (see **Network Egress** below).
-- The only on-disk secret Topofuzz creates is the local Ed25519 attestation-signing key at `~/.topofuzz/dev.pem` (POSIX `chmod 0o600`); this is not a vendor key and is never transmitted off-host.
+- **CLI**: vendor API keys are read from environment variables only: `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`. The CLI never writes a vendor key to disk.
+- **`topofuzz ui`**: by default, a key pasted into the in-browser key card is held **in memory only**, for the lifetime of the running process — never written to disk. The "Remember this key on this computer" checkbox is **opt-in and unchecked by default**; only when a user explicitly checks it does the UI write the key to `~/.topofuzz/keys/{vendor}` (plaintext; POSIX `chmod 0o600`, and on Windows an `icacls` ACL reset that grants Full Control to the current user only and drops inherited permissions — POSIX mode bits do not restrict access on NTFS). Unchecking "remember" (or clicking "Remove") deletes that file.
+- In all cases, a vendor API key is never written to any cache file and never transmitted to any endpoint other than the declared vendor API (see **Network Egress** below).
+- The on-disk secrets Topofuzz can create: the local Ed25519 attestation-signing key at `~/.topofuzz/dev.pem` (POSIX `chmod 0o600`; not a vendor key, never transmitted off-host), and — opt-in only, UI path — `~/.topofuzz/keys/{vendor}` as described above.
 - The `topofuzz repro` command emits a shell script with log-redaction guards (see **Log Redaction** below); the generated script will not echo or log API keys even if invoked under `set -x`.
 
 ## Network Egress

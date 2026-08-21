@@ -183,6 +183,7 @@
   .banner-rekor-deferred { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn); }
   .banner-jury { background: var(--jury-bg); border-color: var(--jury-border); color: var(--jury-ink); }
   .banner-degraded { background: var(--degraded-bg); border-color: var(--degraded-border); color: var(--degraded-ink); }
+  .banner-incomplete { background: var(--degraded-bg); border-color: var(--degraded-border); color: var(--degraded-ink); }
 
   .warning {
     background: var(--warn-bg);
@@ -612,6 +613,7 @@
     {% if show_rekor_deferred %}<span class="banner banner-rekor-deferred term" tabindex="0" data-tip="We tried to post proof to the public Sigstore transparency log so anyone can verify these numbers. The submission was deferred — re-run with --rekor to retry. Note: Sigstore Rekor entries are permanent and globally public." aria-label="Rekor submission deferred. We tried to post proof to the public Sigstore transparency log so anyone can verify these numbers. The submission was deferred — re-run the rekor flag to retry. Note: Sigstore Rekor entries are permanent and globally public.">[REKOR-DEFERRED]</span>{% endif %}
     {% if show_jury %}<span class="banner banner-jury term" tabindex="0" data-tip="Each cell was judged by three independent LLM vendors instead of one. Reduces single-vendor bias in the scores." aria-label="Jury of three judges. Each cell was judged by three independent LLM vendors instead of one. Reduces single-vendor bias in the scores.">[JURY]</span>{% endif %}
     {% if show_degraded %}<span class="banner banner-degraded term" tabindex="0" data-tip="The run finished but with degraded outputs — some cells failed or were partial." aria-label="Run completed in degraded state. The run finished but with degraded outputs — some cells failed or were partial.">[DEGRADED]</span>{% endif %}
+    {% if show_incomplete %}<span class="banner banner-incomplete term" tabindex="0" data-tip="This run's status is still {{ status }} — it never reached a final state (succeeded / degraded / failed / cost_cap_hit / interrupted). Most likely the process was killed mid-run. Results below may be partial." aria-label="Incomplete run warning. This run's status is still {{ status }} — it never reached a final state. Most likely the process was killed mid-run. Results below may be partial.">[INCOMPLETE — status: {{ status }}]</span>{% endif %}
   </div>
 
   {% if matrix_warning %}<div class="warning">⚠ {{ matrix_warning }}</div>{% endif %}

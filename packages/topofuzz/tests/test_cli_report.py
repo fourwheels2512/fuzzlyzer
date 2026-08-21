@@ -258,6 +258,36 @@ def test_report_no_degraded_banner_for_other_statuses(
     assert status in body
 
 
+def test_report_incomplete_banner_when_status_running(tmp_path: Path) -> None:
+    """ROB-3: a run killed mid-execution leaves ``runs.status='running'``
+    (the DB default — never reached ``RunWriter.finalize``). Pre-fix,
+    ``topofuzz report`` rendered a normal-looking report with exit 0 and
+    NO indication the run was incomplete. Post-fix, an ``[INCOMPLETE]``
+    banner (naming the raw status) must appear."""
+    run_dir = _make_run_dir(tmp_path, status="running")
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    body = (run_dir / "report.html").read_text(encoding="utf-8")
+    assert "[INCOMPLETE" in body
+    assert "running" in body
+
+
+@pytest.mark.parametrize(
+    "status", ["succeeded", "degraded", "failed", "cost_cap_hit", "interrupted"]
+)
+def test_report_no_incomplete_banner_for_final_statuses(
+    tmp_path: Path, status: str
+) -> None:
+    """The [INCOMPLETE] banner is specific to a non-final ``status`` —
+    every §A final status (including 'degraded'/'failed', which have
+    their OWN dedicated banners/status line) must NOT trip it."""
+    run_dir = _make_run_dir(tmp_path, status=status)
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 0, result.output
+    body = (run_dir / "report.html").read_text(encoding="utf-8")
+    assert "[INCOMPLETE" not in body
+
+
 def test_report_all_three_banners_together(tmp_path: Path) -> None:
     """Banners are independent — verify they coexist in one render."""
     run_dir = _make_run_dir(
@@ -361,6 +391,36 @@ def test_report_corrupt_sqlite_exits_bad_usage(tmp_path: Path) -> None:
     (run_dir / "run.sqlite").write_bytes(b"not a database")
     result = CliRunner().invoke(app, ["report", str(run_dir)])
     assert result.exit_code == 2, result.output
+
+
+def test_report_corrupt_zero_byte_sqlite_names_the_file(tmp_path: Path) -> None:
+    """ROB-6: a 0-byte run.sqlite (e.g. truncated by a crash) raises
+    ``sqlite3.OperationalError: no such table: runs`` deep inside
+    ``_read_run_row`` — the wrapping there already names the file, so
+    this locks in "run.sqlite" + the run_dir appearing in the message
+    rather than the bare parser text leaking to the operator."""
+    run_dir = _make_run_dir(tmp_path)
+    (run_dir / "run.sqlite").write_bytes(b"")
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 2, result.output
+    assert "run.sqlite" in result.output
+    assert str(run_dir) in result.output or run_dir.name in result.output
+
+
+def test_report_corrupt_manifest_json_names_the_file(tmp_path: Path) -> None:
+    """ROB-6: a manifest.json that isn't valid JSON used to bubble up the
+    raw ``json.JSONDecodeError`` text (e.g. "Expecting value: line 1
+    column 7") with NO mention of which file was unparseable. Post-fix,
+    the message must name manifest.json explicitly."""
+    run_dir = _make_run_dir(tmp_path)
+    (run_dir / "manifest.json").write_text('{"a": ', encoding="utf-8")
+    result = CliRunner().invoke(app, ["report", str(run_dir)])
+    assert result.exit_code == 2, result.output
+    assert "manifest.json" in result.output
+    assert "not valid JSON" in result.output
+    # The raw parser detail is still useful — kept, just no longer
+    # the ENTIRE message.
+    assert "Expecting value" in result.output
 
 
 # ---------------------------------------------------------------------------

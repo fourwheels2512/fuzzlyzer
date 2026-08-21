@@ -53,11 +53,11 @@ cache = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/kirannayudu/topofuzz"
-Repository = "https://github.com/kirannayudu/topofuzz"
-Issues = "https://github.com/kirannayudu/topofuzz/issues"
-Changelog = "https://github.com/kirannayudu/topofuzz/blob/main/packages/fuzzeval/CHANGELOG.md"
-Documentation = "https://github.com/kirannayudu/topofuzz/blob/main/packages/fuzzeval/README.md"
+Homepage = "https://github.com/fourwheels2512/fuzzlyzer"
+Repository = "https://github.com/fourwheels2512/fuzzlyzer"
+Issues = "https://github.com/fourwheels2512/fuzzlyzer/issues"
+Changelog = "https://github.com/fourwheels2512/fuzzlyzer/blob/main/packages/fuzzeval/CHANGELOG.md"
+Documentation = "https://github.com/fourwheels2512/fuzzlyzer/blob/main/packages/fuzzeval/README.md"
 
 [build-system]
 # hatchling >= 1.27 implements the **finalized** PEP 639 `license-files`

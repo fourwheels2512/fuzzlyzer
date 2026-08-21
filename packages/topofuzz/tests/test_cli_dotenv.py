@@ -190,6 +190,124 @@ def test_root_callback_quiet_when_no_dotenv(tmp_path: Path, monkeypatch) -> None
     assert ".env" not in result.stderr
 
 
+def test_ui_command_still_loads_dotenv_despite_license_exemption(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """UX-1 made ``ui`` exempt from the BLOCKING license prompt, but it
+    must still get the same ``.env`` vendor-key fill as any other
+    command (unlike ``verify``, which is exempt from both) — otherwise a
+    repo-root ``.env`` would silently stop reaching the browser
+    keystore's ``os.environ`` fallback the moment ``ui`` became exempt.
+    ``--help`` avoids actually starting the uvicorn server (Click
+    dispatches ``--help`` on the subcommand only after the group
+    callback ``_root`` — where the .env fill lives — has already run)."""
+    _enable_dotenv(monkeypatch, _GEMINI)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        f"{_GEMINI}=fake-key-for-test-12345\n", encoding="utf-8"
+    )
+    runner = _runner()
+    try:
+        result = runner.invoke(app, ["ui", "--help"])
+        assert result.exit_code == 0, result.output
+        assert os.environ.get(_GEMINI) == "fake-key-for-test-12345"
+        assert "loaded 1 vendor key(s) from .env" in result.stderr
+    finally:
+        os.environ.pop(_GEMINI, None)
+
+
+# ---------------------------------------------------------------------------
+# FIX 4(d): litellm's OWN dotenv autoload defeats TOPOFUZZ_NO_DOTENV
+#
+# litellm's ``__init__.py`` runs ``dotenv.load_dotenv()`` unconditionally at
+# import time (LITELLM_MODE defaults to "DEV") — a SEPARATE loader from
+# ``_load_dotenv_if_present`` above that knows nothing about
+# TOPOFUZZ_NO_DOTENV. ``_harden_no_dotenv_against_litellm_autoload`` forces
+# the (sys.modules-cached) litellm import under our control and strips any
+# of the 4 vendor vars that appeared during it and were NOT present before.
+#
+# These tests never touch real litellm or the repo's real .env — they
+# inject a fake "import" trigger that simulates the leak deterministically.
+# ---------------------------------------------------------------------------
+
+
+def test_harden_no_dotenv_strips_vendor_key_litellm_autoload_introduced(
+    monkeypatch,
+) -> None:
+    from topofuzz.cli import _harden_no_dotenv_against_litellm_autoload
+
+    monkeypatch.setenv(_DOTENV_DISABLE_ENV, "1")
+    monkeypatch.delenv(_DEEPSEEK, raising=False)
+
+    def _fake_litellm_import() -> None:
+        # Simulates litellm's dotenv autoload silently filling in a
+        # vendor key from the repo's real .env.
+        os.environ[_DEEPSEEK] = "sk-leaked-from-dotenv-autoload"
+
+    _harden_no_dotenv_against_litellm_autoload(_fake_litellm_import)
+    assert _DEEPSEEK not in os.environ
+
+
+def test_harden_no_dotenv_preserves_preexisting_vendor_key(monkeypatch) -> None:
+    """A vendor var that was ALREADY present must never be deleted — only
+    vars litellm's autoload newly introduced are stripped. (Real litellm/
+    dotenv never overwrites an existing var — ``load_dotenv``'s default is
+    ``override=False`` — so the fake trigger overwriting the value here is
+    illustrative of the worst case, not a literal repro; the contract this
+    pins is "never delete a var that was present beforehand.")"""
+    from topofuzz.cli import _harden_no_dotenv_against_litellm_autoload
+
+    monkeypatch.setenv(_DOTENV_DISABLE_ENV, "1")
+    monkeypatch.setenv(_DEEPSEEK, "user-set-value")
+
+    def _fake_litellm_import() -> None:
+        os.environ[_DEEPSEEK] = "sk-leaked-from-dotenv-autoload"
+
+    _harden_no_dotenv_against_litellm_autoload(_fake_litellm_import)
+    assert _DEEPSEEK in os.environ
+
+
+def test_harden_no_dotenv_is_noop_when_flag_unset(monkeypatch) -> None:
+    """Do not change behavior when TOPOFUZZ_NO_DOTENV is unset — the
+    (fake) litellm import is never even triggered."""
+    from topofuzz.cli import _harden_no_dotenv_against_litellm_autoload
+
+    monkeypatch.delenv(_DOTENV_DISABLE_ENV, raising=False)
+    monkeypatch.delenv(_DEEPSEEK, raising=False)
+    called = {"n": 0}
+
+    def _fake_litellm_import() -> None:
+        called["n"] += 1
+        os.environ[_DEEPSEEK] = "sk-leaked-from-dotenv-autoload"
+
+    _harden_no_dotenv_against_litellm_autoload(_fake_litellm_import)
+    assert called["n"] == 0
+    assert _DEEPSEEK not in os.environ
+
+
+def test_harden_no_dotenv_default_trigger_is_real_litellm_import(
+    monkeypatch,
+) -> None:
+    """No injected trigger → falls back to a real ``import litellm``.
+
+    litellm is already an installed dependency in this environment; this
+    only exercises the no-op branch (no vendor var was newly introduced
+    by a real litellm import, because every real vendor var is already
+    present as a placeholder per the test-suite ground rules), so no
+    real key can leak."""
+    from topofuzz.cli import _harden_no_dotenv_against_litellm_autoload
+
+    monkeypatch.setenv(_DOTENV_DISABLE_ENV, "1")
+    # Every vendor var is already set (placeholder) — assert none of them
+    # get deleted (they were present beforehand, so they're never touched)
+    # and the call doesn't raise even without an injected trigger.
+    for name in (_GEMINI, _DEEPSEEK, _OPENAI, "ANTHROPIC_API_KEY"):
+        monkeypatch.setenv(name, "placeholder")
+    _harden_no_dotenv_against_litellm_autoload()
+    for name in (_GEMINI, _DEEPSEEK, _OPENAI, "ANTHROPIC_API_KEY"):
+        assert os.environ[name] == "placeholder"
+
+
 def test_verify_subcommand_skips_dotenv(tmp_path: Path, monkeypatch) -> None:
     """``verify`` is the auditor-facing minimal-side-effect trust anchor:
     it must NOT read ``.env`` or mutate the environment (the loader runs

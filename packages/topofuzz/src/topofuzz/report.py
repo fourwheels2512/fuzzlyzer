@@ -42,6 +42,12 @@ Banner conditionals (§11 line 304):
   ``cost_cap_hit``, ``interrupted``) are surfaced through the status
   line; the blueprint specifically names ``degraded`` as the banner
   trigger.
+* ``[INCOMPLETE — status: ...]`` (ROB-3) — emitted iff ``runs.status``
+  is outside the §A final-status set (``succeeded`` / ``degraded`` /
+  ``failed`` / ``cost_cap_hit`` / ``interrupted``). In practice this is
+  ``"running"`` — the DB default a row never leaves ``finalize`` isn't
+  called (process killed mid-run). A companion WARNING-level log line
+  (reaching stderr) fires alongside the banner.
 """
 
 from __future__ import annotations
@@ -105,6 +111,19 @@ class ReportDependencyError(RuntimeError):
 # HTML stays well under 1 MB even for 100k-eval runs; the manifest still
 # carries the full list for downstream tooling.
 _EVAL_ID_RENDER_CAP = 500
+
+# ROB-3: the §A statuses a run can be FINALIZED into — see
+# ``topofuzz.runner.RunWriter.finalize``'s docstring. A row that never
+# reaches ``finalize`` (process killed, crashed, kill -9) keeps the
+# ``runs.status`` DEFAULT of ``'running'`` forever. Any status outside
+# this set (in practice just ``"running"``, but treated as an open set
+# so a future/unknown status also trips the warning rather than
+# silently rendering as if the run were clean) means the run never
+# finished — the report must say so instead of looking like a normal,
+# complete result.
+_FINAL_RUN_STATUSES: frozenset[str] = frozenset(
+    {"succeeded", "degraded", "failed", "cost_cap_hit", "interrupted"}
+)
 
 
 def render_report(run_dir: Path) -> Path:
@@ -201,6 +220,19 @@ def render_report(run_dir: Path) -> Path:
         manifest.get("cli_args", {}).get("jury_of_3", False)
     )
     show_degraded = status == "degraded"
+    # ROB-3: a run that never reached a final status (typically
+    # ``status == "running"`` — the DB default, left in place by a
+    # process that was killed mid-run) rendered a normal-looking report
+    # with no indication the results are partial/incomplete. Surface a
+    # loud banner AND a stderr note so an operator can't mistake a
+    # truncated run for a clean one.
+    show_incomplete = status not in _FINAL_RUN_STATUSES
+    if show_incomplete:
+        _log.warning(
+            "warning: this run is incomplete (status=%s) — results may "
+            "be partial (run_dir=%s)",
+            status, run_dir,
+        )
     # Step 18 (§11 line 306): [REKOR-DEFERRED] gate. Lights iff a
     # ``.rekor-deferred`` marker is on disk AND there is no successful
     # LogEntry alongside it — a re-attest that succeeded should clear
@@ -275,6 +307,7 @@ def render_report(run_dir: Path) -> Path:
         show_dev_key=show_dev_key,
         show_jury=show_jury,
         show_degraded=show_degraded,
+        show_incomplete=show_incomplete,
         show_rekor_deferred=show_rekor_deferred,
         matrix_warning=matrix_warning,
         worstcase=worstcase_ctx,
@@ -305,6 +338,15 @@ def _read_json_capped(path: "Path", *, max_bytes: int = _MAX_JSON_BYTES) -> Any:
     existing call site that already handles ``json.JSONDecodeError``)
     when the file is over the cap, so existing try/except blocks pick
     up the new error without surface changes.
+
+    ROB-6: a malformed file used to bubble up the raw
+    ``json.JSONDecodeError`` message (e.g. "Expecting value: line 1
+    column 7") with no indication of WHICH file was unparseable — the
+    render_report call site had no wrapping to add it. Re-raising here
+    (as a plain ``ValueError``, still caught by every existing
+    ``except (..., json.JSONDecodeError, ValueError)`` clause since
+    ``ValueError`` is explicitly listed there) prefixes the file name
+    for every caller at once.
     """
     size = path.stat().st_size
     if size > max_bytes:
@@ -312,7 +354,10 @@ def _read_json_capped(path: "Path", *, max_bytes: int = _MAX_JSON_BYTES) -> Any:
             f"{path.name} is {size} bytes (> {max_bytes} cap); refusing "
             "to parse to bound RAM. Edit _MAX_JSON_BYTES if intentional."
         )
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{path.name} is not valid JSON: {e}") from e
 
 
 def _check_heavy_deps() -> None:

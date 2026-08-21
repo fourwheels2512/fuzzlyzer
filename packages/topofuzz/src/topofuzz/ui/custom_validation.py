@@ -57,6 +57,44 @@ MAX_RUBRIC_LEN = 2000
 # the validation layer.
 AGENT_ID_RE = re.compile(r"\A[a-z][a-z0-9_]{1,39}\Z")
 
+# SECURITY: character allow-list for the free-text fields (``label``,
+# ``domain_noun``, ``decision_verb``) that get spliced into GENERATED
+# PYTHON SOURCE via repr() (custom_templates.py's module docstring +
+# rubric template). Length bounds alone don't stop the content from
+# being dangerous: a label containing an embedded ``"""`` can terminate
+# a triple-quoted docstring early if repr()'s escaping is ever bypassed
+# or the template changes shape — today that's a DoS (the generated
+# fixture fails to compile), and it is only ONE stray edit away from
+# becoming a code-injection primitive. Reject the character classes
+# outright rather than relying solely on repr() as the last line of
+# defense. Double quotes and backslashes are the two characters repr()
+# must escape to keep a string literal well-formed; ASCII control chars
+# (and non-printable Unicode, checked separately below) have no
+# legitimate place in a workflow name/noun/verb either.
+_FREE_TEXT_FORBIDDEN_RE = re.compile(r'["\\\x00-\x1f\x7f]')
+
+
+def _check_free_text_chars(value: str, field_display_name: str) -> str | None:
+    """Return an error message if ``value`` contains a disallowed
+    character, else None.
+
+    Disallows double quotes, backslashes, ASCII control/DEL characters,
+    and (via ``str.isprintable()``) broader Unicode non-printables —
+    without rejecting the ASCII space, which ``isprintable()`` already
+    treats as printable.
+    """
+    if _FREE_TEXT_FORBIDDEN_RE.search(value):
+        return (
+            f"{field_display_name} may only contain letters, numbers, "
+            "spaces, and basic punctuation — not quotes or backslashes"
+        )
+    if not value.isprintable():
+        return (
+            f"{field_display_name} contains a non-printable character; "
+            "please use plain text"
+        )
+    return None
+
 
 class CustomFormError(ValueError):
     """One or more form fields failed validation.
@@ -125,6 +163,10 @@ def validate_custom_workflow_form(
         errors["label"] = (
             f"workflow name must be {MAX_LABEL_LEN} characters or fewer"
         )
+    else:
+        char_err = _check_free_text_chars(label, "workflow name")
+        if char_err:
+            errors["label"] = char_err
 
     domain_noun = (domain_noun or "").strip()
     if len(domain_noun) < MIN_DOMAIN_NOUN_LEN:
@@ -135,6 +177,10 @@ def validate_custom_workflow_form(
         errors["domain_noun"] = (
             f"domain noun must be {MAX_DOMAIN_NOUN_LEN} characters or fewer"
         )
+    else:
+        char_err = _check_free_text_chars(domain_noun, "domain noun")
+        if char_err:
+            errors["domain_noun"] = char_err
 
     decision_verb = (decision_verb or "").strip()
     if len(decision_verb) < MIN_DECISION_VERB_LEN:
@@ -145,6 +191,10 @@ def validate_custom_workflow_form(
         errors["decision_verb"] = (
             f"decision verb must be {MAX_DECISION_VERB_LEN} characters or fewer"
         )
+    else:
+        char_err = _check_free_text_chars(decision_verb, "decision verb")
+        if char_err:
+            errors["decision_verb"] = char_err
 
     rubric_paragraph = (rubric_paragraph or "").strip()
     if len(rubric_paragraph) < MIN_RUBRIC_LEN:

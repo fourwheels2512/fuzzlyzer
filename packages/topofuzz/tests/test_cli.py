@@ -1836,3 +1836,242 @@ def test_run_jury_models_recorded_in_manifest(tmp_path):
         "google_2": "google/gemini-2.5-flash",
         "google_3": "google/gemini-2.5-flash",
     }
+
+
+# ---------------------------------------------------------------------------
+# ROB-1 — stdout/stderr forced to UTF-8 (Windows cp1252-console crash fix)
+# ---------------------------------------------------------------------------
+
+
+def test_reconfigure_stdio_utf8_survives_legacy_codepage_stream(monkeypatch):
+    """ROB-1: on a default Windows console/pipe, stdout is opened with the
+    legacy codepage (commonly cp1252). ``--help`` text and ``scan``
+    banners contain non-ASCII characters (arrows, em dashes, section
+    signs); writing them to a cp1252 stream raises ``UnicodeEncodeError``
+    (reproduced below to prove the failure mode is real on this stream).
+    ``_reconfigure_stdio_utf8`` forces stdout/stderr to UTF-8 so the same
+    writes round-trip cleanly afterwards."""
+    import io
+    import sys
+
+    from topofuzz.cli import _reconfigure_stdio_utf8
+
+    cp1252_stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    cp1252_stderr = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", cp1252_stdout)
+    monkeypatch.setattr(sys, "stderr", cp1252_stderr)
+
+    # Sanity: prove the pre-fix failure mode is real on this stream
+    # before the helper has had a chance to run.
+    with pytest.raises(UnicodeEncodeError):
+        sys.stdout.write("→")  # "→"
+
+    _reconfigure_stdio_utf8()
+
+    assert sys.stdout.encoding.lower() == "utf-8"
+    assert sys.stderr.encoding.lower() == "utf-8"
+    # Round-trips cleanly now — no crash, no mojibake.
+    sys.stdout.write("→ — §")  # "→ — §"
+    sys.stderr.write("→ — §")
+
+
+def test_reconfigure_stdio_utf8_is_noop_without_reconfigure_method(monkeypatch):
+    """A stream lacking ``.reconfigure()`` (some test-harness stand-ins,
+    e.g. a bare ``io.StringIO``) must not crash the helper — guarded by
+    ``hasattr`` + try/except per the fix's design."""
+    import sys
+
+    from topofuzz.cli import _reconfigure_stdio_utf8
+
+    class _NoReconfigureStream:
+        def write(self, s):
+            return len(s)
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "stdout", _NoReconfigureStream())
+    monkeypatch.setattr(sys, "stderr", _NoReconfigureStream())
+    _reconfigure_stdio_utf8()  # must not raise
+
+
+def test_root_callback_reconfigures_stdio_before_dispatch():
+    """The reconfigure helper must fire at the earliest CLI entry point
+    — Click invokes the group callback (``_root``) before parsing a
+    subcommand's own args, so this covers ``topofuzz run --help`` /
+    ``topofuzz scan --help`` too, not just a subcommand's own body."""
+    import topofuzz.cli as cli_mod
+
+    calls = []
+    original = cli_mod._reconfigure_stdio_utf8
+
+    def _spy():
+        calls.append(1)
+        original()
+
+    try:
+        cli_mod._reconfigure_stdio_utf8 = _spy
+        result = CliRunner().invoke(app, ["run", "--help"])
+    finally:
+        cli_mod._reconfigure_stdio_utf8 = original
+    assert result.exit_code == 0, result.output
+    assert calls, "expected _reconfigure_stdio_utf8 to run for `run --help`"
+
+
+# ---------------------------------------------------------------------------
+# ROB-2 — bad `--out` path no longer leaks a raw OSError traceback
+# ---------------------------------------------------------------------------
+
+
+def test_run_bad_out_path_parent_is_file_exits_clean(tmp_path):
+    """ROB-2: when ``--out``'s target has an existing FILE in the
+    position of a parent directory component (portable across OSes,
+    unlike a bad-drive-letter repro), ``plan.run_dir.mkdir`` used to
+    raise a raw ``FileExistsError`` / ``NotADirectoryError`` straight out
+    of ``write_manifest`` — verified against the pre-fix code: exit code
+    1 with ``result.exception`` set to the raw OSError. Post-fix, the
+    CLI must catch it and print a clean, actionable one-liner with exit
+    code 2 — no raw exception escaping to the caller."""
+    pytest.importorskip("langgraph")
+
+    fixture = tmp_path / "fx.py"
+    fixture.write_text(
+        "from langgraph.graph import END, START, StateGraph\n"
+        "from typing import TypedDict\n"
+        "from topofuzz.ir import LLMConfig\n"
+        "\n"
+        "class _S(TypedDict, total=False):\n"
+        "    x: str\n"
+        "\n"
+        "def _a(s): return s\n"
+        "\n"
+        "def build_graph():\n"
+        "    g = StateGraph(_S)\n"
+        "    g.add_node('a', _a)\n"
+        "    g.add_edge(START, 'a')\n"
+        "    g.add_edge('a', END)\n"
+        "    return g.compile()\n"
+        "\n"
+        "LLM_CONFIGS = {\n"
+        "    'a': LLMConfig(model='google/gemini-2.5-pro'),\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    eval_path = tmp_path / "e.jsonl"
+    eval_path.write_text(
+        '{"id": "e1", "input": "x", "ground_truth_decision": "approve"}\n',
+        encoding="utf-8",
+    )
+
+    # A FILE (not a directory) sits where `--out`'s path needs a parent
+    # directory: `<not_a_dir>/child/<run_id>`'s `mkdir(parents=True)`
+    # then fails because `not_a_dir` cannot be traversed into.
+    not_a_dir = tmp_path / "not_a_dir"
+    not_a_dir.write_text("x", encoding="utf-8")
+    bad_out = not_a_dir / "child"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            f"{fixture}:build_graph",
+            "--eval", str(eval_path),
+            "--n", "1",
+            "--variants", "1",
+            "--out", str(bad_out),
+            "--simulate",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 2, (
+        f"expected clean exit 2; got {result.exit_code} "
+        f"exception={result.exception!r}\n{result.output}"
+    )
+    assert not isinstance(result.exception, OSError), (
+        f"a raw OSError must not escape the CLI — got {result.exception!r}"
+    )
+    assert "could not create output directory" in result.output
+
+
+# ---------------------------------------------------------------------------
+# ROB-4 — `run` surfaces the real failure reason, not just "Status: failed"
+# ---------------------------------------------------------------------------
+
+
+def test_run_surfaces_failure_reason_on_judge_keyerror(tmp_path, monkeypatch):
+    """ROB-4: a misconfigured run (eval rows missing the
+    ``ground_truth_decision`` column the packaged lending rubric
+    requires) makes the judge's prompt renderer raise ``KeyError`` on
+    every cell. Pre-fix, the CLI printed only ``Cells: 1 ok / 1
+    completed`` then ``Status: failed`` — the actual reason was visible
+    ONLY by opening ``run.sqlite``'s ``judge_results.failure_reason``
+    column by hand. Post-fix, a ``Failure: ...`` line surfaces the same
+    reason on stdout."""
+    pytest.importorskip("langgraph")
+
+    fixture = tmp_path / "fx.py"
+    fixture.write_text(
+        "from langgraph.graph import END, START, StateGraph\n"
+        "from typing import TypedDict\n"
+        "from topofuzz.ir import LLMConfig\n"
+        "\n"
+        "class _S(TypedDict, total=False):\n"
+        "    x: str\n"
+        "\n"
+        "def _a(s): return s\n"
+        "\n"
+        "def build_graph():\n"
+        "    g = StateGraph(_S)\n"
+        "    g.add_node('a', _a)\n"
+        "    g.add_edge(START, 'a')\n"
+        "    g.add_edge('a', END)\n"
+        "    return g.compile()\n"
+        "\n"
+        "LLM_CONFIGS = {\n"
+        "    'a': LLMConfig(model='google/gemini-2.5-pro'),\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    eval_path = tmp_path / "e.jsonl"
+    # Deliberately missing "ground_truth_decision" — the packaged
+    # lending_judge.txt rubric's render_prompt raises KeyError on this,
+    # deterministically, with no real LLM call needed to reproduce it.
+    eval_path.write_text('{"id": "e1", "input": "x"}\n', encoding="utf-8")
+
+    async def fake_llm(**kwargs):
+        return {
+            "choices": [{"message": {"content": "ok"}}],
+            "model": kwargs["model"],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+
+    from topofuzz import orchestrator as orch_mod
+
+    real_execute_run = orch_mod.execute_run
+
+    async def execute_run_with_fake(plan, **kwargs):
+        kwargs.setdefault("llm_callable", fake_llm)
+        return await real_execute_run(plan, **kwargs)
+
+    monkeypatch.setattr(orch_mod, "execute_run", execute_run_with_fake)
+
+    out_dir = tmp_path / "runs"
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            f"{fixture}:build_graph",
+            "--eval", str(eval_path),
+            "--n", "1",
+            "--variants", "1",
+            "--out", str(out_dir),
+            "--no-cache",
+            "--yes",
+        ],
+    )
+
+    assert "Status: failed" in result.output, result.output
+    assert "Cells: 1 ok / 1 completed" in result.output, result.output
+    assert "Failure:" in result.output, result.output
+    assert "KeyError" in result.output, result.output
+    assert "ground_truth_decision" in result.output, result.output

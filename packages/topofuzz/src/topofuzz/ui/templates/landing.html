@@ -57,6 +57,22 @@
   </p>
 </section>
 
+{% if not license_accepted %}
+{# UX-1: one-time in-browser license click-through. Nothing else on
+   this page (key entry, "Start a test") is reachable until this is
+   accepted — the server-side gates on GET/POST /setup enforce the
+   same rule even if a stale page is resubmitted. #}
+<section class="card mt-32">
+  <h3 style="margin-top: 0;">Before you start — license terms</h3>
+  <p class="field-hint" style="white-space: pre-line;">{{ license_summary }}</p>
+  <form method="post" action="/accept-license">
+    <div class="btn-row" style="margin-top: 14px;">
+      <button type="submit" class="btn large">I accept these terms</button>
+    </div>
+  </form>
+</section>
+{% else %}
+
 {# Required vendor (Google) — always shown, takes the visual top slot. #}
 {% set required_row = vendor_rows | selectattr("required") | first %}
 {% set optional_rows = vendor_rows | rejectattr("required") | list %}
@@ -140,5 +156,6 @@
 <p class="muted" style="text-align: center; margin-top: 12px;">
   Save your Google AI key above to turn this on.
 </p>
+{% endif %}
 {% endif %}
 {% endblock %}

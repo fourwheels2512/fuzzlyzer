@@ -477,57 +477,25 @@ def _truncate_response(text: str | None) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def run_ablation_pass(
-    run_dir: Path | str,
-    *,
-    max_cost_usd: float | None = None,
-    llm_callable: Any = None,
-    fixture_override: str | None = None,
-    dry_run: bool = False,
-) -> AblationSummary:
-    """Run the counterfactual ablation pass on a source run.
+def validate_ablation_source(run_dir: Path | str) -> dict:
+    """Cheap, side-effect-free validation of a source run for ablation.
 
-    See the module docstring for the locked design contract. Persists
-    ``<run_dir>/ablation.json`` as a sidecar mirroring the confirm-pass
-    sidecar pattern.
+    Checks manifest.json exists/parses, the source ran ``--jury-of-3``,
+    and that no incompatible custom-builder / jury-kwargs fields are
+    present — everything :func:`run_ablation_pass` needs to refuse
+    BEFORE it does any real work. No LLM calls and no ``run.sqlite``
+    reads happen here, so it is safe for the CLI to call this ahead of
+    the interactive spend-confirmation prompt (ROB-5): an invalid or
+    missing source run then errors out immediately instead of only
+    AFTER the operator has answered "bills real LLM calls? [y/N]".
 
-    Args:
-        run_dir: An existing ``topofuzz run`` directory whose manifest
-            says ``cli_args.jury_of_3 == True``.
-        max_cost_usd: Soft-warn at 80 %, hard-stop at 100 %. ``None`` is
-            uncapped. On hard-stop the sidecar lands with
-            ``partial: true``.
-        llm_callable: Test injection point — async, services the
-            terminal-node re-execution only. The jury vendors are NOT
-            auto-wired with this callable (their SingleJudge wrappers
-            invoke their callable synchronously, so an async callable
-            explodes at ``judge.score()`` time). For controlled jury
-            verdicts in tests, construct a custom judge and call
-            :func:`_ablate_async` directly, or pass ``dry_run=True``
-            below.
-        fixture_override: Path that wins over ``cli_args.fixture`` when
-            the fixture has moved on disk since the source run. Same
-            escape hatch the confirm pass exposes.
-        dry_run: When True, every terminal LLM call AND every judge LLM
-            call short-circuits. The terminal returns ``[DRY-RUN]``
-            text; each vendor's SingleJudge returns ``ContinuousScore
-            (0.5)`` — and crucially JuryJudge's F3 majority-vote
-            aggregator binarises 0.5 ``>=`` 0.5 to approve, so all
-            three vendors approve, ``approve_count * 2 > total`` →
-            jury verdict is ``ContinuousScore(value=1.0)``, NOT 0.5
-            (Pass-1 Fuzzer BLOCKER B3 fix — the prior docstring
-            claimed 0.5 here, which the F3 aggregator contract
-            falsifies). Therefore under ``--dry-run`` every
-            ``new_v_score`` equals 1.0 (APPROVE) and ``flip_closed`` is
-            purely a function of canonical's binarised verdict.
-            *Attribution percentages under dry-run are not meaningful
-            and the CLI prints a banner saying so.*
+    Returns the parsed manifest dict (reused by :func:`run_ablation_pass`
+    so the source run is not re-read).
 
     Raises:
-        AblationError: manifest / run.sqlite missing or malformed; the
-            source run was not jury-of-3; the fixture can't be loaded;
-            the manifest's canonical hash isn't in the regenerated
-            variant set.
+        AblationError: manifest missing/malformed; ``run_id`` missing;
+            source run was not jury-of-3; custom prompt_builder or
+            jury-construction fields present.
     """
     run_dir = Path(run_dir)
     manifest = _load_manifest(run_dir)
@@ -588,6 +556,65 @@ def run_ablation_pass(
             "the rebuilt jury would not match the source's. v0.5.1 BACKLOG: "
             "plumb these knobs through _build_jury before lifting the gate."
         )
+    return manifest
+
+
+def run_ablation_pass(
+    run_dir: Path | str,
+    *,
+    max_cost_usd: float | None = None,
+    llm_callable: Any = None,
+    fixture_override: str | None = None,
+    dry_run: bool = False,
+) -> AblationSummary:
+    """Run the counterfactual ablation pass on a source run.
+
+    See the module docstring for the locked design contract. Persists
+    ``<run_dir>/ablation.json`` as a sidecar mirroring the confirm-pass
+    sidecar pattern.
+
+    Args:
+        run_dir: An existing ``topofuzz run`` directory whose manifest
+            says ``cli_args.jury_of_3 == True``.
+        max_cost_usd: Soft-warn at 80 %, hard-stop at 100 %. ``None`` is
+            uncapped. On hard-stop the sidecar lands with
+            ``partial: true``.
+        llm_callable: Test injection point — async, services the
+            terminal-node re-execution only. The jury vendors are NOT
+            auto-wired with this callable (their SingleJudge wrappers
+            invoke their callable synchronously, so an async callable
+            explodes at ``judge.score()`` time). For controlled jury
+            verdicts in tests, construct a custom judge and call
+            :func:`_ablate_async` directly, or pass ``dry_run=True``
+            below.
+        fixture_override: Path that wins over ``cli_args.fixture`` when
+            the fixture has moved on disk since the source run. Same
+            escape hatch the confirm pass exposes.
+        dry_run: When True, every terminal LLM call AND every judge LLM
+            call short-circuits. The terminal returns ``[DRY-RUN]``
+            text; each vendor's SingleJudge returns ``ContinuousScore
+            (0.5)`` — and crucially JuryJudge's F3 majority-vote
+            aggregator binarises 0.5 ``>=`` 0.5 to approve, so all
+            three vendors approve, ``approve_count * 2 > total`` →
+            jury verdict is ``ContinuousScore(value=1.0)``, NOT 0.5
+            (Pass-1 Fuzzer BLOCKER B3 fix — the prior docstring
+            claimed 0.5 here, which the F3 aggregator contract
+            falsifies). Therefore under ``--dry-run`` every
+            ``new_v_score`` equals 1.0 (APPROVE) and ``flip_closed`` is
+            purely a function of canonical's binarised verdict.
+            *Attribution percentages under dry-run are not meaningful
+            and the CLI prints a banner saying so.*
+
+    Raises:
+        AblationError: manifest / run.sqlite missing or malformed; the
+            source run was not jury-of-3; the fixture can't be loaded;
+            the manifest's canonical hash isn't in the regenerated
+            variant set.
+    """
+    run_dir = Path(run_dir)
+    manifest = validate_ablation_source(run_dir)
+    run_id = manifest.get("run_id")
+    cli_args = manifest.get("cli_args") or {}
 
     triples = find_all_flipping_triples(run_dir)
     if not triples:

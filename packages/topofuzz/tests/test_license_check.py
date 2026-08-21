@@ -563,3 +563,39 @@ def test_gate_fires_when_autouse_acceptance_removed(
     assert result.exit_code == LICENSE_REFUSED_EXIT_CODE
     combined = _combined_output(result)
     assert "license acceptance required" in combined
+
+
+# ---------------------------------------------------------------------------
+# UX-1: `topofuzz ui` must never die at the CLI gate before the server
+# starts. A double-click / .bat / scheduled-task launch has no TTY — pre-fix,
+# `ui` was NOT in _LICENSE_EXEMPT_COMMANDS, so a fresh (unaccepted) machine
+# hit the same non-interactive refusal as `scan` above and exited 2 before
+# uvicorn ever bound a port. Enforcement for `ui` moves into the browser
+# (see test_ui_smoke.py's TestLicenseAcceptGate).
+# ---------------------------------------------------------------------------
+
+
+def test_ui_command_is_license_exempt(fake_home: Path) -> None:
+    """``topofuzz ui`` is in ``_LICENSE_EXEMPT_COMMANDS`` (UX-1)."""
+    assert "ui" in _LICENSE_EXEMPT_COMMANDS
+
+
+def test_ui_help_works_without_prior_acceptance(fake_home: Path) -> None:
+    """Regression guard for the double-click/no-TTY hang.
+
+    We can't spin up a real uvicorn server in a unit test, but ``--help``
+    proves the point: Click evaluates the group callback (``_root``, where
+    the gate lives) before it dispatches ``--help`` to the ``ui``
+    subcommand (see the ROB-1 comment in ``cli.py``). Pre-fix, `ui` was
+    not exempt, so this died with exit code 2 and "license acceptance
+    required" before ever reaching ui's own help text — proven by running
+    this exact assertion against pre-fix HEAD.
+    """
+    runner = CliRunner()
+    result = runner.invoke(app, ["ui", "--help"])
+    combined = _combined_output(result)
+    assert "license acceptance required" not in combined
+    assert result.exit_code == 0
+    # Exempt means never prompted AND never force-wrote an acceptance —
+    # the browser accept-gate (ui/app.py) is the only place that writes.
+    assert not acceptance_path().exists()

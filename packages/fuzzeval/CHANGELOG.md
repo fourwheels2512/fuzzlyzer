@@ -10,18 +10,26 @@ placeholder version and are not separately enumerated.
 
 ## [Unreleased]
 
+No unreleased changes yet.
+
+## [0.2.0] — 2026-05-16
+
+Ships alongside `topofuzz` v1.0.0.
+
 ### Changed
 
 - **License change from Apache 2.0 to Business Source License 1.1
-  (BUSL-1.1), effective v0.2.0 (ships alongside topofuzz v1.0.0).**
-  Same terms as topofuzz: non-production / academic / small-scale
-  commercial use (under USD $100,000 annual gross revenue) remain
-  permitted without charge; production-scale use requires a commercial
-  license — contact `kiran@modelbrew.ai`. Each release
+  (BUSL-1.1).** Same terms as topofuzz: non-production / academic /
+  small-scale commercial use (under USD $100,000 annual gross revenue)
+  remain permitted without charge; production-scale use requires a
+  commercial license — contact `kiran@modelbrew.ai`. Each release
   auto-converts to Apache 2.0 four years after publication. Full
   terms in `LICENSE`. Version 0.1.0 was released under the Apache
   License, Version 2.0, and remains under that license as published —
   the license change is not retroactive.
+- **Consumer pin bumped to `fuzzeval>=0.2,<0.3`.** Supersedes the
+  0.1.x line's `>=0.1,<0.2`; `topofuzz` v1.0.0's base install depends
+  on this range.
 
 ## [0.1.0] — 2026-05-13
 
@@ -30,7 +38,7 @@ verify-path substrate and the LLM-judge/statistics/attestation
 primitive layer.
 
 The 0.1.x public API is the contract defined in
-[BLUEPRINT_v5plus.md §17a](https://github.com/kirannayudu/topofuzz/blob/main/BLUEPRINT_v5plus.md).
+[BLUEPRINT_v5plus.md §17a](https://github.com/fourwheels2512/fuzzlyzer/blob/main/BLUEPRINT_v5plus.md).
 Consumers should depend on `fuzzeval>=0.1,<0.2`; the 0.2 line may shift
 signatures.
 
@@ -85,4 +93,5 @@ signatures.
 - Python 3.11 / 3.12 / 3.13 / 3.14 declared as supported; macOS, Linux,
   and Windows declared in classifiers.
 
-[0.1.0]: https://github.com/kirannayudu/topofuzz/releases/tag/fuzzeval-v0.1.0
+[0.2.0]: https://github.com/fourwheels2512/fuzzlyzer/releases/tag/fuzzeval-v0.2.0
+[0.1.0]: https://github.com/fourwheels2512/fuzzlyzer/releases/tag/fuzzeval-v0.1.0

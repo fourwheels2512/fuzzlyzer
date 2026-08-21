@@ -208,6 +208,68 @@ class TestLabelDomainVerbLengths:
             validate_custom_workflow_form(**_ok_form(decision_verb="x"))
 
 
+class TestFreeTextCharacterAllowList:
+    """SECURITY FIX 3: ``label`` / ``domain_noun`` / ``decision_verb``
+    are spliced into generated Python source via ``repr()``
+    (``custom_templates.py``). Length bounds alone don't stop a
+    quote/backslash/control-char foot-gun — the validator must reject
+    those characters outright."""
+
+    def test_label_with_triple_quote_rejected(self) -> None:
+        with pytest.raises(CustomFormError) as ctx:
+            validate_custom_workflow_form(**_ok_form(label='a"""b'))
+        assert "label" in ctx.value.errors
+
+    def test_label_with_backslash_rejected(self) -> None:
+        with pytest.raises(CustomFormError) as ctx:
+            validate_custom_workflow_form(**_ok_form(label="a\\b"))
+        assert "label" in ctx.value.errors
+
+    def test_label_with_control_char_rejected(self) -> None:
+        with pytest.raises(CustomFormError) as ctx:
+            validate_custom_workflow_form(**_ok_form(label="a\x07b"))
+        assert "label" in ctx.value.errors
+
+    def test_domain_noun_with_quote_rejected(self) -> None:
+        with pytest.raises(CustomFormError) as ctx:
+            validate_custom_workflow_form(**_ok_form(domain_noun='a"b'))
+        assert "domain_noun" in ctx.value.errors
+
+    def test_decision_verb_with_backslash_rejected(self) -> None:
+        with pytest.raises(CustomFormError) as ctx:
+            validate_custom_workflow_form(
+                **_ok_form(decision_verb="a\\b")
+            )
+        assert "decision_verb" in ctx.value.errors
+
+    def test_normal_label_still_passes(self) -> None:
+        cw = validate_custom_workflow_form(
+            **_ok_form(label="My pipeline - v2 (2026)")
+        )
+        assert cw.label == "My pipeline - v2 (2026)"
+
+    def test_normal_domain_and_verb_still_pass(self) -> None:
+        cw = validate_custom_workflow_form(
+            **_ok_form(
+                domain_noun="loan application",
+                decision_verb="approve / deny",
+            )
+        )
+        assert cw.domain_noun == "loan application"
+        assert cw.decision_verb == "approve / deny"
+
+    def test_validated_workflow_fixture_still_compiles(self) -> None:
+        """Integration: a workflow that passed validation renders a
+        ``fixture.py`` that still compiles. Guards against the
+        allow-list being so strict it silently changes what a NORMAL
+        submission produces."""
+        from topofuzz.ui.custom_templates import render_fixture_py
+
+        cw = validate_custom_workflow_form(**_ok_form())
+        src = render_fixture_py(cw)
+        compile(src, "<custom-fixture>", "exec")
+
+
 class TestRubricLength:
     def test_short_rubric_rejected(self) -> None:
         with pytest.raises(CustomFormError):

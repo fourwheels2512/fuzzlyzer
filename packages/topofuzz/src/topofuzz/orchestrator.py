@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -182,6 +183,20 @@ class RunResult:
     metrics_exit_code: int = 0
 
 
+class RunDirError(OSError):
+    """``write_manifest`` could not create ``plan.run_dir``.
+
+    Wraps whatever :class:`OSError` ``Path.mkdir`` raised — a bad drive
+    letter (Windows ``WinError 3``), a parent path component that is an
+    existing file rather than a directory (``WinError 183`` /
+    ``NotADirectoryError``), permission denied, etc. ``exist_ok=True``
+    already tolerates "directory already exists"; this type covers
+    every OTHER failure mode. The CLI's ``run`` command catches this
+    specific type and prints a one-line friendly message instead of
+    letting the raw traceback reach the terminal (ROB-2).
+    """
+
+
 # ---------------------------------------------------------------------------
 # Manifest
 # ---------------------------------------------------------------------------
@@ -283,8 +298,16 @@ def write_manifest(plan: RunPlan, *, cli_args: dict[str, Any]) -> Path:
     * ``agent_vendors`` — sorted unique list of LiteLLM provider
       prefixes derived from the topology's per-node ``llm_config.model``.
       Used by the §8 ``judge_independence`` overlap computation.
+
+    Raises:
+        RunDirError: ``plan.run_dir`` could not be created (bad drive,
+            a parent path component that is an existing file,
+            permission denied, etc.) — see :class:`RunDirError`.
     """
-    plan.run_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        plan.run_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise RunDirError(str(e)) from e
     payload = {
         "run_id": plan.run_id,
         "topology_canonical_hash": plan.topology.canonical_hash(),
@@ -352,6 +375,62 @@ def write_manifest(plan: RunPlan, *, cli_args: dict[str, Any]) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+def read_failure_summary(run_dir: Path, *, run_id: str | None = None) -> str | None:
+    """Read one short, human-readable failure reason from ``run.sqlite``.
+
+    ROB-4: a misconfigured run (e.g. a judge rubric ``KeyError`` on a
+    missing eval column) used to print only ``Cells: N ok / M completed``
+    and ``Status: failed`` — the actual WHY was persisted exclusively in
+    ``judge_results.failure_reason`` / ``cells.error``, never on stdout,
+    forcing the operator to open the sqlite file by hand. This picks the
+    first non-null reason it finds (cell-level ``error`` — usually the
+    underlying LLM/pipeline exception — takes priority over judge-level
+    ``failure_reason``, since a cell error is closer to the root cause)
+    and returns one formatted line.
+
+    Best-effort: returns ``None`` (never raises) when ``run.sqlite`` is
+    missing/corrupt, the tables aren't there yet, or every cell/judgment
+    succeeded. ``run_id`` narrows the query when supplied (all v0.5 run
+    dirs hold exactly one run per file, so it's usually unnecessary).
+    """
+    sqlite_path = Path(run_dir) / "run.sqlite"
+    if not sqlite_path.exists():
+        return None
+    try:
+        db = sqlite3.connect(str(sqlite_path))
+        try:
+            if run_id is not None:
+                cell_row = db.execute(
+                    "SELECT error FROM cells "
+                    "WHERE run_id = ? AND error IS NOT NULL LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+            else:
+                cell_row = db.execute(
+                    "SELECT error FROM cells WHERE error IS NOT NULL LIMIT 1"
+                ).fetchone()
+            if cell_row and cell_row[0]:
+                return f"cell error: {cell_row[0]}"
+            if run_id is not None:
+                judge_row = db.execute(
+                    "SELECT failure_reason FROM judge_results "
+                    "WHERE run_id = ? AND failure_reason IS NOT NULL LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+            else:
+                judge_row = db.execute(
+                    "SELECT failure_reason FROM judge_results "
+                    "WHERE failure_reason IS NOT NULL LIMIT 1"
+                ).fetchone()
+            if judge_row and judge_row[0]:
+                return f"judge failure: {judge_row[0]}"
+        finally:
+            db.close()
+    except sqlite3.DatabaseError:
+        return None
+    return None
 
 
 # ---------------------------------------------------------------------------

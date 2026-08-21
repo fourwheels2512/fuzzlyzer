@@ -1,14 +1,16 @@
 # topofuzz gallery
 
-> ⚠️ **UNDER RE-EVALUATION (2026-05-14).** A measurement bug was found
-> and fixed: the runner judged the last-*walked* node instead of the
-> declared verdict node, so `order_swap` permutations that landed a
-> non-verdict agent last fabricated verdict-flips. With the bug fixed,
-> both gallery entries' headline `verdict_flip_rate` collapses to `0`
-> (degenerate) — the "fragility" they appeared to show was the artifact.
-> **The numbers below predate the fix and must not be quoted.** The
-> gallery's headline framing is being re-decided — see
-> `.planning/verdict-flip-rootcause/` and the step-20a session handoff.
+> **Note on measurement history.** An early runner bug — judging the
+> last-*walked* node instead of the declared verdict node — inflated
+> the apparent `order_swap` fragility reported by two early entries
+> (`langgraph-supervisor-research`, `langgraph-lending-4role`). It was
+> fixed via the first-class `verdict_node` IR field (step 20a); each
+> entry's own README documents that entry's current re-measured status.
+> The later `langgraph-adversarial-relay` fixture was purpose-built to
+> demonstrate a genuine, non-degenerate order-induced flip under the
+> corrected metric. Entries on this page are illustrative, small-N runs
+> with wide confidence intervals — see **Caveats and known limitations**
+> below before quoting any number.
 
 Pre-built topofuzz runs against well-known LangGraph multi-agent
 patterns. Each gallery entry is a complete, reproducible artifact: the
@@ -29,14 +31,16 @@ small-N run (`--n 8 --variants 4`). Stable topologies are excluded — a
 "this is stable" entry in a "examples where ordering matters" gallery
 is a credibility loss.
 
-This release ships 2 of 3 candidate fixtures. The third was discarded
-on the gate; its source code remains in
-[`langgraph-content-moderation/`](langgraph-content-moderation/) as a
-transparency artifact (read its README to understand why).
+This release curates 3 of the original candidate fixtures with their
+own entry README + headline table below. Several newer fixtures have
+since been added to the directory (see the "Additional fixtures" table
+below) but do not yet have a curated entry README with a committed,
+narrated run — check each one's own directory for its current state
+before quoting a number.
 
 ## Cross-vendor scope (v0.5 vs v0.6)
 
-The current release ships **3 LangGraph entries** because topofuzz
+The gallery today ships **LangGraph-only entries** because topofuzz
 today only has a LangGraph IR adapter
 (`packages/topofuzz/src/topofuzz/adapter.py:from_langgraph`). The
 **canonical final form is a 1 LangGraph + 1 CrewAI + 1 Autogen
@@ -46,25 +50,57 @@ v0.6. See `packages/topofuzz/BACKLOG.md` § "v0.6 — cross-vendor gallery
 
 ## Entries
 
+Curated entries below each have their own entry README with a
+"Headline metrics" section — read the entry README for the
+current, authoritative status of its numbers (two of the three were
+affected by the measurement-history note above).
+
 | Slug | Topology | Domain | Verdict-flip rate | Status |
 |------|----------|--------|-------------------|--------|
-| [`langgraph-supervisor-research/`](langgraph-supervisor-research/) | Supervisor + 3 workers (`add_conditional_edges` + path_map) | Article publication-readiness | **0.250** [CI 0.105–0.368] | Shipped |
-| [`langgraph-lending-4role/`](langgraph-lending-4role/) | 4-agent linear chain | Loan underwriting | **0.300** [CI 0.100–0.500] | Shipped |
+| [`langgraph-supervisor-research/`](langgraph-supervisor-research/) | Supervisor + 3 workers (`add_conditional_edges` + path_map) | Article publication-readiness | **0.250** [CI 0.105–0.368] (original measurement — see entry README for current re-measured status) | Shipped |
+| [`langgraph-lending-4role/`](langgraph-lending-4role/) | 4-agent linear chain | Loan underwriting | **0.300** [CI 0.100–0.500] (original measurement — see entry README for current re-measured status) | Shipped |
 | [`langgraph-content-moderation/`](langgraph-content-moderation/) | 4-agent linear chain | UGC moderation | 0.00 (degenerate) | Discarded — see entry README |
 
-### Published rendered reports
+### Additional fixtures in this directory
 
-Once the gallery is hosted on GitHub Pages (see `docs/gallery-build.md`
-for the republish ritual and `gh-pages` branch contents), the rendered
-Variant D `report.html` for each shipped entry is reachable at:
+These fixtures live under `examples/gallery/` but do not (yet) have a
+curated entry README. Where a fixture has a committed `runs/`
+directory with `report.json`, the point estimate below was read
+directly from that committed file (range shown if multiple runs are
+committed); wide CIs apply just as they do above. Fixtures with no
+committed `runs/` directory are fixture-only — no verified measurement
+exists in this directory for them yet.
+
+| Slug | Topology / domain | Verdict-flip rate | Status |
+|------|--------------------|--------------------|--------|
+| [`langgraph-adversarial-relay/`](langgraph-adversarial-relay/) | 4-agent skeptic-in-the-middle loan chain — built specifically to reproduce a genuine, non-degenerate order-induced flip | point **0.21–0.32** across 3 committed runs, CIs wide (one crosses 0) — see `runs/*/report.json` | Runs committed; no curated entry README yet |
+| [`insurance-claim-triage/`](insurance-claim-triage/) | 4-agent skeptic-in-the-middle, health-insurance claims (same mechanism as adversarial-relay) | Fixture only — not yet measured in this directory | No committed runs |
+| [`langgraph-admissions-4role/`](langgraph-admissions-4role/) | 4-agent pipeline — university admissions (EU AI Act high-risk) | Fixture only — not yet measured in this directory | No committed runs |
+| [`langgraph-benefits-4role/`](langgraph-benefits-4role/) | 4-agent pipeline — public-benefits eligibility (EU AI Act high-risk) | Fixture only — not yet measured in this directory | No committed runs |
+| [`langgraph-hiring-4role/`](langgraph-hiring-4role/) | 4-agent pipeline — hiring decisions (EU AI Act high-risk) | Fixture only — not yet measured in this directory | No committed runs |
+| [`langgraph-insurance-4role/`](langgraph-insurance-4role/) | 4-agent pipeline — life-insurance underwriting (EU AI Act high-risk) | Fixture only — not yet measured in this directory | No committed runs |
+| [`risa-priorauth-4agent/`](risa-priorauth-4agent/) | 4-agent pipeline — insurance prior-authorization (archetype reconstruction) | Fixture only — not yet measured in this directory | No committed runs |
+| [`td-agentic-mortgage/`](td-agentic-mortgage/) | 4-agent pipeline — agentic mortgage document review (archetype reconstruction) | Fixture only — not yet measured in this directory | No committed runs |
+
+"Not yet measured in this directory" means no `runs/` subdirectory with
+a committed report is checked into this path — it does not assert that
+the fixture has never been run elsewhere (some of these fixtures have
+been exercised with real LLM calls as part of paper/patent work tracked
+outside `examples/gallery/`).
+
+### Published rendered reports (not yet live)
+
+The repo is not yet public and GitHub Pages is not yet configured, so
+the URLs below are **not live**. They document the intended path once
+the gallery is published (see `docs/gallery-build.md` for the
+republish ritual, `gh-pages` branch contents, and the "Activation"
+section for what flips them on):
 
 * `https://fourwheels2512.github.io/topofuzz/gallery/langgraph-supervisor-research/report.html`
 * `https://fourwheels2512.github.io/topofuzz/gallery/langgraph-lending-4role/report.html`
 
-These URLs go live only after the repo is made public AND GitHub Pages
-is configured to serve the `gh-pages` branch — see `docs/gallery-build.md`
-§ "Activation". Until then, render the reports locally from the
-committed `runs/<run_id>/report.html` files.
+Until the repo is public and Pages is activated, render the reports
+locally from the committed `runs/<run_id>/report.html` files.
 
 ## Reproducing a gallery run
 

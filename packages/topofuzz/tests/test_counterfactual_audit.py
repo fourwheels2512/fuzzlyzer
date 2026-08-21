@@ -57,6 +57,7 @@ from topofuzz.counterfactual_audit import (  # noqa: E402
     _write_audit_sidecar,
     read_audit_sidecar,
     run_audit_pass,
+    validate_audit_source,
 )
 from topofuzz.ir import Edge, LLMConfig, Node, Topology  # noqa: E402
 
@@ -505,6 +506,33 @@ def test_run_audit_rejects_jury_max_tokens_field(tmp_path):
     )
     with pytest.raises(AuditError, match="jury-construction"):
         run_audit_pass(run_dir)
+
+
+def test_run_audit_rejects_missing_manifest(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(AuditError, match="manifest.json missing"):
+        run_audit_pass(empty)
+
+
+def test_validate_audit_source_rejects_missing_manifest(tmp_path):
+    """ROB-5: :func:`validate_audit_source` is the cheap, side-effect-
+    free precondition check :func:`run_audit_pass` runs first — it must
+    raise the SAME ``AuditError`` on a missing manifest so the CLI can
+    call it standalone, before the spend-confirmation prompt, without
+    duplicating validation logic."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(AuditError, match="manifest.json missing"):
+        validate_audit_source(empty)
+
+
+def test_validate_audit_source_accepts_valid_jury_manifest(tmp_path):
+    """The happy path returns the parsed manifest dict (reused by
+    run_audit_pass so the source run isn't read twice)."""
+    run_dir = _write_manifest_run(tmp_path, hashes=["a" * 64])
+    manifest = validate_audit_source(run_dir)
+    assert manifest["cli_args"]["jury_of_3"] is True
 
 
 def test_run_audit_rejects_unknown_dim_before_llm(tmp_path):

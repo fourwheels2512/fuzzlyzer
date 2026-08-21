@@ -864,6 +864,34 @@ def test_cli_confirm_bad_run_dir_exits_friendly():
     assert "not a directory" in result.output.lower()
 
 
+def test_cli_confirm_missing_manifest_errors_before_spend_prompt(tmp_path):
+    """ROB-5: an existing-but-invalid run_dir (a real directory with no
+    manifest.json) must error out immediately — no billing prompt.
+
+    Verified against the pre-fix CLI ordering: ``run_dir.is_dir()``
+    passed (the directory DOES exist), so the code printed "the confirm
+    pass re-runs the pipeline and bills real LLM calls" and the
+    "Re-run screened flip candidates ... ?" prompt BEFORE
+    ``run_confirm_pass`` ever got a chance to raise
+    ``ConfirmError("manifest.json missing...")`` — exit code 0 with an
+    "Aborted." line (CliRunner's stdin is empty, no ``--yes`` passed
+    here on purpose). Post-fix, validation runs first: exit 2, no
+    prompt text anywhere in the output, no stdin needed.
+    """
+    from typer.testing import CliRunner
+
+    from topofuzz.cli import app
+
+    empty_dir = tmp_path / "empty-run"
+    empty_dir.mkdir()
+
+    result = CliRunner().invoke(app, ["confirm", str(empty_dir)])
+    assert result.exit_code == 2, result.output
+    assert "manifest.json missing" in result.output
+    assert "bills real LLM calls" not in result.output
+    assert "Aborted" not in result.output
+
+
 def test_cli_confirm_invokes_run_confirm_pass(tmp_path, monkeypatch):
     """The CLI wires run_dir + --repeats into run_confirm_pass and prints
     the summary. run_confirm_pass itself is monkeypatched (it would
