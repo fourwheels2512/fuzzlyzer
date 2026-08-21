@@ -105,5 +105,4 @@ on borderline applicants like `lending_008`.
 - Fixture topology: `topofuzz.fixtures.lending_4role` shipped with
   topofuzz v0.5
 - Rubric: `topofuzz.prompts.lending_judge` shipped with topofuzz v0.5
-  (BLUEPRINT_v5plus.md §13 underwriting heuristic)
 - Eval rows: synthetic, generated for v0.5 demo purposes

@@ -36,8 +36,7 @@ no-telemetry statement.
 ## Status
 
 **v0.2.0** — ships alongside `topofuzz` v1.0.0. Public API surface
-frozen for the 0.2.x line per
-[BLUEPRINT_v5plus.md §17a](https://github.com/fourwheels2512/fuzzlyzer/blob/main/BLUEPRINT_v5plus.md).
+frozen for the 0.2.x line.
 Pinned upper bound: any consumer should depend on `fuzzeval>=0.2,<0.3`.
 See [`CHANGELOG.md`](CHANGELOG.md) for what changed from `0.1.0`.
 
@@ -80,10 +79,6 @@ from fuzzeval.judge import SingleJudge, JuryJudge
 from fuzzeval.attestation import dsse_sign, dsse_verify
 from fuzzeval.stats import wilson_ci, percentile_cluster_bootstrap
 ```
-
-See
-[BLUEPRINT_v5plus.md §17a](https://github.com/fourwheels2512/fuzzlyzer/blob/main/BLUEPRINT_v5plus.md)
-for the public-API contract.
 
 ## License (full terms)
 
