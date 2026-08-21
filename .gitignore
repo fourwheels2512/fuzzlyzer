@@ -73,3 +73,10 @@ ui-*.png
 # uv lock state lives at workspace root only; per-package locks not used
 packages/*/uv.lock
 
+# Internal planning, patent drafts, and local run artifacts — never re-add
+.planning/
+runs-eu-*.log
+runs-eu-domains/
+runs-marginal/
+runs-marginal*.log
+
