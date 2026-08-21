@@ -152,6 +152,55 @@ def test_load_topology_rejects_bad_llm_configs_values(tmp_path):
         load_topology(f"{f}:build_graph")
 
 
+_FIXTURE_WITH_BUILDER = _FIXTURE_BODY + '''
+
+def prompt_builder(node, eval_row, prior):
+    return "BUILT:" + node.id
+'''
+
+
+def test_prompt_builder_survives_variant_rebuild(tmp_path):
+    """A fixture-exported ``prompt_builder`` attached by ``load_topology``
+    must survive variant generation onto EVERY rebuilt variant.
+
+    Regression guard for fix #4 (RT 2026-05-30): ``generators._rebuild``
+    re-attaches the ``object.__setattr__`` side-channel that the Pydantic
+    constructor drops. If a refactor silently re-drops it, the F4 ablation
+    / F7 audit terminal re-execution falls back to the bare
+    ``_default_prompt`` (no domain rules) while the run still reports
+    success — measuring the wrong pipeline with a green status. This test
+    fails the instant that regression returns.
+    """
+    from topofuzz.loaders import get_prompt_builder
+    from topofuzz.variants.generators import (
+        decoding_param_swap,
+        order_swap,
+        role_swap,
+    )
+
+    f = _write_fixture(tmp_path, _FIXTURE_WITH_BUILDER)
+    topo = load_topology(f"{f}:build_graph")
+    builder = get_prompt_builder(topo)
+    assert builder is not None
+
+    rebuilt_seen = False
+    for variants in (
+        order_swap(topo),
+        role_swap(topo),
+        decoding_param_swap(topo),
+    ):
+        assert variants, "generator produced no variants"
+        for v in variants:
+            assert get_prompt_builder(v) is builder, (
+                "variant rebuild dropped the prompt_builder side-channel"
+            )
+            if v is not topo:
+                rebuilt_seen = True
+    # The guard is only meaningful if at least one NON-original (rebuilt)
+    # variant was produced and still carried the builder through _rebuild.
+    assert rebuilt_seen, "no rebuilt variant exercised the propagation path"
+
+
 # Step 20a: __topofuzz_verdict_node__ forwarded so confirm-pass
 # regeneration round-trips with the same canonical_hash.
 _FIXTURE_VERDICT_NODE = '''

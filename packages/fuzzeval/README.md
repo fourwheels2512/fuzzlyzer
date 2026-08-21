@@ -35,10 +35,11 @@ no-telemetry statement.
 
 ## Status
 
-**v0.1.0** — released alongside `topofuzz` v0.5.0rc1 (2026-05-13).
-Public API surface frozen for the 0.1.x line per
-[BLUEPRINT_v5plus.md §17a](https://github.com/kirannayudu/topofuzz/blob/main/BLUEPRINT_v5plus.md).
-Pinned upper bound: any consumer should depend on `fuzzeval>=0.1,<0.2`.
+**v0.2.0** — ships alongside `topofuzz` v1.0.0. Public API surface
+frozen for the 0.2.x line per
+[BLUEPRINT_v5plus.md §17a](https://github.com/fourwheels2512/fuzzlyzer/blob/main/BLUEPRINT_v5plus.md).
+Pinned upper bound: any consumer should depend on `fuzzeval>=0.2,<0.3`.
+See [`CHANGELOG.md`](CHANGELOG.md) for what changed from `0.1.0`.
 
 ## Install
 
@@ -81,7 +82,7 @@ from fuzzeval.stats import wilson_ci, percentile_cluster_bootstrap
 ```
 
 See
-[BLUEPRINT_v5plus.md §17a](https://github.com/kirannayudu/topofuzz/blob/main/BLUEPRINT_v5plus.md)
+[BLUEPRINT_v5plus.md §17a](https://github.com/fourwheels2512/fuzzlyzer/blob/main/BLUEPRINT_v5plus.md)
 for the public-API contract.
 
 ## License (full terms)
@@ -92,10 +93,10 @@ bundled into the wheel under `dist-info/licenses/LICENSE` per PEP 639.
 
 ## See also
 
-- [`topofuzz`](https://github.com/kirannayudu/topofuzz/blob/main/packages/topofuzz/README.md)
+- [`topofuzz`](https://github.com/fourwheels2512/fuzzlyzer/blob/main/packages/topofuzz/README.md)
   — the LangGraph topology fuzzer that consumes `fuzzeval`.
-- [`SECURITY.md`](https://github.com/kirannayudu/topofuzz/blob/main/SECURITY.md)
+- [`SECURITY.md`](https://github.com/fourwheels2512/fuzzlyzer/blob/main/SECURITY.md)
   — threat model + 30-line standalone DSSE verifier reference (stdlib +
   `cryptography` only).
-- [`CHANGELOG.md`](https://github.com/kirannayudu/topofuzz/blob/main/packages/fuzzeval/CHANGELOG.md)
+- [`CHANGELOG.md`](https://github.com/fourwheels2512/fuzzlyzer/blob/main/packages/fuzzeval/CHANGELOG.md)
   — release history.

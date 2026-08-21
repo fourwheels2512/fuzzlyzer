@@ -326,10 +326,15 @@ LLM_CONFIGS = {
 """
 
 
-def _build_real_run_dir(tmp_path: Path) -> tuple[Path, list[str]]:
+def _build_real_run_dir(
+    tmp_path: Path, fixture_src: str = _FIXTURE_SRC
+) -> tuple[Path, list[str]]:
     """Write a langgraph fixture, regenerate the variant set the same way
     ``topofuzz run`` does, and lay down a manifest + run.sqlite whose
     judge_results make at least one variant a flip candidate.
+
+    ``fixture_src`` overrides the fixture module body (e.g. to export a
+    ``prompt_builder`` for the builder-threading regression test).
 
     Returns ``(run_dir, variant_hashes)``.
     """
@@ -343,7 +348,7 @@ def _build_real_run_dir(tmp_path: Path) -> tuple[Path, list[str]]:
     )
 
     fixture = tmp_path / "fx.py"
-    fixture.write_text(_FIXTURE_SRC, encoding="utf-8")
+    fixture.write_text(fixture_src, encoding="utf-8")
     eval_file = tmp_path / "e.csv"
     eval_file.write_text(
         "id,input\neval_001,q1\neval_002,q2\n", encoding="utf-8"
@@ -440,6 +445,35 @@ def test_run_confirm_pass_reruns_candidates_and_reference(tmp_path):
     assert len(fake.calls) == 12
 
 
+def test_run_confirm_pass_threads_fixture_prompt_builder(tmp_path):
+    """RT 2026-05-30: the confirm pass MUST re-run the pipeline with the
+    fixture-exported ``prompt_builder``, not the bare ``_default_prompt``.
+
+    The bug this guards: ``_confirm_async`` passed ``resolver=`` but no
+    ``prompt_builder=``, so ``run_variant`` defaulted to ``_default_prompt``
+    and confirm silently re-ran a DOMAIN-RULE-LESS pipeline — different from
+    the kickoff — making its reproducibility/noise-floor number a
+    measurement of the WRONG pipeline. Proven here by asserting the
+    builder's marker reaches the LLM call. Fails (marker absent) on the bare
+    fallback; passes once the builder is threaded.
+    """
+    marker = "MARKER_FROM_FIXTURE_PROMPT_BUILDER"
+    src = _FIXTURE_SRC + (
+        "\n\ndef prompt_builder(node, eval_row, prior):\n"
+        f"    return {marker!r} + ' ' + node.id\n"
+    )
+    run_dir, _hashes = _build_real_run_dir(tmp_path, src)
+    fake = FakeLLM()
+    run_confirm_pass(run_dir, repeats=2, llm_callable=fake)
+    assert fake.calls, "no LLM calls recorded"
+    blob = repr(fake.calls)
+    assert marker in blob, (
+        "confirm did not thread the fixture prompt_builder into the "
+        "re-execution — it fell back to the bare _default_prompt (the RT "
+        "bug that made the confirm pass measure the wrong pipeline)."
+    )
+
+
 def test_run_confirm_pass_max_cost_hard_stop(tmp_path, monkeypatch):
     """--max-cost-usd hard-stop persists what completed and flags partial.
 
@@ -527,6 +561,51 @@ def test_verdict_stability_drops_judge_failures():
     assert res.point == pytest.approx(1.0)
 
 
+def test_verdict_stability_conditional_class_is_unanimous():
+    """2026-05-30 3-state: when rows carry verdict_class, three CONDITIONAL
+    repeats (the lending_042 shape) are UNANIMOUS — not a fake flip. Old
+    behaviour binarised the 0.5 conditional score and coin-flipped it."""
+    ref = [
+        # All three re-runs land CONDITIONAL (score 0.5 but class is the
+        # load-bearing signal). Without class-compare these would binarise
+        # to APPROVE (0.5 >= 0.5) and any noise would flip them.
+        {"eval_id": "lending_042", "score_value": 0.5, "verdict_class": "conditional"},
+        {"eval_id": "lending_042", "score_value": 0.5, "verdict_class": "conditional"},
+        {"eval_id": "lending_042", "score_value": 0.5, "verdict_class": "conditional"},
+    ]
+    res = compute_verdict_stability(ref)
+    assert res.n_evals == 1
+    assert res.n_unanimous == 1
+    assert res.point == pytest.approx(1.0)
+
+
+def test_verdict_stability_class_distinguishes_approve_from_conditional():
+    """A genuine class flip (approve vs conditional across re-runs) is NOT
+    unanimous — the metric still catches real instability."""
+    ref = [
+        {"eval_id": "e1", "score_value": 1.0, "verdict_class": "approve"},
+        {"eval_id": "e1", "score_value": 0.5, "verdict_class": "conditional"},
+    ]
+    res = compute_verdict_stability(ref)
+    assert res.n_evals == 1
+    assert res.n_unanimous == 0
+    assert res.point == pytest.approx(0.0)
+
+
+def test_verdict_stability_falls_back_to_threshold_without_class():
+    """Rows with no usable verdict_class keep the legacy bool path —
+    byte-identical to pre-3-state behaviour."""
+    ref = [
+        {"eval_id": "e1", "score_value": 0.9, "verdict_class": ""},
+        {"eval_id": "e1", "score_value": 0.1, "verdict_class": "dryrun"},
+    ]
+    res = compute_verdict_stability(ref)
+    # 0.9 → APPROVE, 0.1 → DENY (both via threshold) → split, not unanimous.
+    assert res.n_evals == 1
+    assert res.n_unanimous == 0
+    assert res.point == pytest.approx(0.0)
+
+
 def test_verdict_stability_degenerate_when_no_rows():
     res = compute_verdict_stability([])
     assert res.point is None
@@ -576,6 +655,43 @@ def test_confirmed_verdict_flip_confirmed_and_flaky():
     assert res.ci_lower is not None and res.ci_upper is not None
     assert 0.0 <= res.ci_lower <= res.point <= res.ci_upper <= 1.0
     assert res.degenerate_flag is False
+
+
+def test_confirmed_verdict_flip_class_aware_conditional():
+    """3-state (RT 2026-05-30): a candidate that re-runs to CONDITIONAL
+    votes as its own class instead of binarising to APPROVE at 0.5, so the
+    confirm-pass flip rate agrees with ``verdict_stability``.
+
+    - e1: reference stable APPROVE, candidate 3x CONDITIONAL → the candidate
+      no longer matches baseline → CONFIRMED. (The old binary path scored
+      0.5 >= 0.5 = APPROVE == baseline → wrongly FLAKY, hiding the verdict
+      change behind the threshold.)
+    - e2: reference stable CONDITIONAL, candidate 3x CONDITIONAL → same class
+      as baseline → FLAKY, not a fake flip (mirrors
+      ``test_verdict_stability_conditional_class_is_unanimous``).
+    """
+    V = "v" * 64
+    ref = [
+        {"eval_id": "e1", "score_value": 1.0, "verdict_class": "approve"},
+        {"eval_id": "e1", "score_value": 1.0, "verdict_class": "approve"},
+        {"eval_id": "e1", "score_value": 1.0, "verdict_class": "approve"},
+        {"eval_id": "e2", "score_value": 0.5, "verdict_class": "conditional"},
+        {"eval_id": "e2", "score_value": 0.5, "verdict_class": "conditional"},
+        {"eval_id": "e2", "score_value": 0.5, "verdict_class": "conditional"},
+    ]
+    cond = {"score_value": 0.5, "verdict_class": "conditional"}
+    cand = [
+        {"eval_id": "e1", "variant_id": V, **cond},
+        {"eval_id": "e1", "variant_id": V, **cond},
+        {"eval_id": "e1", "variant_id": V, **cond},
+        {"eval_id": "e2", "variant_id": V, **cond},
+        {"eval_id": "e2", "variant_id": V, **cond},
+        {"eval_id": "e2", "variant_id": V, **cond},
+    ]
+    res = compute_confirmed_verdict_flip_rate(ref, cand, seed=0)
+    assert res.confirmed == 1  # e1: approve baseline vs conditional candidate
+    assert res.flaky == 1      # e2: conditional baseline == conditional cand
+    assert res.point == pytest.approx(0.5)
 
 
 def test_confirmed_verdict_flip_unstable_baseline_excluded():
@@ -746,6 +862,34 @@ def test_cli_confirm_bad_run_dir_exits_friendly():
     result = CliRunner().invoke(app, ["confirm", "nonexistent-dir", "--yes"])
     assert result.exit_code == 2
     assert "not a directory" in result.output.lower()
+
+
+def test_cli_confirm_missing_manifest_errors_before_spend_prompt(tmp_path):
+    """ROB-5: an existing-but-invalid run_dir (a real directory with no
+    manifest.json) must error out immediately — no billing prompt.
+
+    Verified against the pre-fix CLI ordering: ``run_dir.is_dir()``
+    passed (the directory DOES exist), so the code printed "the confirm
+    pass re-runs the pipeline and bills real LLM calls" and the
+    "Re-run screened flip candidates ... ?" prompt BEFORE
+    ``run_confirm_pass`` ever got a chance to raise
+    ``ConfirmError("manifest.json missing...")`` — exit code 0 with an
+    "Aborted." line (CliRunner's stdin is empty, no ``--yes`` passed
+    here on purpose). Post-fix, validation runs first: exit 2, no
+    prompt text anywhere in the output, no stdin needed.
+    """
+    from typer.testing import CliRunner
+
+    from topofuzz.cli import app
+
+    empty_dir = tmp_path / "empty-run"
+    empty_dir.mkdir()
+
+    result = CliRunner().invoke(app, ["confirm", str(empty_dir)])
+    assert result.exit_code == 2, result.output
+    assert "manifest.json missing" in result.output
+    assert "bills real LLM calls" not in result.output
+    assert "Aborted" not in result.output
 
 
 def test_cli_confirm_invokes_run_confirm_pass(tmp_path, monkeypatch):
@@ -1297,6 +1441,75 @@ def test_reconstruct_variants_rebinds_python_api_verdict_node(tmp_path):
         )
     for v in by_hash.values():
         assert v.verdict_node == "n1"
+
+
+def test_reconstruct_variants_preserves_prompt_builder_on_v06_rebind(tmp_path):
+    """RT 2026-05-30: on the v0.6 rebind branch (manifest carries a
+    ``verdict_node``), ``_reconstruct_variants`` re-builds the Topology
+    through the constructor — which drops the side-channel ``prompt_builder``
+    that ``load_topology`` attached via ``object.__setattr__``. Without the
+    re-attach, every confirm-pass variant silently falls back to the bare
+    ``_default_prompt`` (no domain rules): the exact fix-#4 regression, on
+    the confirm path. This pins the re-attach so it cannot regress.
+    """
+    pytest.importorskip("langgraph")
+    from topofuzz.cli import _round_robin_select
+    from topofuzz.confirm import _reconstruct_variants
+    from topofuzz.ir import Topology
+    from topofuzz.loaders import get_prompt_builder, load_topology
+    from topofuzz.variants.generators import (
+        decoding_param_swap,
+        order_swap,
+        role_swap,
+    )
+
+    src = _FIXTURE_SRC + (
+        "\n\ndef prompt_builder(node, eval_row, prior):\n"
+        "    return 'BUILT:' + node.id\n"
+    )
+    fixture = tmp_path / "fx_builder_vn.py"
+    fixture.write_text(src, encoding="utf-8")
+    base = load_topology(f"{fixture}:build_graph")
+    assert get_prompt_builder(base) is not None  # attached at load time
+
+    # Reproduce the producer-side hashes with verdict_node set — this is
+    # what makes _reconstruct_variants take the needs_v06_rebind branch.
+    producer = Topology(
+        name=base.name,
+        nodes=base.nodes,
+        edges=base.edges,
+        entrypoint=base.entrypoint,
+        terminal=base.terminal,
+        verdict_node="n1",
+    )
+    ord_list = list(order_swap(producer, rng_seed=0))
+    role_list = list(role_swap(producer))
+    dec_list = list(decoding_param_swap(producer))
+    variant_list = _round_robin_select(
+        original=ord_list[0],
+        family_pools=(ord_list[1:], role_list, dec_list),
+        total=4,
+    )
+    producer_hashes = [v.canonical_hash() for v in variant_list]
+
+    manifest = {
+        "run_id": "builder-vn-run",
+        "variant_canonical_hashes": producer_hashes,
+        "verdict_node": "n1",
+        "cli_args": {
+            "fixture": f"{fixture}:build_graph",
+            "rng_seed": 0,
+            "variants": 4,
+        },
+    }
+    by_hash = _reconstruct_variants(manifest)
+    assert by_hash, "no variants reconstructed"
+    for v in by_hash.values():
+        assert v.verdict_node == "n1"  # confirms the rebind branch ran
+        assert get_prompt_builder(v) is not None, (
+            "v0.6 rebind dropped the prompt_builder side-channel — "
+            "confirm-pass variants would fall back to the bare prompt"
+        )
 
 
 def test_reconstruct_variants_rejects_partial_pair(tmp_path):

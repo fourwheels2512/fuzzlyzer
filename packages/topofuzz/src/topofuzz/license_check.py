@@ -210,6 +210,35 @@ def _write_acceptance(path: Path) -> None:
             pass
 
 
+def is_accepted() -> bool:
+    """Read-only check: does a valid acceptance record exist right now?
+
+    Never prompts and never writes — the sibling of :func:`prompt_and_record`
+    for callers that must not touch stdin (e.g. the UI server process
+    deciding whether to show the in-browser accept gate before a run
+    can be launched; see ``topofuzz.ui.app``'s ``/accept-license`` route).
+
+    ``HomeUnresolvableError`` (no HOME/USERPROFILE) is treated as "not
+    accepted" rather than propagated — a server-side caller should
+    degrade to showing the accept gate, never crash.
+    """
+    try:
+        path = acceptance_path()
+    except HomeUnresolvableError:
+        return False
+    return _is_accepted(_read_acceptance(path))
+
+
+def record_acceptance() -> None:
+    """Persist an acceptance record unconditionally, without prompting.
+
+    Equivalent to answering ``y`` at the interactive prompt or passing
+    ``--accept-license``, minus the CLI flag/stdin plumbing — the entry
+    point for the UI's in-browser "I accept" control.
+    """
+    _write_acceptance(acceptance_path())
+
+
 def prompt_and_record(
     *,
     force: bool = False,

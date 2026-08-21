@@ -450,6 +450,9 @@ class RunRegistry:
         proc = subprocess.Popen(  # noqa: S603 — args are list, not shell string
             cmd,
             cwd=out_dir.parent.parent,
+            stdin=subprocess.DEVNULL,  # never let the child block on stdin —
+            # e.g. a version-mismatched or somehow-unaccepted license
+            # prompt would otherwise hang until EOF (see _build_topofuzz_cmd)
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,  # interleave for the ring buffer
             text=True,
@@ -535,6 +538,15 @@ def _build_topofuzz_cmd(
     spawning, so the prompt would just leave the subprocess hung waiting
     on stdin.
 
+    ``--accept-license`` (a root-level flag, so it MUST precede the
+    ``run`` subcommand) propagates the operator's license acceptance to
+    the child process. This is safe and non-deceptive: the UI only
+    reaches the point of spawning a run after the operator has accepted
+    the license in the browser (see ``topofuzz.ui.app``'s run-start
+    gate) — without it, the child would hit its own interactive BSL
+    prompt, block on stdin (see the ``stdin=subprocess.DEVNULL`` on the
+    ``Popen`` call in :meth:`RunRegistry.launch`), get EOF, and exit 2.
+
     When ``jury_of_3`` is set, appends ``--jury-of-3`` and (if
     ``jury_models`` is non-None) ``--jury-models`` with an explicit
     comma-separated trio. The CLI raises a usage error if exactly 3
@@ -550,6 +562,7 @@ def _build_topofuzz_cmd(
         sys.executable,
         "-m",
         "topofuzz",
+        "--accept-license",
         "run",
         fixture_spec,
         "--eval",

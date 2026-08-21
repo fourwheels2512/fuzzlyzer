@@ -105,11 +105,29 @@ class ContinuousScore:
     + UI layers use to tell single from jury judgments without a side
     channel. Defaulted (empty tuple) so old pickled cache entries
     round-trip via the class-attribute fallback.
+
+    ``verdict_class`` is the out-of-band 3-state verdict label, added
+    2026-05-30. One of:
+      - ``""``           — no explicit class; binarise by the 0.5
+                           threshold (the v0.5 contract, preserved
+                           bit-for-bit; legacy pickled cache entries
+                           round-trip to this via the class-attribute
+                           default).
+      - ``"approve"`` / ``"deny"`` — explicit clear verdict.
+      - ``"conditional"`` — the verdict hinges on a future unmet step
+                           (``Score: COND``). ``value`` is 0.5 but the
+                           class is what flip/stability metrics key on.
+      - ``"dryrun"``     — the dry-run sentinel 0.5, so it never aliases
+                           a real conditional 0.5.
+    Kept OUT of the continuous ``value`` so the [0,1] scalar stays
+    untouched for every existing consumer; the class is the parallel
+    channel the 3-state metrics read.
     """
 
     value: float
     rationale: str = ""
     votes: tuple[tuple[str, float, str], ...] = ()
+    verdict_class: str = ""
 
 
 @dataclass(frozen=True)
@@ -179,8 +197,25 @@ class JudgeUnparseableError(RuntimeError):
 #
 # Anchored to a line start so ``"my score is 7"`` does NOT match — we
 # only accept the contract format spelled in the rubric.
+#
+# 2026-05-30: the alternation now also accepts the two literal verdict-
+# class tokens ``COND`` (conditional) and ``NONE`` (no verdict). Both are
+# captured as group(1) and disambiguated in ``_parse_score``:
+#   - ``COND`` → a real third verdict class (the decision genuinely hinges
+#     on a future unmet step). Previously the rubric forced every hedged
+#     "approve only if ..." output into 10 or 0, and the judge coin-flipped
+#     it on re-run — a fake flip. ``COND`` gives the hedge its own stable
+#     class so it stops inflating the flip rate.
+#   - ``NONE`` → no verdict at all; raises ``JudgeUnparseableError`` so a
+#     missing verdict still registers as ``judge_failure`` (excluded from
+#     metrics), not as a silent denial. Before this, ``Score: NONE`` simply
+#     failed the regex with a "missing Score line" error — the rubric's
+#     documented third state never actually parsed. Now it parses and is
+#     handled explicitly.
+# The ``(?i)`` flag makes the token match case-insensitively; _parse_score
+# upper-cases the capture before branching.
 _SCORE_RE = re.compile(
-    r"(?im)^[\s*#>\-]*\**\s*Score:\**\s*\**\s*(10|[0-9])\**(?!\.\d)(?!\d)"
+    r"(?im)^[\s*#>\-]*\**\s*Score:\**\s*\**\s*(10|[0-9]|COND(?:ITIONAL)?|NONE)(?![A-Za-z])\**(?!\.\d)(?!\d)"
 )
 # Rationale LABEL. ``[\s*#>\-]*`` allows the same markdown leaders as
 # Score; ``\**`` tolerates ``**Rationale:**`` bold-wrapping. This only
@@ -210,14 +245,30 @@ _PARAGRAPH_BREAK_RE = re.compile(r"\n[ \t\r]*\n")
 _RATIONALE_MAX_CHARS: Final[int] = 1000
 
 
-def _parse_score(response_text: str) -> tuple[int, str]:
-    """Return (raw_score in [0, 10], rationale) parsed from a judge response.
+def _parse_score(response_text: str) -> tuple[int, str, str]:
+    """Return (raw_score in [0, 10], verdict_class, rationale).
+
+    ``verdict_class`` is one of:
+      - ``""``           — an ordinary numeric score (caller binarises by
+                           threshold; preserves the v0.5 behaviour exactly).
+      - ``"conditional"``— the judge emitted ``Score: COND``; the verdict
+                           genuinely hinges on a future unmet step. ``raw``
+                           is set to ``5`` (→ 0.5 after the caller's /10) so
+                           the continuous score lands mid-scale, but the
+                           class is the load-bearing signal — downstream
+                           flip/stability metrics key on the class, not the
+                           0.5 value (which they would otherwise alias with
+                           the dry-run 0.5).
 
     Raises :class:`JudgeUnparseableError` on:
 
     * No ``Score: N`` line at all.
-    * (Currently unreachable — the regex pins ``N`` to ``0-10`` literally;
-      kept as defense in depth.)
+    * ``Score: NONE`` — the output stated no verdict. Treated as a missing
+      verdict (→ ``judge_failure`` → excluded from metrics), NOT as a
+      silent denial. (The rubric documented this third state but the old
+      regex rejected the literal token, so it never actually parsed.)
+    * (Numeric out of range is currently unreachable — the regex pins ``N``
+      to ``0-10`` literally; kept as defense in depth.)
 
     **Last-match wins.** A judge response often contains echoes of the
     rubric (which itself shows the contract format) and / or echoes of
@@ -244,16 +295,38 @@ def _parse_score(response_text: str) -> tuple[int, str]:
             f"{response_text[:500]}"
         )
     last_score = score_matches[-1]
-    raw = int(last_score.group(1))
-    # Range check kept as defense in depth even though the regex
-    # alternation pins N to 0-10 by construction. A future regex edit
-    # that broadens the integer class would otherwise silently accept
-    # out-of-range values.
-    if not (0 <= raw <= 10):
+    token = last_score.group(1).upper()
+    # Disambiguate the three token shapes the regex now accepts.
+    if token == "NONE":
+        # No verdict at all. Surface as unparseable so the runner marks
+        # the cell judge_failure (missing data, excluded from metrics)
+        # rather than letting a missing verdict masquerade as a denial.
         raise JudgeUnparseableError(
-            f"Judge score {raw} out of range [0, 10]. Response was:\n"
-            f"{response_text[:500]}"
+            "Judge response stated 'Score: NONE' (the pipeline output "
+            "contained no verdict). Treated as a missing verdict. "
+            f"Response was:\n{response_text[:500]}"
         )
+    if token.startswith("COND"):
+        # Real third class: the decision hinges on a future unmet step.
+        # raw=5 → 0.5 continuous; the class carries the actual signal.
+        # Accepts both the mandated bare ``COND`` token and the natural
+        # long form ``CONDITIONAL`` a real judge may emit; the
+        # ``(?![A-Za-z])`` boundary in ``_SCORE_RE`` still rejects
+        # accidental prefixes like ``CONDoning``.
+        raw = 5
+        verdict_class = "conditional"
+    else:
+        raw = int(token)
+        verdict_class = ""
+        # Range check kept as defense in depth even though the regex
+        # alternation pins N to 0-10 by construction. A future regex edit
+        # that broadens the integer class would otherwise silently accept
+        # out-of-range values.
+        if not (0 <= raw <= 10):
+            raise JudgeUnparseableError(
+                f"Judge score {raw} out of range [0, 10]. Response was:\n"
+                f"{response_text[:500]}"
+            )
     # Rationale belongs to the SAME answer block as the authoritative
     # score. The rubric format is "Score:" then "Rationale:", so we take
     # the FIRST "Rationale:" label at or after the LAST "Score:" match.
@@ -274,7 +347,7 @@ def _parse_score(response_text: str) -> tuple[int, str]:
         rationale = " ".join(tail.split()).rstrip("*").strip()
     # Bound the persisted rationale (see _RATIONALE_MAX_CHARS): it lands
     # in run.sqlite, which is digested into the signed attestation.
-    return raw, rationale[:_RATIONALE_MAX_CHARS]
+    return raw, verdict_class, rationale[:_RATIONALE_MAX_CHARS]
 
 
 # ---------------------------------------------------------------------------
@@ -509,7 +582,12 @@ class SingleJudge:
             # dry-run rather than waiting for the first real call. Cheap
             # ($0) and catches the most common rubric-author mistake.
             self.render_prompt(payload)
-            return ContinuousScore(value=0.5, rationale="[DRY-RUN]")
+            # verdict_class="dryrun" so the 0.5 dry-run sentinel can never
+            # be confused with a real conditional 0.5 by the 3-state
+            # flip / stability metrics.
+            return ContinuousScore(
+                value=0.5, rationale="[DRY-RUN]", verdict_class="dryrun"
+            )
 
         prompt = self.render_prompt(payload)
         messages = [{"role": "user", "content": prompt}]
@@ -544,17 +622,20 @@ class SingleJudge:
                     f"{type(e1).__name__}: {e1}; retry: "
                     f"{type(e2).__name__}: {e2}"
                 ) from e2
-        raw, rationale = _parse_score(text)
+        raw, verdict_class, rationale = _parse_score(text)
 
         # 0-10 → [0, 1]. Integer division would zero everything but the
-        # 10 case; explicit float division.
+        # 10 case; explicit float division. For a COND token raw=5 → 0.5
+        # and verdict_class="conditional" carries the real signal.
         value = raw / 10.0
         if rationale:
             _log.debug(
-                "SingleJudge rationale (raw=%d): %s",
-                raw, rationale[:200],
+                "SingleJudge rationale (raw=%d, class=%r): %s",
+                raw, verdict_class, rationale[:200],
             )
-        return ContinuousScore(value=value, rationale=rationale)
+        return ContinuousScore(
+            value=value, rationale=rationale, verdict_class=verdict_class
+        )
 
     # ------------------------------------------------------------------
     # Internal: one LLM call returning the response text
@@ -657,6 +738,28 @@ _JURY_SIZE = 3
 # threshold; a v0.6 sliding-threshold experiment would only touch this
 # line and the public helper.
 _MAJORITY_THRESHOLD = 0.5
+
+
+def _effective_verdict_class(
+    score: "ContinuousScore", *, threshold: float = _MAJORITY_THRESHOLD
+) -> str:
+    """Resolve a :class:`ContinuousScore` to one of approve / deny / conditional.
+
+    - An explicit ``verdict_class`` of ``"conditional"`` / ``"approve"`` /
+      ``"deny"`` is honoured as-is.
+    - Anything else (``""`` numeric scores, the ``"dryrun"`` sentinel, or
+      an unrecognised label) is binarised from the continuous value at
+      ``threshold`` — the same 0.5 cut the headline verdict pill uses — so
+      a plain numeric jury behaves exactly as it did before the 3-state
+      change. The jury aggregator is the only caller; the metrics layer
+      applies the same precedence to persisted DB rows via its own
+      row-shaped twin (``topofuzz.metrics._verdict.verdict_of``) — keep
+      the two rules in sync.
+    """
+    cls = getattr(score, "verdict_class", "") or ""
+    if cls in ("approve", "deny", "conditional"):
+        return cls
+    return "approve" if score.value >= threshold else "deny"
 
 
 # Sentinel-typed mapping for the optional per-vendor test injection. Each
@@ -987,6 +1090,10 @@ class JuryJudge:
         # mirrors construction-order iteration over self._judges so the
         # persisted column is stable across runs.
         vote_breakdown: list[tuple[str, float, str]] = []
+        # Per-vendor 3-state verdict class, parallel to ``votes`` (one
+        # entry per parseable vendor, construction order). Drives the
+        # 3-class majority below.
+        vote_classes: list[str] = []
         parseable_this_call: list[str] = []
         per_call_errors: list[tuple[str, str]] = []
         local_total = 0
@@ -1048,6 +1155,7 @@ class JuryJudge:
             votes.append(result.value)
             vote_rationales.append((vendor, result.rationale))
             vote_breakdown.append((vendor, float(result.value), result.rationale))
+            vote_classes.append(_effective_verdict_class(result))
             parseable_this_call.append(vendor)
 
         # Apply the per-call accumulator updates atomically.
@@ -1061,18 +1169,47 @@ class JuryJudge:
                 f"JuryJudge: all {len(self._judges)} vendors failed. "
                 f"Errors: {per_call_errors!r}"
             )
-        # F3 aggregation: strict-majority of per-vendor binarized votes.
-        # ``vote >= _MAJORITY_THRESHOLD`` is the same binarisation
-        # ``binary_from_continuous`` and the headline verdict pill use,
-        # so the panel's approve/deny tally and the cell-level verdict
-        # agree by construction. ``approve_count * 2 > total`` rejects
-        # ties — a 1-of-2 jury (one failed vendor) deadlocks to DENY,
-        # the compliance-conservative default. The raw per-vendor scores
-        # remain available via ``ContinuousScore.votes`` for any caller
-        # that needs the mean.
-        total = len(votes)
-        approve_count = sum(1 for v in votes if v >= _MAJORITY_THRESHOLD)
-        majority_value = 1.0 if approve_count * 2 > total else 0.0
+        # F3 aggregation, 2026-05-30: strict-majority of per-vendor 3-state
+        # verdict CLASSES (approve / deny / conditional), not just the
+        # binarised approve/deny tally. Each vendor's class is its explicit
+        # verdict_class when set ("conditional" for a COND token) or, for an
+        # ordinary numeric score, derived from the same 0.5 threshold the
+        # headline verdict pill uses — so the panel tally and the cell-level
+        # verdict still agree by construction for the clear classes.
+        #
+        # A class wins only on STRICT majority (count*2 > total). When no
+        # class has a strict majority — the genuine split (e.g. surviving
+        # two vendors disagree 1/1, or a 3-way approve/deny/conditional
+        # spread) — the jury returns CONDITIONAL: the conservative middle.
+        # This REPLACES the old ties→DENY rule, and is what stops a hedged
+        # "approve only if ..." from coin-flipping the binary verdict on
+        # re-run. The raw per-vendor scores remain available via
+        # ``ContinuousScore.votes`` for any caller that needs the mean.
+        total = len(vote_classes)
+        approve_count = sum(1 for c in vote_classes if c == "approve")
+        deny_count = sum(1 for c in vote_classes if c == "deny")
+        if approve_count * 2 > total:
+            majority_value, jury_class = 1.0, "approve"
+        elif deny_count * 2 > total:
+            majority_value, jury_class = 0.0, "deny"
+        else:
+            # No strict approve/deny majority (includes an explicit
+            # conditional majority and every no-majority split) → the
+            # conservative conditional middle.
+            majority_value, jury_class = 0.5, "conditional"
+        if self._dry_run:
+            # Dry-run: every vendor vote is the 0.5 "dryrun" sentinel,
+            # which the class resolver binarises to APPROVE — so the
+            # majority above lands on the long-standing, test-asserted
+            # dry-run scalar (1.0). But persisting class "approve" would
+            # erase the sentinel: a $0 dry-run cell would be
+            # indistinguishable from a real unanimous approve in
+            # run.sqlite, and the score-matrix reader's "at least one
+            # EXPLICIT class" gate would build a class_matrix out of
+            # cells no judge ever scored — exactly the aliasing
+            # ``verdict_class="dryrun"`` exists to prevent. Keep the
+            # scalar contract, restore the sentinel.
+            jury_class = "dryrun"
         # Rationale aggregates only the parseable vendors that actually
         # emitted a Rationale: line, vendor-prefixed and joined. Vendors
         # with an empty rationale contribute nothing — so an all-empty
@@ -1088,6 +1225,7 @@ class JuryJudge:
             value=majority_value,
             rationale=jury_rationale,
             votes=tuple(vote_breakdown),
+            verdict_class=jury_class,
         )
 
     # ------------------------------------------------------------------

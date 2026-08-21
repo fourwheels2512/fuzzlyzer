@@ -20,7 +20,7 @@ You are responsible for compliance with applicable data-protection law (GDPR, CC
 You can verify this posture yourself:
 
 - Observe network traffic during topofuzz invocation. The default path (no `--rekor`, no `topofuzz ui`) emits zero non-vendor egress; `topofuzz scan` and `topofuzz run --dry-run` emit zero egress.
-- Inspect `~/.topofuzz/`. The principal local-only files Topofuzz writes there are `~/.topofuzz/dev.pem` (your developer signing key, never transmitted) and, once the v0.6 license click-through ships, `~/.topofuzz/license-accepted` (a local acceptance flag, never transmitted). The `--cache` directory (default `.cache/topofuzz`, configurable) is also local-only.
+- Inspect `~/.topofuzz/`. The principal local-only files Topofuzz writes there are `~/.topofuzz/dev.pem` (your developer signing key, never transmitted) and, once the v0.6 license click-through ships, `~/.topofuzz/license-accepted` (a local acceptance flag, never transmitted). The `--cache` directory (default `.cache/topofuzz`, configurable) is also local-only. If you use `topofuzz ui` and explicitly check "Remember this key on this computer" (unchecked by default — the default is memory-only, for the process lifetime), the pasted vendor key is also written to `~/.topofuzz/keys/{vendor}`; unchecking it or clicking "Remove" deletes that file. This is an opt-in on-disk secret — see `SECURITY.md`'s **API Key Handling** for the exact persistence contract.
 - Read `SECURITY.md` at the repo root for the full network-egress list and key-handling posture; every claim there is greppable in `packages/topofuzz/src/` and `packages/fuzzeval/src/`.
 
 ## Contact

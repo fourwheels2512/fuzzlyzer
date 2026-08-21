@@ -23,7 +23,12 @@ Topofuzz runs against the LLM vendor of your choice. **Your keys stay
 on your machine.** Topofuzz reads keys from environment variables only
 (`GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
 `DEEPSEEK_API_KEY`), never persists them, and never transmits anything
-other than your declared vendor API calls. See
+other than your declared vendor API calls. As a convenience, the CLI
+fills *missing* vendor API keys — only the four variables above, never
+arbitrary environment variables — from a `.env` file in the current
+directory (real environment variables always win; set
+`TOPOFUZZ_NO_DOTENV=1` to disable). Run `topofuzz keys` to pre-flight
+which keys are visible. See
 [SECURITY.md](../../SECURITY.md) for the full posture and
 [PRIVACY.md](../../PRIVACY.md) for the no-telemetry statement.
 
@@ -73,7 +78,7 @@ this package.
   developer key lives unencrypted at `~/.topofuzz/dev.pem`; anyone
   with read access to that file can forge attestations
   indistinguishably. See
-  [`SECURITY.md`](https://github.com/kirannayudu/topofuzz/blob/main/SECURITY.md)
+  [`SECURITY.md`](https://github.com/fourwheels2512/fuzzlyzer/blob/main/SECURITY.md)
   for the v0.5 threat model.
 
 ## What it does
@@ -81,7 +86,7 @@ this package.
 1. Reads your compiled LangGraph and lifts it to a typed
    `Topology` (`fuzzeval.ir`).
 2. Generates permuted variants per
-   [BLUEPRINT §6](https://github.com/kirannayudu/topofuzz/blob/main/BLUEPRINT_v5plus.md):
+   [BLUEPRINT §6](https://github.com/fourwheels2512/fuzzlyzer/blob/main/BLUEPRINT_v5plus.md):
    `order_swap`, `role_swap`, `decoding_param_swap`.
 3. Runs every `(variant, eval_row)` cell through the LLM stack, judges
    each result against a rubric, persists traces.
@@ -91,18 +96,30 @@ this package.
    prints a `file://` URL.
 6. A fresh machine running `topofuzz verify` (or ~30 lines of stdlib +
    `cryptography` — see
-   [SECURITY.md](https://github.com/kirannayudu/topofuzz/blob/main/SECURITY.md))
+   [SECURITY.md](https://github.com/fourwheels2512/fuzzlyzer/blob/main/SECURITY.md))
    reproduces the trust decision without re-running the LLMs.
 
 ## Install
 
 ```bash
 # Full install: LangGraph adapter + LLM SDKs + plotting + signing (~400 MB).
-pip install "topofuzz[full]==1.0.0"
+pip install "topofuzz[full]"
 
 # Verify-only install: cryptography + rfc8785 only — no LLM stack (~15 MB).
-pip install "topofuzz==1.0.0"
+pip install topofuzz
 ```
+
+Neither package is on PyPI yet (pre-launch); once published, install the
+latest release unpinned as shown above. Do **not** pin
+`topofuzz[full]==1.0.0` — the published `1.0.0` tag shipped a
+mutually-unsatisfiable `fuzzeval` dependency pin in the `[full]` extra
+(base required `fuzzeval>=0.2,<0.3`, `[full]` required
+`fuzzeval[stats,cache]>=0.1,<0.2`) that makes that exact pinned command
+fail to resolve. The fix is committed on `main` pending a `1.0.1`
+release — see
+[`CHANGELOG.md`](https://github.com/fourwheels2512/fuzzlyzer/blob/main/packages/topofuzz/CHANGELOG.md)
+`[Unreleased]` for details. If you must pin a version, wait for
+`1.0.1` or check the CHANGELOG for the current resolvable pin.
 
 Python 3.11+ on macOS, Linux, and Windows. Use a virtualenv.
 
@@ -112,10 +129,27 @@ The demo lending fixture and 50-row eval CSV ship with the source tree.
 Clone the repo to run the Quickstart:
 
 ```bash
-git clone https://github.com/kirannayudu/topofuzz.git
+git clone https://github.com/fourwheels2512/fuzzlyzer.git
 cd topofuzz
 pip install -e "packages/topofuzz[full]"
 ```
+
+### First run: license acceptance
+
+Every subcommand except `topofuzz verify` asks you to accept the BSL
+1.1 terms once per machine — an interactive `y`/`N` prompt. CI jobs,
+scripts, piped commands, and double-clicked launchers have no
+terminal to answer that prompt, so pass `--accept-license` on the
+**root** command instead; it persists the acceptance to
+`~/.topofuzz/license-accepted` so it's a one-time cost per machine:
+
+```bash
+topofuzz --accept-license keygen
+```
+
+Placement matters: `--accept-license` must come **before** the
+subcommand (`topofuzz --accept-license run ...`) — `topofuzz run ...
+--accept-license` (after) is rejected as an unrecognized option.
 
 Generate a dev signing key (one time per machine):
 
@@ -126,15 +160,21 @@ topofuzz keygen
 # [DEV-KEY] this is a developer-grade key (unencrypted PEM, no KMS).
 ```
 
-Dry-run (no LLM judge calls — every cell gets `ContinuousScore(0.5)`,
-useful for proving the install works without spending money):
+Zero-cost smoke test (`--simulate` stubs BOTH the agent rollouts and
+the judge with deterministic responses — zero network calls, cannot
+bill — proving the fixture, eval, and topology wire up correctly):
 
 ```bash
 topofuzz run \
     packages/topofuzz/src/topofuzz/fixtures/lending_4role.py:build_graph \
     --eval packages/topofuzz/src/topofuzz/fixtures/lending_eval.csv \
-    --n 10 --dry-run --out runs --yes
+    --n 10 --simulate --out runs --yes
 ```
+
+Note: `--dry-run` alone only stubs the judge — agent rollouts still
+bill real money (see `topofuzz run --help`). `--simulate` implies
+`--dry-run`'s judge stub *and* stubs the agents, so it's the flag that
+actually costs $0.
 
 The run prints a unique run directory at the end. The run id is a
 UTC date + a 26-character ULID — yours will look different from this
@@ -161,19 +201,54 @@ topofuzz verify runs/2026-05-13-01KRH4DF2T314C1X6D9HVE6QTK
 ```
 
 For a real run, set `GEMINI_API_KEY` (or your judge of choice via
-`--judge MODEL_ID`) and drop `--dry-run`. The cost estimator will print
+`--judge MODEL_ID`) and drop `--simulate`. The cost estimator will print
 `cold=$X ± $Y / warm-cache=$X' ± $Y' (90% CI)` and prompt before
 submitting jobs; `-y` skips the prompt.
 
 ## Subcommand reference
 
-| Subcommand | What it does |
-|---|---|
-| `topofuzz run`    | Permute topology, run all `(variant, eval_row)` cells, sign the bundle. |
-| `topofuzz verify` | DSSE-verify an output bundle. Works without LLM SDKs installed. |
-| `topofuzz report` | Render HTML report with voo bar + heatmap + per-agent influence panel (§6a) and [§A](https://github.com/kirannayudu/topofuzz/blob/main/BLUEPRINT_v5plus.md) banners. |
-| `topofuzz keygen` | Generate a dev Ed25519 signing keypair in `~/.topofuzz/`. |
-| `topofuzz scan`   | Static risk badge — zero-LLM-cost HIGH/MEDIUM/LOW rule-based scanner over the Topology IR (BLUEPRINT §5a). |
+All 14 subcommands. "Cost" is whether the command makes billed LLM
+calls; free commands make zero vendor API calls (or, for `ui`, zero
+calls until you start a run from inside it).
+
+**Core — fuzz + reproduce**
+
+| Subcommand | What it does | Cost |
+|---|---|---|
+| `topofuzz scan`    | Static risk badge — zero-LLM-cost HIGH/MEDIUM/LOW rule-based scanner over the Topology IR (BLUEPRINT §5a). | Free |
+| `topofuzz run`     | Permute topology, run all `(variant, eval_row)` cells, sign the bundle. | Bills (use `--simulate` for $0) |
+| `topofuzz confirm` | Re-run screened verdict flips K times to separate the topology effect from LLM noise. | Bills |
+
+**Attribution — which agent is responsible**
+
+| Subcommand | What it does | Cost |
+|---|---|---|
+| `topofuzz ablate` | Counterfactual leave-one-out attribution on a run's flips — which node's swap closes the flip. Writes `ablation.json`. | Bills unless `--dry-run` |
+| `topofuzz audit`  | Eval-axis counterfactual audit (name/zip/age/gender-swap) — which agent is biased on a disparate-impact axis. Writes `audit.json`. | Bills unless `--dry-run` |
+
+**Artifacts — render what happened**
+
+| Subcommand | What it does | Cost |
+|---|---|---|
+| `topofuzz report`  | Render HTML report with voo bar + heatmap + per-agent influence panel (§6a) and [§A](https://github.com/fourwheels2512/fuzzlyzer/blob/main/BLUEPRINT_v5plus.md) banners. | Free |
+| `topofuzz inspect` | Side-by-side HTML inspector for one verdict flip, agent-by-agent. | Free |
+| `topofuzz repro`   | Emit a standalone reproducer script for a verdict flip. | Free |
+| `topofuzz publish` | Bundle report.html + top flipping inspect pages into a PDF (or a CEO/consistency/counterfactual card). | Free |
+
+**Trust — sign and verify**
+
+| Subcommand | What it does | Cost |
+|---|---|---|
+| `topofuzz verify` | DSSE-verify an output bundle. Works without LLM SDKs installed. | Free |
+| `topofuzz keygen` | Generate a dev Ed25519 signing keypair in `~/.topofuzz/`. | Free |
+
+**Entry points**
+
+| Subcommand | What it does | Cost |
+|---|---|---|
+| `topofuzz keys`             | Pre-flight: list which vendor API keys are visible in the env. | Free |
+| `topofuzz langgraph-import` | Import an existing LangGraph as a topofuzz custom workflow tile, for use in `topofuzz ui`. | Free |
+| `topofuzz ui`               | Launch the topofuzz web UI at `http://localhost:<port>`. | Free to launch (runs started inside it bill) |
 
 Full option lists: `topofuzz <cmd> --help`.
 
@@ -211,7 +286,7 @@ for forward-compat documentation; do not interpret an empty `[verify]`
 extra as a packaging bug.
 
 For a fully standalone reproduction without installing topofuzz at all,
-[`SECURITY.md`](https://github.com/kirannayudu/topofuzz/blob/main/SECURITY.md)
+[`SECURITY.md`](https://github.com/fourwheels2512/fuzzlyzer/blob/main/SECURITY.md)
 ships a ~30-line `verify_dsse.py` reference verifier that depends only on
 the Python stdlib + the `cryptography` package (no `rfc8785`, no
 `pydantic`).
@@ -234,7 +309,7 @@ topofuzz run <fixture>:build_graph --eval <rows.csv> --n 50 --jury-of-3
 
 Missing keys surface as `judge_failure` cells, not as a kickoff error
 (per the
-[BLUEPRINT §A](https://github.com/kirannayudu/topofuzz/blob/main/BLUEPRINT_v5plus.md)
+[BLUEPRINT §A](https://github.com/fourwheels2512/fuzzlyzer/blob/main/BLUEPRINT_v5plus.md)
 degraded-badge contract).
 
 ### Cross-Vendor Consistency
@@ -336,7 +411,7 @@ today: `--conformance`, `--signoff`, `--judge-pool`, `--sandbox`,
   title  = {topofuzz: Topology Safety Fuzzer for multi-agent LLM systems},
   author = {Nayudu, Kiran},
   year   = {2026},
-  url    = {https://github.com/kirannayudu/topofuzz},
+  url    = {https://github.com/fourwheels2512/fuzzlyzer},
   version = {1.0.0}
 }
 ```
@@ -357,16 +432,16 @@ v1.0.0 reference vectors.
 
 ## See also
 
-- [`fuzzeval`](https://github.com/kirannayudu/topofuzz/blob/main/packages/fuzzeval/README.md)
+- [`fuzzeval`](https://github.com/fourwheels2512/fuzzlyzer/blob/main/packages/fuzzeval/README.md)
   — verify-path substrate (DSSE + judge + stats + cache + costest + key
   management).
-- [`BLUEPRINT_v5plus.md`](https://github.com/kirannayudu/topofuzz/blob/main/BLUEPRINT_v5plus.md)
+- [`BLUEPRINT_v5plus.md`](https://github.com/fourwheels2512/fuzzlyzer/blob/main/BLUEPRINT_v5plus.md)
   — full design contract.
-- [`SECURITY.md`](https://github.com/kirannayudu/topofuzz/blob/main/SECURITY.md)
+- [`SECURITY.md`](https://github.com/fourwheels2512/fuzzlyzer/blob/main/SECURITY.md)
   — threat model + standalone verifier.
-- [`CHANGELOG.md`](https://github.com/kirannayudu/topofuzz/blob/main/packages/topofuzz/CHANGELOG.md)
+- [`CHANGELOG.md`](https://github.com/fourwheels2512/fuzzlyzer/blob/main/packages/topofuzz/CHANGELOG.md)
   — release history.
-- [`BACKLOG.md`](https://github.com/kirannayudu/topofuzz/blob/main/packages/topofuzz/BACKLOG.md)
+- [`BACKLOG.md`](https://github.com/fourwheels2512/fuzzlyzer/blob/main/packages/topofuzz/BACKLOG.md)
   — polish + hardening items deferred from prior steps; the
   v0.5.1 punch list. Contributors closing items reference this
   file in commit messages (`closes BACKLOG: <description>`).

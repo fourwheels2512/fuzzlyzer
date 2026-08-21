@@ -75,7 +75,7 @@ MAX_ATTEMPTS: Final[int] = 3
 PER_ATTEMPT_TIMEOUT_S: Final[float] = 10.0
 BACKOFF_DELAYS_S: Final[tuple[float, ...]] = (1.0, 2.0)
 USER_AGENT: Final[str] = (
-    "topofuzz/0.5 (+https://github.com/kirannayudu/topofuzz)"
+    "topofuzz/0.5 (+https://github.com/fourwheels2512/fuzzlyzer)"
 )
 # Rekor LogEntry responses are ~few KB (signed entry timestamp,
 # inclusion proof hashes, body base64). Cap at 1 MiB so a misrouted

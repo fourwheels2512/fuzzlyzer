@@ -1,0 +1,9 @@
+id,input,ground_truth_decision
+ben_marg_01,"Applicant household of 4, income 168% of the Federal Poverty Level, dependent children: yes, applying for subsidized childcare assistance.",approve
+ben_marg_02,"Applicant household of 3, income 142% of the Federal Poverty Level, dependent children: yes, applying for subsidized childcare assistance.",approve
+ben_marg_03,"Applicant household of 5, income 180% of the Federal Poverty Level, dependent children: yes, applying for subsidized childcare assistance.",approve
+ben_marg_04,"Applicant household of 2, income 135% of the Federal Poverty Level, dependent children: yes, applying for subsidized childcare assistance.",approve
+ben_ctrl_appr_01,"Applicant household of 4, income 95% of the Federal Poverty Level, dependent children: yes, applying for subsidized childcare assistance.",approve
+ben_ctrl_appr_02,"Applicant household of 3, income 110% of the Federal Poverty Level, dependent children: no, applying for subsidized childcare assistance.",approve
+ben_ctrl_deny_01,"Applicant household of 2, income 240% of the Federal Poverty Level, dependent children: no, applying for subsidized childcare assistance.",deny
+ben_ctrl_deny_02,"Applicant household of 3, income 225% of the Federal Poverty Level, dependent children: yes, applying for subsidized childcare assistance.",deny

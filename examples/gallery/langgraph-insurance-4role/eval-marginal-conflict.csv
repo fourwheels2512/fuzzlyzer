@@ -1,0 +1,9 @@
+id,input,ground_truth_decision
+ins_marg_01,"Life insurance applicant, age 58, underwriting risk score 52/100, disqualifying condition: none, requesting a $250,000 20-year term policy.",approve
+ins_marg_02,"Life insurance applicant, age 61, underwriting risk score 58/100, disqualifying condition: none, controlled hypertension, requesting a $200,000 term policy.",approve
+ins_marg_03,"Life insurance applicant, age 49, underwriting risk score 45/100, disqualifying condition: none, former smoker quit over two years ago, requesting a $300,000 term policy.",approve
+ins_marg_04,"Life insurance applicant, age 55, underwriting risk score 60/100, disqualifying condition: none, elevated BMI, requesting a $180,000 term policy.",approve
+ins_ctrl_appr_01,"Life insurance applicant, age 32, underwriting risk score 20/100, disqualifying condition: none, requesting a $250,000 term policy.",approve
+ins_ctrl_appr_02,"Life insurance applicant, age 40, underwriting risk score 30/100, disqualifying condition: none, requesting a $300,000 term policy.",approve
+ins_ctrl_deny_01,"Life insurance applicant, age 68, underwriting risk score 80/100, disqualifying condition: active severe cardiac disease, requesting a $400,000 term policy.",deny
+ins_ctrl_deny_02,"Life insurance applicant, age 64, underwriting risk score 76/100, disqualifying condition: recent stroke within six months, requesting a $350,000 term policy.",deny

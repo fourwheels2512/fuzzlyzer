@@ -547,7 +547,7 @@ graduation to `0.5.0` follows smoke-test feedback per
   Weekend 6 — the flag exists but currently raises.
 - **DEV-KEY only.** Attestations are signed with an unencrypted PEM dev
   key. Age-encrypted PEM via `keyring` lands in v0.6; KMS in v1.0. See
-  [`SECURITY.md`](https://github.com/kirannayudu/topofuzz/blob/main/SECURITY.md)
+  [`SECURITY.md`](https://github.com/fourwheels2512/fuzzlyzer/blob/main/SECURITY.md)
   for the threat model.
 
-[0.5.0rc1]: https://github.com/kirannayudu/topofuzz/releases/tag/v0.5.0rc1
+[0.5.0rc1]: https://github.com/fourwheels2512/fuzzlyzer/releases/tag/v0.5.0rc1

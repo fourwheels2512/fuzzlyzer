@@ -82,6 +82,17 @@ class ScoreMatrixResult:
     (variant_ids, eval_ids) axes, so ``per_vendor_matrix.mean(axis=0)``
     is NOT the majority — it is the continuous per-vendor average. The
     majority lives in ``matrix`` exactly as before.
+
+    ``class_matrix`` (2026-05-30, v7) is the 3-state companion: a
+    ``(n_variants, n_evals)`` int8 array aligned cell-for-cell with
+    ``matrix``, coding ``-1`` missing, ``0`` deny, ``1`` approve, ``2``
+    conditional. Populated only when the DB carries the v7
+    ``verdict_class`` column AND at least one cell has an explicit class;
+    ``None`` otherwise (pre-v7 DBs, or runs where no judgement set a
+    class). When ``None``, the flip metric stays on the legacy
+    score-threshold path — byte-identical to before. When present,
+    ``compute_verdict_flip_rate(class_matrix=...)`` applies the clear-flip
+    gate (APPROVE-vs-DENY only; conditional tracked separately).
     """
 
     matrix: "np.ndarray"
@@ -90,6 +101,7 @@ class ScoreMatrixResult:
     rubric_hash: str
     per_vendor_matrix: "np.ndarray | None" = None
     vendor_ids: tuple[str, ...] = ()
+    class_matrix: "np.ndarray | None" = None
 
 
 def read_score_matrix(
@@ -192,6 +204,10 @@ def read_score_matrix(
             ).fetchall()
         }
         has_votes_json = "votes_json" in judge_cols
+        # v7 ``verdict_class`` probe — same conditional-read shape as
+        # votes_json so a pre-v7 DB still loads (class_matrix stays None →
+        # flip metric uses the legacy threshold path).
+        has_verdict_class = "verdict_class" in judge_cols
 
         # Pull the continuous-judge cells. ORDER BY canonical_hash on the
         # variant axis (handoff decision C) — variant_id IS the canonical
@@ -223,6 +239,19 @@ def read_score_matrix(
                     (run_id,),
                 ).fetchall()
             ]
+        if has_verdict_class:
+            vclass_rows = db.execute(
+                "SELECT variant_id, eval_id, verdict_class "
+                "FROM judge_results "
+                "WHERE run_id = ? "
+                "  AND judge_kind = 'continuous' "
+                "  AND failure_reason IS NULL "
+                "  AND score_value IS NOT NULL "
+                "ORDER BY variant_id, rowid",
+                (run_id,),
+            ).fetchall()
+        else:
+            vclass_rows = []
     finally:
         db.close()
 
@@ -263,6 +292,33 @@ def read_score_matrix(
         eval_index=eval_index,
     )
 
+    # Build the 3-state class_matrix aligned to ``matrix``. Codes: -1
+    # missing, 0 deny, 1 approve, 2 conditional. An explicit class wins;
+    # a "" / "dryrun" / NULL class on a scored cell falls back to the 0.5
+    # threshold (so a numeric-only run gets clear 0/1 codes and the flip
+    # metric matches the legacy path). Returns None unless at least one
+    # cell carried an EXPLICIT class — that keeps pre-3-state runs on the
+    # untouched threshold path (None → legacy in compute_verdict_flip_rate).
+    _CODE = {"approve": 1, "deny": 0, "conditional": 2}
+    class_matrix: "np.ndarray | None" = None
+    if vclass_rows and any(
+        (vc or "") in _CODE for _v, _e, vc in vclass_rows
+    ):
+        class_matrix = np.full(
+            (len(variant_ids), len(eval_ids)), -1, dtype=np.int8
+        )
+        for vid, eid, vclass in vclass_rows:
+            if vid not in variant_index or eid not in eval_index:
+                continue
+            i, j = variant_index[vid], eval_index[eid]
+            code = _CODE.get(vclass or "")
+            if code is None:
+                # "" / "dryrun" / unknown on a scored cell → threshold the
+                # continuous value (matches the legacy binarisation).
+                val = matrix[i, j]
+                code = 1 if (val == val and val >= 0.5) else 0  # NaN-safe
+            class_matrix[i, j] = code
+
     return ScoreMatrixResult(
         matrix=matrix,
         variant_ids=tuple(variant_ids),
@@ -270,6 +326,7 @@ def read_score_matrix(
         rubric_hash=rubric_hash,
         per_vendor_matrix=per_vendor_matrix,
         vendor_ids=vendor_ids,
+        class_matrix=class_matrix,
     )
 
 

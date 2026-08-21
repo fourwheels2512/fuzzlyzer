@@ -403,3 +403,107 @@ def test_wilson_deterministic():
     a = wilson_score_interval(7, 23)
     b = wilson_score_interval(7, 23)
     assert a == b
+
+
+# ---------------------------------------------------------------------------
+# 2026-05-30 clear-flip gate: class_matrix path
+# ---------------------------------------------------------------------------
+# Codes: -1 missing, 0 deny, 1 approve, 2 conditional.
+
+
+def test_class_matrix_conditional_excluded_from_flip_denominator():
+    """A CONDITIONAL cell opposite a clear verdict is NOT a clear flip and
+    is excluded from the denominator — tracked in conditional_pairs."""
+    scores = np.full((2, 3), 0.5)  # value channel irrelevant on class path
+    classes = np.array(
+        [
+            [1, 1, 1],   # original: approve, approve, approve
+            [0, 2, 1],   # permuted: deny (flip), conditional (excluded), approve (no flip)
+        ]
+    )
+    r = compute_verdict_flip_rate(
+        scores, original_index=0, seed=0, class_matrix=classes
+    )
+    # Clear↔clear pairs: eval0 (approve vs deny → flip) and eval2 (approve
+    # vs approve → no flip). eval1 is conditional → excluded.
+    assert r.numerator == 1
+    assert r.denominator == 2
+    assert r.clear_pairs == 2
+    assert r.conditional_pairs == 1
+    assert r.point == pytest.approx(0.5)
+
+
+def test_class_matrix_all_conditional_is_degenerate():
+    """When the original variant is conditional on every eval there is no
+    clear↔clear pair → flip rate undefined (degenerate), but the metric
+    still reports zero clear pairs and the conditional-pair count."""
+    scores = np.full((2, 3), 0.5)
+    classes = np.array(
+        [
+            [2, 2, 2],   # original conditional everywhere
+            [2, 1, 0],   # permuted: cond, approve, deny
+        ]
+    )
+    r = compute_verdict_flip_rate(
+        scores, original_index=0, seed=0, class_matrix=classes
+    )
+    # No clear↔clear pair exists → degenerate, point undefined.
+    assert r.degenerate_flag is True
+    assert r.point is None
+    assert r.clear_pairs == 0
+    # All three eval columns have the original conditional → 3 conditional
+    # pairs (both not-missing, not both clear).
+    assert r.conditional_pairs == 3
+
+
+def test_class_matrix_clear_flip_counts_only_approve_deny():
+    """Pure APPROVE↔DENY swing with no conditionals behaves like the
+    numeric path: full flip rate, zero conditional pairs."""
+    scores = np.full((2, 4), 0.5)
+    classes = np.array(
+        [
+            [1, 1, 1, 1],   # original approve
+            [0, 0, 0, 0],   # permuted deny → flips every eval
+        ]
+    )
+    r = compute_verdict_flip_rate(
+        scores, original_index=0, seed=0, class_matrix=classes
+    )
+    assert r.point == 1.0
+    assert r.clear_pairs == 4
+    assert r.conditional_pairs == 0
+
+
+def test_class_matrix_missing_code_excluded():
+    """A -1 (missing) cell drops from the denominator and is NOT counted as
+    a conditional pair."""
+    scores = np.full((2, 3), 0.5)
+    classes = np.array(
+        [
+            [1, 1, 1],
+            [0, -1, 1],   # eval1 missing
+        ]
+    )
+    r = compute_verdict_flip_rate(
+        scores, original_index=0, seed=0, class_matrix=classes
+    )
+    assert r.denominator == 2          # eval0 + eval2
+    assert r.conditional_pairs == 0    # the -1 is missing, not conditional
+    assert r.numerator == 1            # eval0 flips
+
+
+def test_class_matrix_shape_mismatch_raises():
+    scores = np.full((2, 3), 0.5)
+    bad = np.zeros((2, 2), dtype=int)
+    with pytest.raises(ValueError, match="shape"):
+        compute_verdict_flip_rate(
+            scores, original_index=0, class_matrix=bad
+        )
+
+
+def test_no_class_matrix_leaves_new_fields_none():
+    """Legacy numeric path must not populate the 3-state fields."""
+    scores = np.array([[0.8, 0.9], [0.1, 0.2]])
+    r = compute_verdict_flip_rate(scores, original_index=0, seed=0)
+    assert r.clear_pairs is None
+    assert r.conditional_pairs is None

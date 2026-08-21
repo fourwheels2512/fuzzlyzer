@@ -28,6 +28,21 @@ from topofuzz.inspect import (
 )
 
 
+def _combined_output(result) -> str:
+    """Stdout + stderr joined, regardless of Click version (mirrors
+    ``test_cli_audit._combined_output``). Click 8.2's ``CliRunner``
+    captures stderr separately; Click 8.1's default runner mixes it
+    into ``result.output`` and RAISES ``ValueError`` on ``.stderr`` —
+    so a bare ``result.stderr or result.output`` fallback never engages.
+    """
+    out = result.output or ""
+    try:
+        err = result.stderr or ""
+    except (AttributeError, ValueError):
+        err = ""  # Click 8.1: stderr already mixed into output.
+    return out + err
+
+
 # ---------------------------------------------------------------------------
 # Synthetic run fixture builder
 # ---------------------------------------------------------------------------
@@ -204,6 +219,45 @@ def test_find_inspect_pair_named_eval_with_no_flip_raises(tmp_path):
     run_dir = _make_run(tmp_path, with_flip=False)
     with pytest.raises(InspectError, match="No verdict flip"):
         find_inspect_pair(run_dir, eval_id="eval_001")
+
+
+def test_find_inspect_pair_excludes_explicit_conditional_cells(tmp_path):
+    """3-state regression (2026-06-11): a cell carrying an explicit v7
+    ``verdict_class='conditional'`` must contribute NEITHER side of a
+    flip. The §14 headline metric counts clear APPROVE↔DENY pairs only —
+    before this fix the inspector binarised the conditional cell via
+    ``passed``/threshold and rendered a "flip" the published rate never
+    counted."""
+    run_dir = _make_run(tmp_path, with_flip=True)  # legacy: flip exists
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    db.execute("ALTER TABLE judge_results ADD COLUMN verdict_class TEXT")
+    db.execute(
+        "UPDATE judge_results SET verdict_class = 'conditional' "
+        "WHERE variant_id = ?",
+        (_FLIPPING_HASH,),
+    )
+    db.commit()
+    db.close()
+    with pytest.raises(InspectError, match="No verdict flip"):
+        find_inspect_pair(run_dir)
+
+
+def test_find_inspect_pair_explicit_class_outranks_passed(tmp_path):
+    """3-state regression (2026-06-11): an explicit ``verdict_class``
+    wins over the legacy ``passed`` column — same precedence as the
+    shared :func:`topofuzz.metrics._verdict.verdict_of` rule."""
+    run_dir = _make_run(tmp_path, with_flip=False)  # legacy: no flip
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    db.execute("ALTER TABLE judge_results ADD COLUMN verdict_class TEXT")
+    db.execute(
+        "UPDATE judge_results SET verdict_class = 'deny' "
+        "WHERE variant_id = ?",
+        (_FLIPPING_HASH,),
+    )
+    db.commit()
+    db.close()
+    eid, c_idx, f_idx = find_inspect_pair(run_dir)
+    assert (eid, c_idx, f_idx) == ("eval_001", 0, 1)
 
 
 def test_find_inspect_pair_skips_judge_failures(tmp_path):
@@ -480,14 +534,14 @@ def test_cli_inspect_no_flip_exit1(tmp_path):
     runner = CliRunner()
     result = runner.invoke(app, ["inspect", str(run_dir)])
     assert result.exit_code == 1
-    assert "No verdict flip" in (result.stderr or result.output)
+    assert "No verdict flip" in _combined_output(result)
 
 
 def test_cli_inspect_missing_dir_exit2(tmp_path):
     runner = CliRunner()
     result = runner.invoke(app, ["inspect", str(tmp_path / "nope")])
     assert result.exit_code == 2
-    assert "not a directory" in (result.stderr or result.output)
+    assert "not a directory" in _combined_output(result)
 
 
 def test_cli_inspect_eval_option_plumbed(tmp_path):

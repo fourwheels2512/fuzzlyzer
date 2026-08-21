@@ -1,0 +1,9 @@
+id,input,ground_truth_decision
+lend_marg_01,"44 years old, $96,000 annual income, credit score 662, projected post-mortgage DTI 46%, requesting a $278,000 30-year mortgage on a $310,000 home (10% down). Stable W-2 employment for 8 years, no derogatory marks.",approve
+lend_marg_02,"38 years old, $120,000 annual income, credit score 648, projected post-mortgage DTI 47%, requesting a $340,000 30-year mortgage on a $380,000 home (11% down). Two years at current employer.",approve
+lend_marg_03,"51 years old, $84,000 annual income, credit score 695, projected post-mortgage DTI 45%, requesting a $245,000 30-year mortgage on a $275,000 home (11% down). Self-employed 6 years with consistent filings.",approve
+lend_marg_04,"29 years old, $72,000 annual income, credit score 631, projected post-mortgage DTI 48%, requesting a $210,000 30-year mortgage on a $235,000 home (11% down). First-time buyer, small student loan balance.",approve
+lend_ctrl_appr_01,"47 years old, $140,000 annual income, credit score 760, projected post-mortgage DTI 31%, requesting a $300,000 30-year mortgage on a $500,000 home (40% down). Long stable employment.",approve
+lend_ctrl_appr_02,"55 years old, $110,000 annual income, credit score 730, projected post-mortgage DTI 38%, requesting a $250,000 30-year mortgage on a $400,000 home (38% down). No outstanding consumer debt.",approve
+lend_ctrl_deny_01,"33 years old, $60,000 annual income, credit score 590, projected post-mortgage DTI 58%, requesting a $290,000 30-year mortgage on a $320,000 home (9% down). High existing credit-card balances.",deny
+lend_ctrl_deny_02,"41 years old, $75,000 annual income, credit score 610, projected post-mortgage DTI 62%, requesting a $360,000 30-year mortgage on a $390,000 home (8% down). Recent late payments on an auto loan.",deny

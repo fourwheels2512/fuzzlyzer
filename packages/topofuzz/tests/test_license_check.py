@@ -46,6 +46,22 @@ from topofuzz.license_check import (
 _NEVER_RESOLVED_FIXTURE = "nonexistent-fixture-path.py:graph"
 
 
+def _combined_output(result) -> str:
+    """Stdout + stderr joined, regardless of Click version (mirrors
+    ``test_cli_audit._combined_output``). Click 8.2's ``CliRunner``
+    captures stderr separately; Click 8.1's default runner mixes it
+    into ``result.output`` and RAISES ``ValueError`` on ``.stderr``.
+    Gate tests assert "this message appears somewhere the user saw",
+    so the join is the right contract under both versions.
+    """
+    out = result.output or ""
+    try:
+        err = result.stderr or ""
+    except (AttributeError, ValueError):
+        err = ""  # Click 8.1: stderr already mixed into output.
+    return out + err
+
+
 @pytest.fixture
 def fake_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Redirect ``Path.home()`` to ``tmp_path`` for the duration of the
@@ -350,7 +366,7 @@ def test_verify_skips_license_check_via_prompt_mock(
     result = runner.invoke(app, ["verify", str(fake_home / "no-such-run")])
     # Just ensure we got through to verify's body — it printed its own
     # diagnostic, not the gate's.
-    combined = (result.stdout or "") + (result.stderr or "")
+    combined = _combined_output(result)
     assert "license acceptance required" not in combined
     assert not acceptance_path().exists()
 
@@ -363,7 +379,7 @@ def test_scan_refuses_when_non_interactive_and_no_acceptance(
     runner = CliRunner()
     result = runner.invoke(app, ["scan", _NEVER_RESOLVED_FIXTURE])
     assert result.exit_code == LICENSE_REFUSED_EXIT_CODE
-    combined = (result.stdout or "") + (result.stderr or "")
+    combined = _combined_output(result)
     assert "license acceptance required" in combined
     assert not acceptance_path().exists()
 
@@ -376,7 +392,7 @@ def test_accept_license_flag_bypasses_gate(fake_home: Path) -> None:
     result = runner.invoke(
         app, ["--accept-license", "scan", _NEVER_RESOLVED_FIXTURE]
     )
-    combined = (result.stdout or "") + (result.stderr or "")
+    combined = _combined_output(result)
     assert "license acceptance required" not in combined
     assert acceptance_path().exists()
     data = json.loads(acceptance_path().read_text(encoding="utf-8"))
@@ -410,7 +426,7 @@ def test_accept_license_flag_after_subcommand_gives_placement_hint(
     result = runner.invoke(
         app, ["scan", _NEVER_RESOLVED_FIXTURE, "--accept-license"]
     )
-    combined = (result.stdout or "") + (result.stderr or "")
+    combined = _combined_output(result)
     assert "must come BEFORE the subcommand" in combined
 
 
@@ -443,7 +459,7 @@ def test_accept_license_flag_after_subcommand_includes_co_typos(
             "--accept-license",
         ],
     )
-    combined = (result.stdout or "") + (result.stderr or "")
+    combined = _combined_output(result)
     assert "must come BEFORE the subcommand" in combined
     assert "Also unknown option(s)" in combined
     assert "--variantss" in combined
@@ -458,7 +474,7 @@ def test_accept_license_persists_across_invocations(fake_home: Path) -> None:
     assert acceptance_path().exists()
     # Second run without the flag — should NOT hit the gate.
     result = runner.invoke(app, ["scan", _NEVER_RESOLVED_FIXTURE])
-    combined = (result.stdout or "") + (result.stderr or "")
+    combined = _combined_output(result)
     assert "license acceptance required" not in combined
 
 
@@ -484,13 +500,14 @@ def test_no_subcommand_does_not_create_acceptance(fake_home: Path) -> None:
     """``topofuzz`` (no subcommand) prints help and exits — the gate is
     only for invoked subcommands, so no acceptance file is created.
 
-    With ``no_args_is_help=True``, Click returns exit code 2 (the
-    classic "no command" code). What matters for the gate is that the
+    With ``no_args_is_help=True``, Click 8.2+ returns exit code 2 (the
+    classic "no command" code); Click 8.1 returned 0 for the same
+    help-and-exit path. What matters for the gate is that the
     acceptance file is NOT created, not the specific exit code.
     """
     runner = CliRunner()
     result = runner.invoke(app, [])
-    assert result.exit_code == 2
+    assert result.exit_code in (0, 2)
     assert not acceptance_path().exists()
 
 
@@ -544,5 +561,41 @@ def test_gate_fires_when_autouse_acceptance_removed(
     runner = CliRunner()
     result = runner.invoke(app, ["scan", _NEVER_RESOLVED_FIXTURE])
     assert result.exit_code == LICENSE_REFUSED_EXIT_CODE
-    combined = (result.stdout or "") + (result.stderr or "")
+    combined = _combined_output(result)
     assert "license acceptance required" in combined
+
+
+# ---------------------------------------------------------------------------
+# UX-1: `topofuzz ui` must never die at the CLI gate before the server
+# starts. A double-click / .bat / scheduled-task launch has no TTY — pre-fix,
+# `ui` was NOT in _LICENSE_EXEMPT_COMMANDS, so a fresh (unaccepted) machine
+# hit the same non-interactive refusal as `scan` above and exited 2 before
+# uvicorn ever bound a port. Enforcement for `ui` moves into the browser
+# (see test_ui_smoke.py's TestLicenseAcceptGate).
+# ---------------------------------------------------------------------------
+
+
+def test_ui_command_is_license_exempt(fake_home: Path) -> None:
+    """``topofuzz ui`` is in ``_LICENSE_EXEMPT_COMMANDS`` (UX-1)."""
+    assert "ui" in _LICENSE_EXEMPT_COMMANDS
+
+
+def test_ui_help_works_without_prior_acceptance(fake_home: Path) -> None:
+    """Regression guard for the double-click/no-TTY hang.
+
+    We can't spin up a real uvicorn server in a unit test, but ``--help``
+    proves the point: Click evaluates the group callback (``_root``, where
+    the gate lives) before it dispatches ``--help`` to the ``ui``
+    subcommand (see the ROB-1 comment in ``cli.py``). Pre-fix, `ui` was
+    not exempt, so this died with exit code 2 and "license acceptance
+    required" before ever reaching ui's own help text — proven by running
+    this exact assertion against pre-fix HEAD.
+    """
+    runner = CliRunner()
+    result = runner.invoke(app, ["ui", "--help"])
+    combined = _combined_output(result)
+    assert "license acceptance required" not in combined
+    assert result.exit_code == 0
+    # Exempt means never prompted AND never force-wrote an acceptance —
+    # the browser accept-gate (ui/app.py) is the only place that writes.
+    assert not acceptance_path().exists()

@@ -56,7 +56,7 @@ _END_NODE = "__end__"
 # producing canonical_hash collisions and cache poisoning.
 _RESERVED_NODE_ID_CHARS = (":",)
 
-_OOS_TRACKER = "https://github.com/kirannayudu/topofuzz/issues"
+_OOS_TRACKER = "https://github.com/fourwheels2512/fuzzlyzer/issues"
 
 
 def from_langgraph(

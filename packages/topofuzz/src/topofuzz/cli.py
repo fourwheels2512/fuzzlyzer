@@ -30,6 +30,8 @@ from __future__ import annotations
 import asyncio
 import atexit
 import logging
+import os
+import re
 import signal
 import sys
 from contextlib import ExitStack
@@ -51,6 +53,7 @@ from fuzzeval.keys import (
 from topofuzz import __version__
 from topofuzz.attest import load_and_verify_attestation
 from topofuzz.key_inspector import (
+    VENDORS,
     at_least_one_present,
     format_table,
     inspect_keys,
@@ -308,16 +311,198 @@ def _reject_unknown_extras(argv: list[str]) -> None:
     raise typer.Exit(code=_BAD_USAGE_EXIT)
 
 
-# Subcommands that skip the first-run license click-through.
+# Subcommands that skip the first-run license click-through's BLOCKING
+# behavior. Two distinct exemption flavors live in ``_root()``:
 #
 # ``verify`` is the buyer-side audit tool — re-verifying a topofuzz
 # attestation bundle is not "using" topofuzz commercially, so requiring
 # acceptance there would block third-party auditors. BACKLOG entry
 # "CLI click-through" boundary condition: "Skip the prompt_and_record
-# call ONLY for verify." Every other subcommand (scan / run / report /
-# repro / inspect / publish / confirm / ablate / keygen /
-# langgraph-import / ui) is gated.
-_LICENSE_EXEMPT_COMMANDS: frozenset[str] = frozenset({"verify"})
+# call ONLY for verify." Its exemption is hard-coded directly in
+# ``_root()`` (zero side effects — no ``.env`` fill either) but listed
+# here too for documentation and the drift-guard test below.
+#
+# ``ui`` (UX-1, 2026-07) launches the local web server a user
+# "double-clicks" into — a non-interactive start (no TTY: a shortcut,
+# ``.bat``, or scheduled task) must never die at a stdin prompt before
+# the server is even listening. It still gets the normal ``.env`` fill
+# in ``_root()`` (unlike ``verify``); only the BLOCKING prompt is
+# skipped. License enforcement for ``ui`` moves into the browser: the
+# run-starting route (``POST /setup`` in ``topofuzz.ui.app``) refuses
+# to spawn a subprocess until the operator has clicked "I accept" on
+# the landing page, which calls ``license_check.record_acceptance()``
+# — the exact same ``~/.topofuzz/license-accepted`` file the CLI gate
+# reads/writes, so accepting once in the browser also satisfies a
+# later bare ``topofuzz run`` from the same machine.
+#
+# Every other subcommand (scan / run / report / repro / inspect /
+# publish / confirm / ablate / keygen / langgraph-import) is gated.
+_LICENSE_EXEMPT_COMMANDS: frozenset[str] = frozenset({"verify", "ui"})
+
+
+# ---------------------------------------------------------------------------
+# .env auto-load (ops fix, 2026-06-11)
+# ---------------------------------------------------------------------------
+# LiteLLM reads vendor keys (GEMINI_API_KEY, DEEPSEEK_API_KEY, …) from the
+# process environment only. Before this hook, a key parked in the project's
+# ``.env`` was silently ignored unless the operator remembered to ``export``
+# it in every shell — the documented 2026-05-30 failure mode, where
+# API_KEY_INVALID surfaced from the vendor AFTER the license prompt and
+# cost estimate. The loader is deliberately tiny and stdlib-only (no
+# python-dotenv dependency — that would land in the verify-path import
+# graph): ``KEY=VALUE`` lines, ``#`` comments, optional ``export `` prefix,
+# optional matching single/double quotes, `` #``-prefixed inline comments.
+#
+# Two hard safety rules (RT 2026-06-11):
+#
+# * **Vendor-key allowlist.** Only the env var names in
+#   :data:`key_inspector.VENDORS` are ever filled. Topofuzz's pitch is
+#   auditing THIRD-PARTY multi-agent repos, so "operator runs topofuzz
+#   from a hostile checkout" is a realistic posture — an unrestricted
+#   loader would let a dropped ``.env`` set absent-by-default vars like
+#   ``OPENAI_API_BASE`` (silently rerouting the operator's vendor
+#   traffic AND keys to an attacker endpoint) or ``PYTHONPATH``
+#   (arbitrary import in the UI's ``subprocess`` children). The
+#   allowlist kills that entire class: worst case, a hostile ``.env``
+#   plants a *key*, which only ever bills the attacker.
+# * **Real environment variables ALWAYS win** — only absent keys are
+#   filled — and ``TOPOFUZZ_NO_DOTENV=1`` disables the hook entirely
+#   (the test suite sets it in ``conftest.py`` so the developer's
+#   repo-root ``.env`` cannot leak into CLI tests).
+_DOTENV_DISABLE_ENV = "TOPOFUZZ_NO_DOTENV"
+_DOTENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Env var names the ``.env`` loader may fill — sourced from the stable
+# public vendor list so a future vendor addition extends the loader
+# automatically (and inherits key_inspector's SECURITY.md drift guard).
+_DOTENV_ALLOWED_KEYS: frozenset[str] = frozenset(
+    env_name for _vendor, env_name in VENDORS
+)
+
+
+def _load_dotenv_if_present(directory: Path | None = None) -> int:
+    """Fill missing vendor API keys in ``os.environ`` from
+    ``<directory>/.env`` (default: cwd).
+
+    Best-effort: a missing, unreadable, or malformed file is a silent
+    no-op (per-line garbage is skipped, not fatal). Non-vendor keys are
+    ignored and existing environment variables are never overwritten —
+    see the block comment above for the threat model. Returns the number
+    of variables set so :func:`_root` can surface a one-line notice on
+    stderr.
+    """
+    if os.environ.get(_DOTENV_DISABLE_ENV):
+        return 0
+    path = (directory or Path.cwd()) / ".env"
+    try:
+        if not path.is_file():
+            return 0
+        # utf-8-sig: PowerShell's UTF-8 writers prepend a BOM; plain
+        # utf-8 would glue it onto the first key and silently drop it.
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return 0
+    loaded = 0
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if not sep or not _DOTENV_KEY_RE.match(key):
+            continue
+        value = value.strip()
+        if value[:1] in ("'", '"'):
+            # Quoted value: take up to the matching close quote, which
+            # also drops any `` # comment`` after it. A value with no
+            # close quote is kept verbatim (best-effort contract).
+            close = value.find(value[0], 1)
+            if close != -1:
+                value = value[1:close]
+        else:
+            comment_at = value.find(" #")
+            if comment_at != -1:
+                value = value[:comment_at].rstrip()
+        if key not in _DOTENV_ALLOWED_KEYS or key in os.environ:
+            continue
+        os.environ[key] = value
+        loaded += 1
+    return loaded
+
+
+def _harden_no_dotenv_against_litellm_autoload(
+    _trigger_litellm_import: Any = None,
+) -> None:
+    """Close the gap where ``litellm``'s own dotenv autoload defeats
+    ``TOPOFUZZ_NO_DOTENV``.
+
+    :func:`_load_dotenv_if_present` above respects ``TOPOFUZZ_NO_DOTENV``
+    — but ``litellm`` runs its OWN ``dotenv.load_dotenv()`` at import
+    time (unconditionally, whenever ``LITELLM_MODE`` defaults to
+    ``"DEV"``), completely unaware of our flag. ``topofuzz.runner.
+    _call_llm`` only imports ``litellm`` lazily, at the moment of the
+    FIRST real (non-stubbed) agent call — by then it's too late to
+    intercept: whatever vendor key litellm's autoload silently filled in
+    from the repo's real ``.env`` has already been read by the LLM SDK.
+
+    Fix: force the (idempotent — ``sys.modules``-cached) litellm import
+    to happen HERE, under our control, the moment ``TOPOFUZZ_NO_DOTENV``
+    is set. Snapshot which of the 4 known vendor env vars were REALLY
+    present immediately before, then strip any of those 4 vars that
+    appeared afterward — i.e. undo exactly what litellm's autoload just
+    did, and nothing else. Every later ``import litellm`` anywhere in
+    the process (e.g. inside ``runner._call_llm``) then hits the
+    ``sys.modules`` cache and re-runs no dotenv logic.
+
+    No-op when ``TOPOFUZZ_NO_DOTENV`` is unset: real users who want the
+    repo ``.env`` to reach litellm (via our own loader above, or via
+    litellm's own autoload) keep today's behavior unchanged.
+
+    ``_trigger_litellm_import`` is a test seam: production callers leave
+    it ``None`` (a real ``import litellm``); tests inject a fake so the
+    suite never touches the repo's real ``.env`` / live keys.
+    """
+    if not os.environ.get(_DOTENV_DISABLE_ENV):
+        return
+    vendor_vars = tuple(_DOTENV_ALLOWED_KEYS)
+    was_present = {name: (name in os.environ) for name in vendor_vars}
+    try:
+        if _trigger_litellm_import is not None:
+            _trigger_litellm_import()
+        else:
+            import litellm  # noqa: F401
+    except ImportError:
+        return
+    for name in vendor_vars:
+        if not was_present[name] and name in os.environ:
+            del os.environ[name]
+
+
+def _reconfigure_stdio_utf8() -> None:
+    """Force ``sys.stdout`` / ``sys.stderr`` to UTF-8, best-effort.
+
+    ROB-1: help text and banners contain non-ASCII characters (``→``,
+    ``—``, ``§``). On a default Windows console/pipe the process's
+    stdout is opened with the legacy codepage (typically cp1252),
+    which either raises ``UnicodeEncodeError`` (crashing ``--help``
+    output rendered via ``rich``) or silently mojibakes the text
+    (plain ``click.echo`` writes). Reconfiguring to UTF-8 once, at the
+    earliest CLI entry point, fixes both — mirroring the ``PYTHONIOENCODING
+    =utf-8`` the UI subprocess already sets for the same reason.
+
+    ``hasattr`` + try/except make this a true no-op when the stream
+    doesn't support reconfiguration (e.g. a bare ``io.StringIO`` some
+    test harnesses substitute for stdout) or reconfigure() itself
+    refuses (a stream already mid-write). Never raises.
+    """
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            try:
+                _stream.reconfigure(encoding="utf-8")
+            except (ValueError, OSError, AttributeError):
+                pass
 
 
 @app.callback(invoke_without_command=True)
@@ -337,18 +522,47 @@ def _root(
         ),
     ),
 ) -> None:
+    # Earliest point every subcommand (including `--help` on a
+    # subcommand — Click invokes the group callback before parsing the
+    # subcommand's own args, see ROB-1) passes through. Must run before
+    # any typer.echo below.
+    _reconfigure_stdio_utf8()
     if version:
         typer.echo(f"topofuzz {__version__}")
         raise typer.Exit()
     if ctx.invoked_subcommand is None:
         typer.echo(ctx.get_help())
         raise typer.Exit()
-    # First-run license click-through. ``verify`` (and any other
-    # auditor-facing command) is exempt — see _LICENSE_EXEMPT_COMMANDS.
-    # Detection of non-interactive context uses sys.stdin.isatty(); CI
-    # / piped invocations MUST pass --accept-license or the command
-    # refuses with exit code 2 and an actionable message.
+    # First-run license click-through. See _LICENSE_EXEMPT_COMMANDS'
+    # docstring for the two distinct exemption flavors.
+    if ctx.invoked_subcommand == "verify":
+        # Deliberately ABOVE the .env hook: ``verify`` is the
+        # auditor-facing, minimal-side-effect trust anchor — it needs no
+        # vendor keys, so it gets no cwd file read and no os.environ
+        # mutation (RT 2026-06-11).
+        return
+    # Fill missing vendor keys from ``$CWD/.env`` before key-consuming
+    # subcommands run — see the loader's block comment for the failure
+    # mode this closes and the threat model. The notice goes to stderr
+    # so stdout-parsing CI pipelines are unaffected. ``ui`` gets this
+    # fill too (it consumes vendor keys via the browser keystore's
+    # os.environ fallback) even though its license prompt is skipped
+    # below.
+    loaded_env = _load_dotenv_if_present()
+    if loaded_env:
+        typer.echo(
+            f"topofuzz: loaded {loaded_env} vendor key(s) from .env "
+            f"(existing environment variables win; set "
+            f"{_DOTENV_DISABLE_ENV}=1 to disable).",
+            err=True,
+        )
     if ctx.invoked_subcommand in _LICENSE_EXEMPT_COMMANDS:
+        # ``ui`` (UX-1): never block server startup on the CLI gate —
+        # acceptance is enforced in-browser before any run can launch.
+        # Detection of non-interactive context (below, for every other
+        # command) uses sys.stdin.isatty(); CI / piped invocations MUST
+        # pass --accept-license or the command refuses with exit code 2
+        # and an actionable message.
         return
     non_interactive = not sys.stdin.isatty()
     try:
@@ -688,6 +902,17 @@ def run(
             "Agent rollouts STILL bill real money (use --max-cost-usd to cap)."
         ),
     ),
+    simulate: bool = typer.Option(
+        False,
+        "--simulate",
+        "--offline",
+        help=(
+            "Fully offline: stub BOTH agent rollouts and the judge with "
+            "deterministic responses. Makes ZERO network calls and cannot "
+            "bill. Use to smoke-test that a fixture/eval/topology wire up "
+            "before spending. Implies --dry-run's judge stub."
+        ),
+    ),
     yes: bool = typer.Option(
         False,
         "--yes",
@@ -724,6 +949,25 @@ def run(
         err=True,
     )
 
+    # --simulate implies the judge's --dry-run stub too (offline means
+    # OFFLINE — no real judge call either). Reassigning here (rather than
+    # threading a second flag through every dry_run-gated branch below)
+    # gets every existing dry_run-conditional behavior (cache disabling,
+    # judge construction, the manifest field, the [DRY-RUN] banner)
+    # correct for free.
+    if simulate:
+        dry_run = True
+
+    # Close the TOPOFUZZ_NO_DOTENV / litellm-autoload gap before any
+    # heavier imports happen — see the function's docstring for the
+    # threat model. Skipped under --simulate: offline mode never imports
+    # litellm at all (agent rollouts use the offline stub injected
+    # below; the judge is dry-run), so there's nothing to harden, and
+    # forcing the import here would needlessly require litellm to be
+    # installed just to smoke-test a fixture wiring offline.
+    if not simulate:
+        _harden_no_dotenv_against_litellm_autoload()
+
     # Lazy imports of the runtime stack (orchestrator + loaders +
     # variant generators + judge). Keeping these out of module scope
     # is the §11a "verify-path-safe" contract: ``topofuzz verify``
@@ -732,13 +976,30 @@ def run(
     from fuzzeval.judge import JuryJudge, SingleJudge
 
     from topofuzz.loaders import load_eval_rows, load_topology
-    from topofuzz.orchestrator import RunPlan, write_manifest
+    from topofuzz.orchestrator import (
+        RunDirError,
+        RunPlan,
+        read_failure_summary,
+        write_manifest,
+    )
     from topofuzz.runids import new_run_id
     from topofuzz.variants.generators import (
         decoding_param_swap,
         order_swap,
         role_swap,
     )
+
+    # --simulate's agent-rollout stub. Reuses the EXACT stub
+    # ``topofuzz audit --dry-run`` already relies on for the same
+    # contract ("every LLM call short-circuits, zero network, zero
+    # bill") rather than inventing a second one — see
+    # ``counterfactual_audit._dry_run_llm_callable``'s docstring for why
+    # it's LiteLLM-response-shaped and constant across calls.
+    simulate_llm_callable = None
+    if simulate:
+        from topofuzz.counterfactual_audit import _dry_run_llm_callable
+
+        simulate_llm_callable = _dry_run_llm_callable
 
     # Reserved-flag + unknown-flag enforcement. Order matters: reserved
     # gets its specific message, then any remaining tokens are unknown.
@@ -1060,13 +1321,39 @@ def run(
         "rubric": str(effective_rubric_path),
         "rubric_hash": judge.rubric_hash,
         "dry_run": dry_run,
+        "simulate": simulate,
     }
-    write_manifest(plan, cli_args=cli_args)
+    try:
+        write_manifest(plan, cli_args=cli_args)
+    except RunDirError as e:
+        # ROB-2: a bad --out path (nonexistent drive, or a path whose
+        # parent is an existing file) used to raise a raw OSError
+        # traceback here. Surface a clean, actionable message instead.
+        typer.echo(
+            f"topofuzz run: could not create output directory {run_dir}: {e}",
+            err=True,
+        )
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
 
     if dry_run:
         typer.echo("[DRY-RUN] No real judge LLM calls — every cell gets ContinuousScore(0.5).")
+    if simulate:
+        typer.echo(
+            "[SIMULATE] Offline mode: agent rollouts are ALSO stubbed — "
+            "zero network calls; this run cannot bill."
+        )
 
-    result = _run_with_signal_handling(plan, judge=judge)
+    # Thread the fixture-exported prompt_builder (if any) into the run.
+    # Sourced from the Topology side-channel attached by load_topology —
+    # deliberately NOT from cli_args (which would trip the F4/F7
+    # attribution refusal guards). None → orchestrator uses _default_prompt.
+    from topofuzz.loaders import get_prompt_builder
+    result = _run_with_signal_handling(
+        plan,
+        judge=judge,
+        prompt_builder=get_prompt_builder(topology),
+        llm_callable=simulate_llm_callable,
+    )
 
     typer.echo("")
     typer.echo(f"Run id: {result.run_id}")
@@ -1076,6 +1363,17 @@ def run(
         f"Cells: {result.successful_cells} ok / {result.completed_cells} "
         f"completed / {result.total_cells} planned"
     )
+    # ROB-4: a misconfigured run (e.g. a judge rubric KeyError) used to
+    # stop at "Status: failed" with the actual reason visible ONLY by
+    # opening run.sqlite by hand (judge_results.failure_reason / cells
+    # .error). Surface a one-line summary whenever any cell failed or
+    # the run didn't fully succeed.
+    if result.successful_cells < result.completed_cells or result.status in (
+        "failed", "degraded",
+    ):
+        failure_summary = read_failure_summary(result.run_dir, run_id=result.run_id)
+        if failure_summary:
+            typer.echo(f"Failure: {failure_summary}")
     typer.echo(f"Cost (priced cells only): ${result.total_cost_usd:.4f}")
     # Step 12b: surface §B DoD #14 jury accounting from the JuryJudge
     # instance. Done here (CLI scope) rather than via manifest plumbing
@@ -1345,7 +1643,13 @@ def _preflight_cost(
         raise typer.Exit(code=0)
 
 
-def _run_with_signal_handling(plan: RunPlan, *, judge: Any = None) -> Any:
+def _run_with_signal_handling(
+    plan: RunPlan,
+    *,
+    judge: Any = None,
+    prompt_builder: Any = None,
+    llm_callable: Any = None,
+) -> Any:
     """Run the orchestrator with SIGINT → cancel-event wiring.
 
     On Ctrl+C the orchestrator's cancel event is set; the runner stops
@@ -1358,6 +1662,12 @@ def _run_with_signal_handling(plan: RunPlan, *, judge: Any = None) -> Any:
     the orchestrator's ``judge_prompt_renderer`` so the §7 JudgeCache
     ``prompt_hash`` slot keys on the rendered prompt rather than the
     full eval_row (step-5 stopgap).
+
+    ``llm_callable``, when supplied (``run --simulate``), is forwarded
+    to :func:`topofuzz.orchestrator.execute_run` unchanged — it is
+    threaded all the way down to ``runner.run_variant``, which uses it
+    INSTEAD OF litellm for every agent rollout. ``None`` preserves
+    today's behavior (the runner falls back to real litellm).
     """
     # Lazy import of the orchestrator (mirrors the lazy-import policy
     # in :func:`run` — see comment there about §11a verify-path safety).
@@ -1368,7 +1678,7 @@ def _run_with_signal_handling(plan: RunPlan, *, judge: Any = None) -> Any:
     # and 5-10× cache miss amplification on warm runs.
     # (closes BACKLOG: model_served_version_resolver)
     from topofuzz.orchestrator import execute_run
-    from topofuzz.runner import default_resolver
+    from topofuzz.runner import _default_prompt, default_resolver
 
     loop_cancel = asyncio.Event()
 
@@ -1389,16 +1699,32 @@ def _run_with_signal_handling(plan: RunPlan, *, judge: Any = None) -> Any:
         loop_cancel.set()
 
     previous = signal.signal(signal.SIGINT, _signal_handler)
+    # Build the execute_run kwargs, adding ``llm_callable`` only when the
+    # caller actually supplied one (``run --simulate``). Several existing
+    # tests monkeypatch ``orchestrator.execute_run`` with a wrapper that
+    # does ``kwargs.setdefault("llm_callable", fake_llm)`` to inject their
+    # own stub — that pattern only works if we don't *also* pass
+    # ``llm_callable=None`` explicitly (an explicit ``None`` would win
+    # over their ``setdefault`` and silently fall through to real
+    # litellm). Omitting the kwarg when unset preserves that contract
+    # while still letting --simulate's stub reach the orchestrator.
+    execute_run_kwargs: dict[str, Any] = {
+        "cancel": loop_cancel,
+        "judge": judge,
+        "judge_prompt_renderer": judge.render_prompt if judge is not None else None,
+        "resolver": default_resolver,
+        # Fixture-exported deterministic prompt builder (or the runner
+        # default when the fixture exported none). NOT sourced from
+        # manifest cli_args — see load_topology / get_prompt_builder for
+        # the F4/F7-safety rationale.
+        "prompt_builder": (
+            prompt_builder if prompt_builder is not None else _default_prompt
+        ),
+    }
+    if llm_callable is not None:
+        execute_run_kwargs["llm_callable"] = llm_callable
     try:
-        return asyncio.run(
-            execute_run(
-                plan,
-                cancel=loop_cancel,
-                judge=judge,
-                judge_prompt_renderer=judge.render_prompt if judge is not None else None,
-                resolver=default_resolver,
-            )
-        )
+        return asyncio.run(execute_run(plan, **execute_run_kwargs))
     finally:
         signal.signal(signal.SIGINT, previous)
 
@@ -2005,16 +2331,30 @@ def confirm(
         )
         raise typer.Exit(code=_BAD_USAGE_EXIT)
 
+    # Lazy import: the confirm pass pulls the runtime stack (loaders →
+    # langgraph, runner → litellm, the variant generators). Keeping it
+    # out of module scope preserves the §11a verify-path-safe contract.
+    from topofuzz.confirm import ConfirmError, run_confirm_pass
+
+    # ROB-5: validate the source run BEFORE the spend-confirmation
+    # prompt below. ``_load_manifest`` is the same cheap, local-file-only
+    # check ``run_confirm_pass`` performs internally as its first step —
+    # reused here (not duplicated) so an invalid/missing run_dir (e.g.
+    # missing manifest.json) errors out immediately instead of only
+    # AFTER the operator answers the "bills real LLM calls?" prompt.
+    from topofuzz.confirm import _load_manifest as _confirm_load_manifest
+
+    try:
+        _confirm_load_manifest(run_dir_path)
+    except ConfirmError as e:
+        typer.echo(f"topofuzz confirm: {e}", err=True)
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+
     typer.echo(
         "topofuzz: research tool, no warranty. The confirm pass re-runs "
         "the pipeline and bills real LLM calls. See LICENSE.",
         err=True,
     )
-
-    # Lazy import: the confirm pass pulls the runtime stack (loaders →
-    # langgraph, runner → litellm, the variant generators). Keeping it
-    # out of module scope preserves the §11a verify-path-safe contract.
-    from topofuzz.confirm import ConfirmError, run_confirm_pass
 
     if not yes:
         if not typer.confirm(
@@ -2149,6 +2489,26 @@ def ablate(
         )
         raise typer.Exit(code=_BAD_USAGE_EXIT)
 
+    from topofuzz.ablation import (
+        AblationError,
+        run_ablation_pass,
+        validate_ablation_source,
+    )
+
+    # ROB-5: validate the source run BEFORE the spend-confirmation
+    # prompt below. Without this, an invalid run_dir (e.g. missing
+    # manifest.json, or a non-jury-of-3 source) only surfaced its error
+    # AFTER the operator answered the "bills real LLM calls?" prompt —
+    # billing anxiety for a run that was always going to fail. This
+    # check is pure local file I/O (no LLM calls), so it's free to run
+    # early; `run_ablation_pass` re-validates internally, which is
+    # cheap and keeps that function's own contract self-contained.
+    try:
+        validate_ablation_source(run_dir_path)
+    except AblationError as e:
+        typer.echo(f"topofuzz ablate: {e}", err=True)
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+
     if not dry_run:
         typer.echo(
             "topofuzz: research tool, no warranty. The ablate pass re-"
@@ -2156,8 +2516,6 @@ def ablate(
             "this bills real LLM calls. See LICENSE.",
             err=True,
         )
-
-    from topofuzz.ablation import AblationError, run_ablation_pass
 
     if not yes and not dry_run:
         if not typer.confirm(
@@ -2475,6 +2833,27 @@ def audit(
         typer.echo(f"topofuzz audit: {e.message}", err=True)
         raise typer.Exit(code=_BAD_USAGE_EXIT) from e
 
+    from topofuzz.counterfactual_audit import (
+        AuditError,
+        run_audit_pass,
+        validate_audit_source,
+    )
+    from topofuzz.orchestrator import install_resolver_mismatch_dedup
+
+    # ROB-5: validate the source run BEFORE the spend-confirmation
+    # prompt below. Without this, an invalid run_dir (e.g. missing
+    # manifest.json, or a non-jury-of-3 source) only surfaced its error
+    # AFTER the operator answered the "bills real LLM calls?" prompt —
+    # billing anxiety for a run that was always going to fail. This
+    # check is pure local file I/O (no LLM calls), so it's free to run
+    # early; `run_audit_pass` re-validates internally, which is cheap
+    # and keeps that function's own contract self-contained.
+    try:
+        validate_audit_source(run_dir_path)
+    except AuditError as e:
+        typer.echo(f"topofuzz audit: {e}", err=True)
+        raise typer.Exit(code=_BAD_USAGE_EXIT) from e
+
     if not dry_run:
         typer.echo(
             "topofuzz: research tool, no warranty. The audit pass "
@@ -2482,9 +2861,6 @@ def audit(
             "the jury — this bills real LLM calls. See LICENSE.",
             err=True,
         )
-
-    from topofuzz.counterfactual_audit import AuditError, run_audit_pass
-    from topofuzz.orchestrator import install_resolver_mismatch_dedup
 
     # Pass-2 RT M-A fix: install the same dedup filter the ``run``
     # command uses. The audit path emits resolver-mismatch warnings

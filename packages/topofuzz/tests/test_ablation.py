@@ -59,6 +59,7 @@ from topofuzz.ablation import (  # noqa: E402
     find_all_flipping_triples,
     read_ablation_sidecar,
     run_ablation_pass,
+    validate_ablation_source,
 )
 from topofuzz.ir import Edge, LLMConfig, Node, Topology  # noqa: E402
 
@@ -300,6 +301,65 @@ def test_run_ablation_pass_rejects_missing_manifest(tmp_path):
     empty.mkdir()
     with pytest.raises(AblationError, match="manifest.json missing"):
         run_ablation_pass(empty)
+
+
+def test_validate_ablation_source_rejects_missing_manifest(tmp_path):
+    """ROB-5: :func:`validate_ablation_source` is the cheap, side-effect-
+    free precondition check :func:`run_ablation_pass` runs first — it
+    must raise the SAME ``AblationError`` on a missing manifest so the
+    CLI can call it standalone, before the spend-confirmation prompt,
+    without duplicating validation logic."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(AblationError, match="manifest.json missing"):
+        validate_ablation_source(empty)
+
+
+def test_validate_ablation_source_accepts_valid_jury_manifest(tmp_path):
+    """The happy path returns the parsed manifest dict (reused by
+    run_ablation_pass so the source run isn't read twice)."""
+    A, B = "a" * 64, "b" * 64
+    rows = [
+        ("synth-0001", A, "eval_001", "continuous", 0.9, None, None, None),
+        ("synth-0001", B, "eval_001", "continuous", 0.1, None, None, None),
+    ]
+    run_dir = _write_synthetic_run(tmp_path, judge_rows=rows, hashes=[A, B])
+    manifest = validate_ablation_source(run_dir)
+    assert manifest["cli_args"]["jury_of_3"] is True
+
+
+# ---------------------------------------------------------------------------
+# ROB-5: `topofuzz ablate` CLI validates the source run BEFORE the
+# interactive spend-confirmation prompt.
+# ---------------------------------------------------------------------------
+
+
+def test_cli_ablate_missing_manifest_errors_before_spend_prompt(tmp_path):
+    """An existing-but-invalid run_dir (a real directory with no
+    manifest.json) must error out immediately with no billing prompt.
+
+    Verified against the pre-fix CLI ordering: the ``run_dir.is_dir()``
+    check passed (the directory DOES exist), so the code proceeded to
+    print "topofuzz: research tool... this bills real LLM calls" and
+    the "Run counterfactual ablation ... ?" confirmation BEFORE
+    ``run_ablation_pass`` ever got a chance to raise
+    ``AblationError("manifest.json missing...")`` — exit code 0 with an
+    "Aborted." line (CliRunner's stdin is empty). Post-fix, the
+    validation runs first: exit 2, no prompt text anywhere in the
+    output, no stdin needed.
+    """
+    from typer.testing import CliRunner
+
+    from topofuzz.cli import app
+
+    empty_dir = tmp_path / "empty-run"
+    empty_dir.mkdir()
+
+    result = CliRunner().invoke(app, ["ablate", str(empty_dir)])
+    assert result.exit_code == 2, result.output
+    assert "manifest.json missing" in result.output
+    assert "bills real LLM calls" not in result.output
+    assert "Aborted" not in result.output
 
 
 def test_run_ablation_pass_no_flips_writes_empty_sidecar(tmp_path):

@@ -3139,8 +3139,15 @@ def _extract_flip_counts(
     if not isinstance(verdict_flip_rate, dict):
         return None, None, None
     point_raw = verdict_flip_rate.get("point")
-    n_pairs_raw = verdict_flip_rate.get("n_pairs")
-    n_flips_raw = verdict_flip_rate.get("n_flips")
+    # Schema note: the 3-state verdict work renamed the count keys from
+    # ``n_pairs``/``n_flips`` to ``denominator``/``numerator`` (and added
+    # ``clear_pairs``/``conditional_pairs``). Read the current keys first,
+    # fall back to the legacy names so cards render on both old and new runs.
+    # Without this, a current-schema run has neither legacy key -> both come
+    # back None -> the card wrongly falls into the "stable run" branch while
+    # _build_flip_card still shows a real flip (self-contradiction).
+    n_pairs_raw = verdict_flip_rate.get("denominator", verdict_flip_rate.get("n_pairs"))
+    n_flips_raw = verdict_flip_rate.get("numerator", verdict_flip_rate.get("n_flips"))
 
     def _to_float(v: Any) -> float | None:
         if isinstance(v, bool) or not isinstance(v, (int, float)):

@@ -592,6 +592,71 @@ def _load_judge_score(
 # ---------------------------------------------------------------------------
 
 
+def validate_audit_source(run_dir: Path | str) -> dict:
+    """Cheap, side-effect-free validation of a source run for audit.
+
+    Checks manifest.json exists/parses, the source ran ``--jury-of-3``,
+    and that no incompatible custom-builder / jury-kwargs fields are
+    present — everything :func:`run_audit_pass` needs to refuse BEFORE
+    it does any real work. No LLM calls and no ``run.sqlite`` reads
+    happen here, so it is safe for the CLI to call this ahead of the
+    interactive spend-confirmation prompt (ROB-5): an invalid or
+    missing source run then errors out immediately instead of only
+    AFTER the operator has answered "bills real LLM calls? [y/N]".
+
+    Returns the parsed manifest dict (reused by :func:`run_audit_pass`
+    so the source run is not re-read).
+
+    Raises:
+        AuditError: manifest missing/malformed; ``run_id`` missing;
+            source run was not jury-of-3; custom prompt_builder or
+            jury-construction fields present.
+    """
+    run_dir = Path(run_dir)
+    manifest = _load_manifest(run_dir)
+    run_id = manifest.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise AuditError("manifest.run_id missing or not a string.")
+    cli_args = manifest.get("cli_args") or {}
+    if not isinstance(cli_args, dict):
+        raise AuditError("manifest.cli_args missing or wrong shape.")
+    if not cli_args.get("jury_of_3"):
+        raise AuditError(
+            "audit requires a jury-of-3 source run "
+            "(manifest.cli_args.jury_of_3 != True). The leave-one-out "
+            "re-judgments inherit the source run's judge-noise floor; "
+            "without jury voting that floor is ~26 % per-judgment, which "
+            "drowns the attribution signal. Re-run the source with "
+            "`--jury-of-3` first."
+        )
+
+    # Same prompt-builder / jury-kwargs refusals as ablation.py so we
+    # don't silently measure something different than the source.
+    _PROMPT_BUILDER_KEYS = (
+        "prompt_builder", "prompt_builder_module", "prompt_builder_path"
+    )
+    custom_builder = [k for k in _PROMPT_BUILDER_KEYS if cli_args.get(k)]
+    if custom_builder:
+        raise AuditError(
+            "audit refuses to run on a source manifest that carries a "
+            "custom prompt_builder field "
+            f"({', '.join(custom_builder)}): the Phase-1 counterfactual "
+            "cell generation would use the runner's default prompt builder, "
+            "producing incomparable prompts."
+        )
+    _RECONSTRUCT_INCOMPATIBLE_KEYS = (
+        "jury_temperature", "jury_max_tokens", "jury_seed",
+        "jury_kwargs", "judge_kwargs",
+    )
+    incompatible = [k for k in _RECONSTRUCT_INCOMPATIBLE_KEYS if k in cli_args]
+    if incompatible:
+        raise AuditError(
+            "audit refuses to run on a source manifest with unrecognised "
+            f"jury-construction fields ({', '.join(incompatible)})."
+        )
+    return manifest
+
+
 def run_audit_pass(
     run_dir: Path | str,
     *,
@@ -649,47 +714,9 @@ def run_audit_pass(
             run was not jury-of-3; the fixture can't be loaded.
     """
     run_dir = Path(run_dir)
-    manifest = _load_manifest(run_dir)
+    manifest = validate_audit_source(run_dir)
     run_id = manifest.get("run_id")
-    if not isinstance(run_id, str) or not run_id:
-        raise AuditError("manifest.run_id missing or not a string.")
     cli_args = manifest.get("cli_args") or {}
-    if not isinstance(cli_args, dict):
-        raise AuditError("manifest.cli_args missing or wrong shape.")
-    if not cli_args.get("jury_of_3"):
-        raise AuditError(
-            "audit requires a jury-of-3 source run "
-            "(manifest.cli_args.jury_of_3 != True). The leave-one-out "
-            "re-judgments inherit the source run's judge-noise floor; "
-            "without jury voting that floor is ~26 % per-judgment, which "
-            "drowns the attribution signal. Re-run the source with "
-            "`--jury-of-3` first."
-        )
-
-    # Same prompt-builder / jury-kwargs refusals as ablation.py so we
-    # don't silently measure something different than the source.
-    _PROMPT_BUILDER_KEYS = (
-        "prompt_builder", "prompt_builder_module", "prompt_builder_path"
-    )
-    custom_builder = [k for k in _PROMPT_BUILDER_KEYS if cli_args.get(k)]
-    if custom_builder:
-        raise AuditError(
-            "audit refuses to run on a source manifest that carries a "
-            "custom prompt_builder field "
-            f"({', '.join(custom_builder)}): the Phase-1 counterfactual "
-            "cell generation would use the runner's default prompt builder, "
-            "producing incomparable prompts."
-        )
-    _RECONSTRUCT_INCOMPATIBLE_KEYS = (
-        "jury_temperature", "jury_max_tokens", "jury_seed",
-        "jury_kwargs", "judge_kwargs",
-    )
-    incompatible = [k for k in _RECONSTRUCT_INCOMPATIBLE_KEYS if k in cli_args]
-    if incompatible:
-        raise AuditError(
-            "audit refuses to run on a source manifest with unrecognised "
-            f"jury-construction fields ({', '.join(incompatible)})."
-        )
 
     # Validate dims eagerly so a CLI typo doesn't produce a silent no-op.
     for d in dims:
@@ -1364,6 +1391,23 @@ async def _run_counterfactual_cell(
     keys stay aligned in either monkey-patched state).
     """
     extra: dict[str, Any] = {}
+    # 2026-06-11 BLOCKER fix: thread the fixture-exported ``prompt_builder``
+    # into Phase-1 counterfactual cells. The canonical cells these are
+    # diffed against were produced under the fixture's builder, and the
+    # Phase-2 leave-one-out terminal re-execution already reconstructs it
+    # (see ``_leave_one_out_for_triple``) — Phase-1 was the one
+    # re-execution site still silently falling back to
+    # ``runner._default_prompt``, i.e. measuring the counterfactual under
+    # a DIFFERENT prompt pipeline than the canonical it's compared to
+    # (the same bug class the 2026-05-30 confirm fix closed). Forwarded
+    # only when the fixture ships a builder — same conditional-propagation
+    # shape as the resolver kwarg — so builderless topologies keep the
+    # historical ``run_variant`` call signature.
+    from topofuzz.loaders import get_prompt_builder
+
+    prompt_builder = get_prompt_builder(variant_topology)
+    if prompt_builder is not None:
+        extra["prompt_builder"] = prompt_builder
     if llm_cache is not None:
         extra["llm_cache"] = llm_cache
     if model_served_version_resolver is not None:
@@ -1634,7 +1678,17 @@ async def _leave_one_out_for_triple(
             hybrid_prior = _dicts_to_node_outputs(
                 hybrid_prior_dicts, NodeOutput
             )
-            prompt = _default_prompt(
+            # 2026-05-30: use the fixture-exported prompt_builder when the
+            # source fixture pinned one (the lending gallery's deterministic
+            # domain rules + planted last-writer-wins fault). ``variant_topology``
+            # was rebuilt via ``confirm._reconstruct_variants`` → ``load_topology``,
+            # which re-attaches the builder from the fixture module the
+            # manifest records, so the F7 terminal re-execution sees the same
+            # prompt the kickoff run used. Falls back to ``_default_prompt``
+            # for fixtures exporting none (v0.5 behaviour, byte-identical).
+            from topofuzz.loaders import get_prompt_builder
+            _builder = get_prompt_builder(variant_topology) or _default_prompt
+            prompt = _builder(
                 terminal_node, cf_row, tuple(hybrid_prior)
             )
             # F7 Phase-2 cache-architecture fix (BACKLOG BLOCKER):

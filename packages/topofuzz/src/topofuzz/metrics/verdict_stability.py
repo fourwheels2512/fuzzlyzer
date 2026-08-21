@@ -48,6 +48,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from topofuzz.metrics._verdict import verdict_of as _verdict_of
 from topofuzz.metrics.verdict_flip import DEFAULT_FLIP_THRESHOLD
 
 
@@ -137,17 +138,26 @@ def compute_verdict_stability(
             degenerate_flag=True,
         )
 
-    # Group binarised verdicts per eval_id. A judge-failure repeat
-    # (score_value is None) contributes nothing.
-    by_eval: dict[str, list[bool]] = {}
+    # Group verdicts per eval_id. A judge-failure repeat (no usable
+    # verdict) contributes nothing.
+    #
+    # 2026-05-30: verdicts are 3-state class strings resolved by the
+    # SHARED :func:`topofuzz.metrics._verdict.verdict_of` rule (explicit
+    # ``verdict_class`` wins; legacy rows threshold-binarise to the same
+    # "approve"/"deny" strings — see that module's docstring for why this
+    # removes the fake-flip inflation and why bools must never mix in).
+    # ``confirmed_verdict_flip`` resolves rows through the SAME function,
+    # so the noise floor and the corrected rate cannot disagree on what
+    # verdict a repeat produced. The unanimity test below
+    # (``len(set(...)) == 1``) then compares like-for-like strings.
+    by_eval: dict[str, list] = {}
     for row in reference_rows:
         eid = row.get("eval_id")
         if not isinstance(eid, str) or not eid:
             continue
-        score = row.get("score_value")
-        if score is None:
+        verdict = _verdict_of(row, threshold)
+        if verdict is None:
             continue  # judge failure / no verdict — missing data
-        verdict = bool(score >= threshold)
         by_eval.setdefault(eid, []).append(verdict)
 
     # An eval needs >= 2 scored repeats to be meaningfully "unanimous";

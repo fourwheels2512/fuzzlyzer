@@ -51,6 +51,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 
+from topofuzz.metrics._verdict import verdict_of as _verdict_of
 from topofuzz.metrics.verdict_flip import DEFAULT_FLIP_THRESHOLD
 
 
@@ -109,18 +110,26 @@ class ConfirmedVerdictFlipResult:
     degenerate_flag: bool
 
 
-def _majority(verdicts: list[bool]) -> bool | None:
-    """Strict majority of a list of bools; ``None`` on a tie or empty."""
+def _majority(verdicts: list) -> object | None:
+    """Strict plurality of a list of verdicts; ``None`` on a tie or empty.
+
+    Generalised 2026-05-30 from a True/False-keyed count to a plurality
+    over arbitrary hashable verdicts, so the confirm-pass metric can vote
+    over 3-state class strings ("approve" / "deny" / "conditional") as
+    well as legacy bools. The old implementation hard-coded
+    ``counts.get(True)`` / ``counts.get(False)`` and so silently tied
+    (→ ``None``) on ANY non-bool input — switching the callers to class
+    strings without fixing this would have made every candidate pair
+    look like an unstable baseline. For bool input the behaviour is
+    identical (majority True/False, tie → None).
+    """
     if not verdicts:
         return None
-    counts = Counter(verdicts)
-    true_n = counts.get(True, 0)
-    false_n = counts.get(False, 0)
-    if true_n > false_n:
-        return True
-    if false_n > true_n:
-        return False
-    return None  # tie — no strict majority
+    ranked = Counter(verdicts).most_common()
+    if len(ranked) == 1:
+        return ranked[0][0]
+    (top_verdict, top_n), (_, runner_n) = ranked[0], ranked[1]
+    return top_verdict if top_n > runner_n else None  # equal top → tie
 
 
 def compute_confirmed_verdict_flip_rate(
@@ -211,16 +220,20 @@ def compute_confirmed_verdict_flip_rate(
             if isinstance(eid, str) and eid and isinstance(vid, str) and vid
         }
 
-    # Reference verdicts grouped per eval_id.
-    ref_by_eval: dict[str, list[bool]] = {}
+    # Reference verdicts grouped per eval_id. 3-state class-aware
+    # (2026-05-30): a conditional re-run no longer binarises to APPROVE at
+    # the 0.5 threshold — it votes as its own "conditional" class, matching
+    # ``verdict_stability`` and the kickoff ``verdict_flip`` clear-flip gate
+    # so the confirm-pass metrics agree on what a conditional cell is.
+    ref_by_eval: dict[str, list] = {}
     for row in reference_rows:
         eid = row.get("eval_id")
         if not isinstance(eid, str) or not eid:
             continue
-        score = row.get("score_value")
-        if score is None:
+        verdict = _verdict_of(row, threshold)
+        if verdict is None:
             continue
-        ref_by_eval.setdefault(eid, []).append(bool(score >= threshold))
+        ref_by_eval.setdefault(eid, []).append(verdict)
 
     # Reference majority per eval_id; tie → unstable baseline. A
     # reference eval whose scored-repeat count is not exactly K (when
@@ -228,7 +241,7 @@ def compute_confirmed_verdict_flip_rate(
     # baseline as uncallable (the candidate pair is then routed to
     # missing_baseline). The drop is ``!= K`` not ``< K``: a block with
     # MORE than K scored repeats is stale/contaminated (RT-2).
-    ref_majority: dict[str, bool] = {}
+    ref_majority: dict[str, object] = {}
     unstable_baseline_evals: set[str] = set()
     for eid, verdicts in ref_by_eval.items():
         if repeats is not None and len(verdicts) != repeats:
@@ -241,8 +254,9 @@ def compute_confirmed_verdict_flip_rate(
         else:
             ref_majority[eid] = maj
 
-    # Candidate verdicts grouped per (eval_id, variant_id).
-    cand_by_pair: dict[tuple[str, str], list[bool]] = {}
+    # Candidate verdicts grouped per (eval_id, variant_id). Same 3-state
+    # class-aware verdict as the reference side above.
+    cand_by_pair: dict[tuple[str, str], list] = {}
     for row in candidate_rows:
         eid = row.get("eval_id")
         vid = row.get("variant_id")
@@ -250,12 +264,10 @@ def compute_confirmed_verdict_flip_rate(
             continue
         if not isinstance(vid, str) or not vid:
             continue
-        score = row.get("score_value")
-        if score is None:
+        verdict = _verdict_of(row, threshold)
+        if verdict is None:
             continue
-        cand_by_pair.setdefault((eid, vid), []).append(
-            bool(score >= threshold)
-        )
+        cand_by_pair.setdefault((eid, vid), []).append(verdict)
 
     # The pair universe we iterate. With a screened set we walk THAT (so
     # judge-failure-only pairs are seen); without one we fall back to the

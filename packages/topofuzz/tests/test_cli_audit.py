@@ -148,6 +148,29 @@ def test_audit_nonexistent_dir_exits_clean():
     assert "not a directory" in text
 
 
+def test_audit_missing_manifest_errors_before_spend_prompt(tmp_path):
+    """ROB-5: an existing-but-invalid run_dir (a real directory with no
+    manifest.json) must error out immediately — no billing prompt.
+
+    Verified against the pre-fix CLI ordering: ``run_dir.is_dir()``
+    passed (the directory DOES exist), so the code printed "this bills
+    real LLM calls" and the "Run counterfactual audit ... ?" prompt
+    BEFORE ``run_audit_pass`` ever got a chance to raise
+    ``AuditError("manifest.json missing...")`` — exit code 0 with an
+    "Aborted." line (CliRunner's stdin is empty). Post-fix, validation
+    runs first: exit 2, no prompt text anywhere in the output.
+    """
+    empty_dir = tmp_path / "empty-run"
+    empty_dir.mkdir()
+
+    result = _runner().invoke(app, ["audit", str(empty_dir)])
+    assert result.exit_code == 2, result.output
+    text = _combined_output(result)
+    assert "manifest.json missing" in text
+    assert "bills real LLM calls" not in text
+    assert "Aborted" not in text
+
+
 def test_audit_invalid_dim_lists_all_four_choices(tmp_path):
     """``--counterfactual=invalid-dim`` → exit 2 + supported vocab in msg."""
     run_dir = _write_minimal_audit_source(tmp_path)

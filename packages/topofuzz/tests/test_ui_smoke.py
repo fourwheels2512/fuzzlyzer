@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import os
+import subprocess
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -46,6 +47,7 @@ from topofuzz.ui.runs import (  # noqa: E402
     RunRegistry,
     Scenario,
     UnknownRunError,
+    _build_topofuzz_cmd,
     write_eval_csv,
 )
 
@@ -231,6 +233,68 @@ class TestRegistryConcurrency:
             )
 
 
+# --------- UX-2: the spawned child must never hang on stdin --------------
+#
+# Pre-fix, ``topofuzz run`` is spawned with no ``stdin`` redirect and no
+# ``--accept-license``. On a fresh machine (or after a version bump —
+# acceptance is version-keyed) the child hits its own interactive BSL
+# prompt, blocks on stdin, gets EOF, and exits 2 — surfaced to the UI user
+# only as an opaque "exit code 2".
+
+
+class TestBuildCmdAndLaunchNeverHang:
+    def test_build_cmd_includes_accept_license_before_run_subcommand(
+        self, tmp_path: Path
+    ) -> None:
+        cmd = _build_topofuzz_cmd(
+            fixture_path=tmp_path / "fixture.py",
+            eval_csv=tmp_path / "eval.csv",
+            n=5,
+            variants=4,
+            judge_model="google/gemini-2.5-pro",
+            rubric_path=tmp_path / "rubric.txt",
+            raw_cost_cap_usd=8.0,
+            out_dir=tmp_path / "out",
+        )
+        assert "--accept-license" in cmd
+        assert "run" in cmd
+        # It's a root-level flag — Click/typer requires it BEFORE the
+        # subcommand, not after (see cli.py's _reject_unknown_extras
+        # placement-hint test for the mirror-image CLI-usage mistake).
+        assert cmd.index("--accept-license") < cmd.index("run")
+
+    def test_launch_spawns_subprocess_with_stdin_devnull(
+        self, tmp_path: Path
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        class FakeProc:
+            stdout = iter(["[fake] done\n"])
+            returncode = 0
+
+            def wait(self) -> int:
+                return 0
+
+            def terminate(self) -> None:
+                return
+
+        def fake_popen(cmd, **kwargs):  # noqa: ANN001, ANN003
+            captured.update(kwargs)
+            return FakeProc()
+
+        with patch("topofuzz.ui.runs.subprocess.Popen", side_effect=fake_popen):
+            reg = RunRegistry(runs_root=tmp_path / "ui-runs")
+            workflow = get_workflow(DEFAULT_WORKFLOW)
+            thoroughness = get_thoroughness(DEFAULT_THOROUGHNESS)
+            scenarios = [
+                Scenario(case="x", why_borderline="", expected="deny"),
+            ]
+            reg.launch(
+                workflow=workflow, thoroughness=thoroughness, scenarios=scenarios
+            )
+        assert captured.get("stdin") == subprocess.DEVNULL
+
+
 # --------- app.py: route surface ----------------------------------------
 
 
@@ -276,6 +340,33 @@ def client_no_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient
     return c
 
 
+@pytest.fixture()
+def fake_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point ``Path.home()`` (and therefore ``license_check.acceptance_
+    path()``) at a FRESH tmp dir with no acceptance file on record.
+
+    Overrides conftest.py's autouse ``_preaccept_license`` fixture (which
+    pre-accepts the license for every other UI test so the pre-existing
+    route tests don't have to think about it) — same override pattern as
+    ``test_license_check.py``'s identically-named fixture.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    return tmp_path
+
+
+@pytest.fixture()
+def client_unaccepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_home: Path
+) -> TestClient:
+    """Same as ``client`` but with NO license acceptance on record —
+    exercises the UX-1 in-browser accept gate."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
+    app = build_app(runs_root=tmp_path / "ui-runs")
+    c = TestClient(app)
+    c.headers["Origin"] = "http://testserver"
+    return c
+
+
 class TestRoutes:
     def test_healthz(self, client: TestClient) -> None:
         r = client.get("/healthz")
@@ -290,6 +381,19 @@ class TestRoutes:
         # not the paste-key card.
         assert "Google (Gemini)" in r.text
         assert "Remove" in r.text  # the saved-state button
+
+    def test_landing_shows_scope_disclaimer(self, client: TestClient) -> None:
+        """UX-6: a founder-dogfooding session found a real person who
+        believed the loan/insurance demo would predict whether THEY
+        personally would get a real loan. A short, always-visible,
+        factual disclaimer must be on every page (it lives in the
+        shared footer, so this also covers the results page)."""
+        r = client.get("/")
+        assert r.status_code == 200
+        assert (
+            "does not make real loan, insurance, hiring, or other "
+            "decisions about any person" in r.text
+        )
 
     def test_setup_renders_with_key(self, client: TestClient) -> None:
         r = client.get("/setup")
@@ -404,6 +508,22 @@ class TestRoutes:
         # But the key is still active for this session.
         r2 = client_no_key.get("/")
         assert "Google (Gemini)" in r2.text
+
+    def test_landing_remember_checkbox_unchecked_by_default(
+        self, client_no_key: TestClient
+    ) -> None:
+        """SECURITY FIX 1: memory-only key storage must be the default —
+        the "remember this key" checkbox renders UNCHECKED on first load.
+        Persisting to ``~/.topofuzz/keys/{vendor}`` is opt-in, matching
+        the truthful SECURITY.md / PRIVACY.md posture."""
+        r = client_no_key.get("/")
+        assert r.status_code == 200
+        idx = r.text.index('name="remember"')
+        tag_end = r.text.index("/>", idx)
+        checkbox_tag = r.text[idx:tag_end]
+        assert "checked" not in checkbox_tag, (
+            f"remember checkbox defaults to checked: {checkbox_tag!r}"
+        )
 
     def test_post_key_unknown_vendor_404(
         self, client_no_key: TestClient
@@ -550,6 +670,175 @@ class TestRoutes:
         rows = list(csv.DictReader(eval_csv.open(encoding="utf-8")))
         assert len(rows) == 3
         assert rows[0]["input"] == "Applicant A facts here."
+
+
+# --------- UX-1: in-browser license accept gate ---------------------------
+#
+# `ui` is now CLI-license-exempt (test_license_check.py) so the server
+# always comes up, even non-interactively. Enforcement of "no run without
+# acceptance" moves here: the landing page shows a one-time BSL accept
+# gate, and POST /setup (the run-starting action) refuses to spawn a
+# subprocess until license_check reports accepted.
+
+
+class TestLicenseAcceptGate:
+    def test_landing_shows_accept_gate_when_not_accepted(
+        self, client_unaccepted: TestClient
+    ) -> None:
+        r = client_unaccepted.get("/")
+        assert r.status_code == 200
+        assert "I accept these terms" in r.text
+        assert "Business Source License" in r.text
+        # Nothing else on the page is reachable yet.
+        assert "Start a test" not in r.text
+
+    def test_landing_shows_normal_content_once_accepted(
+        self, client: TestClient
+    ) -> None:
+        # The default `client` fixture inherits conftest's pre-accepted
+        # fake home — the gate must NOT appear.
+        r = client.get("/")
+        assert r.status_code == 200
+        assert "I accept these terms" not in r.text
+
+    def test_setup_get_redirects_home_when_not_accepted(
+        self, client_unaccepted: TestClient
+    ) -> None:
+        r = client_unaccepted.get("/setup", follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/"
+
+    def test_setup_post_refuses_to_launch_without_acceptance(
+        self, client_unaccepted: TestClient
+    ) -> None:
+        """The critical run-starting gate: POSTing /setup while
+        unaccepted must NOT spawn a subprocess — it must redirect back
+        to the accept gate instead."""
+        with patch("topofuzz.ui.runs.subprocess.Popen") as mock_popen:
+            r = client_unaccepted.post(
+                "/setup",
+                data={
+                    "workflow": "loan-approval",
+                    "thoroughness": "quick",
+                    "scenario_case": ["A facts.", "B facts.", "C facts."],
+                    "scenario_why": ["", "", ""],
+                    "scenario_expected": ["deny", "approve", "deny"],
+                },
+                follow_redirects=False,
+            )
+        mock_popen.assert_not_called()
+        assert r.status_code == 303
+        assert r.headers["location"] == "/"
+
+    def test_accept_license_then_run_can_launch(
+        self, client_unaccepted: TestClient, tmp_path: Path
+    ) -> None:
+        """Full happy path: not accepted → POST /accept-license →
+        license_check reports accepted → POST /setup now launches."""
+        from topofuzz.license_check import is_accepted
+
+        assert is_accepted() is False
+        r = client_unaccepted.post("/accept-license", follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/"
+        assert is_accepted() is True
+
+        # The gate is gone; normal landing content is back.
+        r_home = client_unaccepted.get("/")
+        assert "I accept these terms" not in r_home.text
+
+        class FakeProc:
+            stdout = iter(["[fake] starting\n", "[fake] done\n"])
+            returncode = 0
+
+            def wait(self) -> int:
+                return 0
+
+            def terminate(self) -> None:
+                return
+
+        with patch(
+            "topofuzz.ui.runs.subprocess.Popen", return_value=FakeProc()
+        ) as mock_popen:
+            r2 = client_unaccepted.post(
+                "/setup",
+                data={
+                    "workflow": "loan-approval",
+                    "thoroughness": "quick",
+                    "scenario_case": ["A facts.", "B facts.", "C facts."],
+                    "scenario_why": ["", "", ""],
+                    "scenario_expected": ["deny", "approve", "deny"],
+                },
+                follow_redirects=False,
+            )
+        mock_popen.assert_called_once()
+        assert r2.status_code == 303
+        assert r2.headers["location"].startswith("/runs/")
+
+
+# --------- _keystore.py: platform-correct on-disk permission -------------
+
+
+class TestKeystoreDiskPermissions:
+    """FIX 2: the persisted ``~/.topofuzz/keys/{vendor}`` file must get a
+    real owner-only restriction on whatever platform it's written on.
+    POSIX ``chmod(0o600)`` is a silent no-op on Windows (NTFS is ACL-
+    gated, not mode-bit-gated), so Windows must instead call `icacls`
+    to reset inheritance and grant Full Control to the current user only.
+    """
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows-only icacls check")
+    def test_windows_calls_icacls_with_inheritance_reset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from topofuzz.ui import _keystore as _ks
+
+        monkeypatch.setattr(_ks, "_KEY_DIR", tmp_path / "keys")
+        monkeypatch.setattr(_ks, "_runtime", {})
+
+        captured: dict[str, Any] = {}
+
+        def fake_run(args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+            class _Result:
+                returncode = 0
+
+            return _Result()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        _ks.set_key("google", "AIza" + "x" * 35, remember=True)
+
+        assert captured, "icacls (subprocess.run) was never invoked"
+        args = captured["args"]
+        assert args[0] == "icacls"
+        assert str(_ks._disk_path("google")) in args
+        assert "/inheritance:r" in args
+        assert any(a.startswith("/grant:r") for a in args)
+        # List-args, not a shell string — no shell=True hazard.
+        assert captured["kwargs"].get("check") is False
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX-only chmod check")
+    def test_posix_calls_chmod_0600(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from topofuzz.ui import _keystore as _ks
+
+        monkeypatch.setattr(_ks, "_KEY_DIR", tmp_path / "keys")
+        monkeypatch.setattr(_ks, "_runtime", {})
+
+        captured: dict[str, Any] = {}
+
+        def fake_chmod(path, mode):
+            captured["path"] = path
+            captured["mode"] = mode
+
+        monkeypatch.setattr(os, "chmod", fake_chmod)
+        _ks.set_key("google", "AIza" + "y" * 35, remember=True)
+
+        assert captured.get("mode") == 0o600
+        assert captured.get("path") == _ks._disk_path("google")
 
 
 # --------- helpers -------------------------------------------------------

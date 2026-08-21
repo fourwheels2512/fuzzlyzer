@@ -1581,7 +1581,7 @@ def test_run_writer_persists_schema_version_pragma(tmp_path):
         ver = db.execute("PRAGMA user_version").fetchone()[0]
     finally:
         db.close()
-    assert ver == 6  # v6: judge_results.votes_json (per-vendor jury breakdown)
+    assert ver == 7  # v7: judge_results/flip_confirmations.verdict_class (3-state)
 
 
 def test_run_writer_resume_preserves_original_created_at(tmp_path):
@@ -2253,11 +2253,12 @@ def test_runwriter_migrates_v1_db_in_place(tmp_path):
 
     db = sqlite3.connect(str(db_path))
     try:
-        # Schema bumped v1 → v6 cascade: cost telemetry (v2) + §A runs
+        # Schema bumped v1 → v7 cascade: cost telemetry (v2) + §A runs
         # cols (v3) + rubric_hash on runs (v4 / step 9) + flip_confirmations
         # table (v5 / noise-floor `topofuzz confirm`) + judge_results
-        # votes_json column (v6 / F3 jury vote breakdown).
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 6
+        # votes_json column (v6 / F3 jury vote breakdown) + verdict_class
+        # column on judge_results + flip_confirmations (v7 / 3-state scorer).
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 7
         # v5: the flip_confirmations table exists post-migrate (created
         # by CREATE TABLE IF NOT EXISTS — no ALTER needed for a new table).
         legacy_tables = {
@@ -2276,6 +2277,17 @@ def test_runwriter_migrates_v1_db_in_place(tmp_path):
             ).fetchall()
         }
         assert "votes_json" in judge_cols_v6
+        # v7: verdict_class column landed on BOTH judge_results and
+        # flip_confirmations — NULL on legacy rows so pre-3-state cells
+        # round-trip unchanged (readers fall back to the score threshold).
+        assert "verdict_class" in judge_cols_v6
+        flip_cols_v7 = {
+            row[1]
+            for row in db.execute(
+                "PRAGMA table_info(flip_confirmations)"
+            ).fetchall()
+        }
+        assert "verdict_class" in flip_cols_v7
         # v3 + v4 runs columns landed. ``status`` defaults to
         # 'running', tenant_id to 'local', rubric_hash to ''.
         runs_cols = {
@@ -2702,8 +2714,8 @@ def test_litellm_model_id_non_string_passes_through() -> None:
 
 
 def test_judge_row_packs_votes_json_when_continuous_score_carries_votes():
-    """``_judge_row`` returns 6 columns; the last is JSON when votes are
-    present, NULL otherwise."""
+    """``_judge_row`` returns 7 columns; votes_json is JSON when votes are
+    present, NULL otherwise; verdict_class is the trailing slot."""
     from topofuzz.runner import _judge_row
 
     cell = _run(
@@ -2722,13 +2734,17 @@ def test_judge_row_packs_votes_json_when_continuous_score_carries_votes():
             ),
         )
     )
-    kind, score, passed, rationale, failure, votes_json = _judge_row(cell)
+    kind, score, passed, rationale, failure, votes_json, verdict_class = (
+        _judge_row(cell)
+    )
     assert kind == "continuous"
     assert score == pytest.approx(0.7)
     assert passed is None
     assert rationale == "combined"
     assert failure is None
     assert votes_json is not None
+    # Default ContinuousScore.verdict_class is "" (no explicit class).
+    assert verdict_class == ""
     parsed = json.loads(votes_json)
     assert parsed == [
         {"vendor": "gemini", "score": 0.7, "rationale": "approve"},
@@ -2751,7 +2767,7 @@ def test_judge_row_returns_null_votes_json_for_single_judge_continuous():
             ),
         )
     )
-    _, _, _, _, _, votes_json = _judge_row(cell)
+    _, _, _, _, _, votes_json, _ = _judge_row(cell)
     assert votes_json is None
 
 
@@ -2803,6 +2819,37 @@ def test_run_writer_persists_votes_json_round_trip(tmp_path):
     assert record["judge_result"]["votes"] == parsed
 
 
+def test_run_writer_persists_verdict_class_round_trip(tmp_path):
+    """v7 3-state: a ContinuousScore.verdict_class persists to
+    judge_results.verdict_class and survives read-back."""
+    topo = _toy_topology(n=1)
+    cell = _run(
+        run_variant(
+            topo, {"id": "e1", "input": "x"},
+            llm_callable=FakeLLM(),
+            judge=FakeJudge(
+                score_to_return=ContinuousScore(
+                    value=0.5, rationale="hinges on FHA appraisal",
+                    verdict_class="conditional",
+                ),
+            ),
+        )
+    )
+    with RunWriter(tmp_path, "run-cond-1", topo) as w:
+        w.write(cell)
+    db = sqlite3.connect(str(tmp_path / "run.sqlite"))
+    try:
+        row = db.execute(
+            "SELECT score_value, verdict_class FROM judge_results "
+            "WHERE run_id='run-cond-1'"
+        ).fetchone()
+    finally:
+        db.close()
+    assert row is not None
+    assert row[0] == pytest.approx(0.5)
+    assert row[1] == "conditional"
+
+
 def test_judge_row_caps_votes_json_size():
     """F3 Fuzzer m4 audit fix: when the per-vendor rationale × N pushes
     the JSON column past _VOTES_JSON_MAX_BYTES, the packer drops the
@@ -2828,7 +2875,7 @@ def test_judge_row_caps_votes_json_size():
             ),
         )
     )
-    _, _, _, _, _, votes_json = _judge_row(cell)
+    _, _, _, _, _, votes_json, _ = _judge_row(cell)
     assert votes_json is not None
     assert len(votes_json) <= _VOTES_JSON_MAX_BYTES
     parsed = json.loads(votes_json)

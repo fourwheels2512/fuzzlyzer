@@ -153,7 +153,7 @@ def _rebuild(topology: Topology, new_nodes: tuple[Node, ...]) -> Topology:
     introduces a bug that produces dangling node ids, this constructor
     raises immediately instead of shipping a corrupt IR downstream.
     """
-    return Topology(
+    rebuilt = Topology(
         tds_version=topology.tds_version,
         name=topology.name,
         nodes=new_nodes,
@@ -175,6 +175,23 @@ def _rebuild(topology: Topology, new_nodes: tuple[Node, ...]) -> Topology:
         verdict_label_true=topology.verdict_label_true,
         verdict_label_false=topology.verdict_label_false,
     )
+    # 2026-05-30 BLOCKER fix: propagate non-field side-channels onto every
+    # generated variant. The fixture-exported ``prompt_builder`` is attached
+    # by ``load_topology`` via ``object.__setattr__`` (NOT a Pydantic field,
+    # so it is invisible to this constructor). Without re-attaching it here,
+    # EVERY permuted / role-swapped / decoding-perturbed variant loses the
+    # deterministic prompt — and the F4 ablation / F7 audit terminal
+    # re-execution (which reads ``get_prompt_builder`` off the VARIANT
+    # topology) silently falls back to the bare ``_default_prompt``: exactly
+    # the no-lending-rules bug the builder exists to kill, reintroduced on
+    # the precise variants attribution depends on. Lazy import avoids any
+    # import-time cycle with the loader.
+    from topofuzz.loaders import _PROMPT_BUILDER_ATTR, get_prompt_builder
+
+    builder = get_prompt_builder(topology)
+    if builder is not None:
+        object.__setattr__(rebuilt, _PROMPT_BUILDER_ATTR, builder)
+    return rebuilt
 
 
 def _enumerate_topological_orderings(

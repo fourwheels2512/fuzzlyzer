@@ -57,6 +57,7 @@ from topofuzz.counterfactual_audit import (  # noqa: E402
     _write_audit_sidecar,
     read_audit_sidecar,
     run_audit_pass,
+    validate_audit_source,
 )
 from topofuzz.ir import Edge, LLMConfig, Node, Topology  # noqa: E402
 
@@ -505,6 +506,33 @@ def test_run_audit_rejects_jury_max_tokens_field(tmp_path):
     )
     with pytest.raises(AuditError, match="jury-construction"):
         run_audit_pass(run_dir)
+
+
+def test_run_audit_rejects_missing_manifest(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(AuditError, match="manifest.json missing"):
+        run_audit_pass(empty)
+
+
+def test_validate_audit_source_rejects_missing_manifest(tmp_path):
+    """ROB-5: :func:`validate_audit_source` is the cheap, side-effect-
+    free precondition check :func:`run_audit_pass` runs first — it must
+    raise the SAME ``AuditError`` on a missing manifest so the CLI can
+    call it standalone, before the spend-confirmation prompt, without
+    duplicating validation logic."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(AuditError, match="manifest.json missing"):
+        validate_audit_source(empty)
+
+
+def test_validate_audit_source_accepts_valid_jury_manifest(tmp_path):
+    """The happy path returns the parsed manifest dict (reused by
+    run_audit_pass so the source run isn't read twice)."""
+    run_dir = _write_manifest_run(tmp_path, hashes=["a" * 64])
+    manifest = validate_audit_source(run_dir)
+    assert manifest["cli_args"]["jury_of_3"] is True
 
 
 def test_run_audit_rejects_unknown_dim_before_llm(tmp_path):
@@ -2495,6 +2523,153 @@ def test_audit_async_substituted_input_reaches_run_variant(tmp_path):
         )
         assert "Greg Walsh" not in inp, (
             f"CF input still carries the canonical token: {inp!r}"
+        )
+
+
+def _phase1_builder_probe_run_dir(tmp_path):
+    """Manifest + run.sqlite for the Phase-1 prompt_builder regression
+    tests below — same minimal shape as the Mi4 substituted-input test."""
+    canonical_outputs = [
+        _make_node_output_dict("n0"),
+        _make_node_output_dict("n1"),
+        _make_node_output_dict("n2", response_text="APPROVE"),
+    ]
+    canonical_id = "c" * 64
+    run_dir = tmp_path / "audit-run"
+    run_dir.mkdir()
+    (run_dir / "manifest.json").write_text(json.dumps({
+        "run_id": "pb-001",
+        "variant_canonical_hashes": [canonical_id],
+        "variant_orderings": [["n0", "n1", "n2"]],
+        "eval_ids": ["eval_001"],
+        "cli_args": {
+            "fixture": "x.py:build_graph", "eval": "e.csv",
+            "rng_seed": 0, "variants": 1, "jury_of_3": True,
+            "rubric": "rubric.txt",
+        },
+    }), encoding="utf-8")
+    db = sqlite3.connect(str(run_dir / "run.sqlite"))
+    db.execute(
+        "CREATE TABLE judge_results ("
+        "run_id TEXT, variant_id TEXT, eval_id TEXT, judge_kind TEXT, "
+        "score_value REAL, passed INTEGER, rationale TEXT, "
+        "failure_reason TEXT, votes_json TEXT)"
+    )
+    db.execute(
+        "CREATE TABLE cells ("
+        "run_id TEXT, variant_id TEXT, eval_id TEXT, "
+        "ir_canonical_hash TEXT, node_outputs_json TEXT, error TEXT, "
+        "cell_cost_usd REAL)"
+    )
+    db.execute(
+        "INSERT INTO judge_results VALUES ('pb-001', ?, 'eval_001', "
+        "'continuous', 0.9, NULL, NULL, NULL, NULL)", (canonical_id,)
+    )
+    db.execute(
+        "INSERT INTO cells VALUES ('pb-001', ?, 'eval_001', '', ?, NULL, NULL)",
+        (canonical_id, json.dumps(canonical_outputs)),
+    )
+    db.commit()
+    db.close()
+    return run_dir, canonical_id
+
+
+def _run_phase1_with_recording_fake(run_dir, canonical_id, topo):
+    """Drive ``_audit_async`` with a run_variant fake that records the
+    ``prompt_builder`` kwarg (or its absence) for every CF cell."""
+    canonical_row = {"id": "eval_001", "input": "Greg Walsh applied."}
+    judge = MockJuryJudge(scores_queue=[0.9])
+    fake_llm = FakeLLM()
+    captured: list[tuple[str, Any]] = []  # (eval_id, prompt_builder kwarg)
+
+    async def recording_run_variant(variant_ir, eval_row, *, llm_callable, judge, **_kwargs):
+        from topofuzz.runner import Cell, NodeOutput
+        captured.append(
+            (eval_row.get("id", ""), _kwargs.get("prompt_builder", "ABSENT"))
+        )
+        nodes = [
+            NodeOutput(
+                node_id=n.id, role=n.role, response_text="x",
+                model_served_version="m", cache_hit=False, latency_ms=1,
+                cost_usd=0.001,
+            )
+            for n in variant_ir.nodes
+        ]
+        jr = judge.score({"variant_id": "", "eval_row": eval_row, "agent_output": "x"})
+        return Cell(
+            variant_id=variant_ir.canonical_hash(), eval_id=eval_row["id"],
+            ir_canonical_hash=variant_ir.canonical_hash(),
+            node_outputs=tuple(nodes), judge_result=jr,
+            judge_failure=False, judge_failure_reason=None, error=None,
+        )
+
+    import topofuzz.runner as runner_mod
+    real_run_variant = runner_mod.run_variant
+    runner_mod.run_variant = recording_run_variant
+    try:
+        asyncio.run(_audit_async(
+            run_dir=run_dir, run_id="pb-001",
+            variant_ids=[canonical_id], by_hash={canonical_id: topo},
+            canonical_eval_rows_by_id={"eval_001": canonical_row},
+            dims=("name",), max_cost_usd=None, max_canonical_evals=None,
+            judge=judge, llm_callable=fake_llm, dry_run=False,
+        ))
+    finally:
+        runner_mod.run_variant = real_run_variant
+    return [
+        (eid, pb) for eid, pb in captured
+        if eid.startswith("eval_001__cf_name_")
+    ]
+
+
+def test_audit_phase1_threads_fixture_prompt_builder(tmp_path):
+    """2026-06-11 BLOCKER regression: Phase-1 counterfactual cells MUST
+    re-run under the fixture-exported ``prompt_builder``.
+
+    The bug this guards: ``_run_counterfactual_cell`` called
+    ``run_variant`` without ``prompt_builder=``, so every Phase-1 cell
+    silently fell back to the bare ``_default_prompt`` — a DIFFERENT
+    prompt pipeline from the canonical cells it is diffed against (which
+    the source run produced under the fixture builder) and from the
+    Phase-2 leave-one-out re-execution (which reconstructs the builder).
+    Same bug class as the 2026-05-30 confirm fix
+    (``test_run_confirm_pass_threads_fixture_prompt_builder``).
+    """
+    from topofuzz.loaders import _PROMPT_BUILDER_ATTR
+
+    run_dir, canonical_id = _phase1_builder_probe_run_dir(tmp_path)
+    topo = _toy_topology(n_nodes=3)
+
+    def fixture_builder(node, eval_row, prior):
+        return "MARKER_FIXTURE_BUILDER " + node.id
+
+    object.__setattr__(topo, _PROMPT_BUILDER_ATTR, fixture_builder)
+
+    cf_calls = _run_phase1_with_recording_fake(run_dir, canonical_id, topo)
+    assert cf_calls, "no CF cell reached run_variant — test harness broken"
+    for eid, pb in cf_calls:
+        assert pb is fixture_builder, (
+            f"Phase-1 CF cell {eid!r} did not receive the fixture "
+            f"prompt_builder (got {pb!r}) — it would re-run the bare "
+            "_default_prompt pipeline, making the counterfactual axis "
+            "apples-to-oranges against the canonical cells."
+        )
+
+
+def test_audit_phase1_builderless_topology_keeps_bare_signature(tmp_path):
+    """A topology with NO fixture builder must keep the historical
+    ``run_variant`` call signature — no ``prompt_builder`` kwarg at all
+    (``run_variant`` then applies its own ``_default_prompt`` default),
+    mirroring the conditional propagation of the resolver kwarg."""
+    run_dir, canonical_id = _phase1_builder_probe_run_dir(tmp_path)
+    topo = _toy_topology(n_nodes=3)
+
+    cf_calls = _run_phase1_with_recording_fake(run_dir, canonical_id, topo)
+    assert cf_calls, "no CF cell reached run_variant — test harness broken"
+    for eid, pb in cf_calls:
+        assert pb == "ABSENT", (
+            f"Phase-1 CF cell {eid!r} unexpectedly received a "
+            f"prompt_builder kwarg ({pb!r}) for a builderless topology."
         )
 
 

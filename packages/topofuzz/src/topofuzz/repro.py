@@ -51,6 +51,13 @@ from topofuzz.metrics.verdict_flip import (
     DEFAULT_FLIP_THRESHOLD as DEFAULT_VERDICT_THRESHOLD,
 )
 
+# Shared 3-state class rule (2026-06-11): an explicit v7 ``verdict_class``
+# must outrank the score threshold HERE exactly as it does in the metrics
+# layer — otherwise ``topofuzz repro`` could emit a reproducer for a
+# "flip" whose conditional side the §14 headline metric excluded as a
+# non-clear pair, contradicting the published number.
+from topofuzz.metrics._verdict import verdict_of as _verdict_of
+
 # eval_id is interpolated into the default output filename. Constrain
 # to characters that are filesystem-safe on POSIX *and* Windows so a
 # hostile CSV ``id`` column cannot drive ``write_repro_script`` to
@@ -84,7 +91,10 @@ def find_flip_candidate(
       the manifest (insertion order of canonical_hashes).
 
     Cells with ``passed IS NULL AND score_value IS NULL`` (judge failures)
-    are skipped — they contribute neither side of the flip.
+    are skipped — they contribute neither side of the flip. Cells whose
+    v7 ``verdict_class`` is explicitly ``"conditional"`` are skipped for
+    the same reason: the §14 headline metric counts clear APPROVE↔DENY
+    pairs only, and the reproducer must agree with it.
 
     Raises:
         ReproError: no flip found, or ``eval_id`` doesn't exist in the run.
@@ -97,9 +107,23 @@ def find_flip_candidate(
     con = sqlite3.connect(str(run_dir / "run.sqlite"))
     try:
         try:
+            # v7 ``verdict_class`` probe — same conditional-read shape as
+            # :func:`topofuzz.metrics.score_matrix.read_score_matrix`, so
+            # a pre-v7 DB still loads (its rows fall back to the legacy
+            # passed/threshold rule below).
+            judge_cols = {
+                row[1]
+                for row in con.execute(
+                    "PRAGMA table_info(judge_results)"
+                ).fetchall()
+            }
+            has_verdict_class = "verdict_class" in judge_cols
+            select_cols = "variant_id, eval_id, score_value, passed"
+            if has_verdict_class:
+                select_cols += ", verdict_class"
             rows = list(
                 con.execute(
-                    "SELECT variant_id, eval_id, score_value, passed "
+                    f"SELECT {select_cols} "
                     "FROM judge_results "
                     "ORDER BY variant_id, eval_id"
                 )
@@ -116,11 +140,26 @@ def find_flip_candidate(
         con.close()
 
     by_eval: dict[str, list[tuple[int, bool]]] = defaultdict(list)
-    for vid, eid, score, passed in rows:
+    for row in rows:
+        vid, eid, score, passed = row[0], row[1], row[2], row[3]
+        vclass = row[4] if has_verdict_class else None
         idx = hash_to_idx.get(vid)
         if idx is None:
             continue
-        if passed is not None:
+        # 3-state rule, shared with the metrics layer via ``verdict_of``:
+        # an explicit ``verdict_class`` outranks both ``passed`` and the
+        # score threshold, and an explicitly CONDITIONAL cell contributes
+        # NEITHER side of a flip (the §14 metric counts clear
+        # APPROVE↔DENY pairs only — a reproducer for a pair the headline
+        # rate excluded would contradict the published number). Rows
+        # without an explicit class keep the legacy passed → threshold
+        # precedence byte-identically.
+        explicit = _verdict_of({"verdict_class": vclass}, threshold)
+        if explicit == "conditional":
+            continue
+        if explicit is not None:
+            verdict = explicit == "approve"
+        elif passed is not None:
             verdict = bool(passed)
         elif score is not None:
             verdict = bool(score >= threshold)
@@ -132,7 +171,8 @@ def find_flip_candidate(
         if eval_id not in by_eval:
             raise ReproError(
                 f"eval_id={eval_id!r} has no scored judge results in run "
-                f"{run_dir.name} (all rows may be judge-failures)"
+                f"{run_dir.name} (rows may be judge-failures or "
+                f"explicitly CONDITIONAL)"
             )
         candidates: list[str] = [eval_id]
     else:
@@ -203,9 +243,28 @@ def find_all_flip_candidates(
     con = sqlite3.connect(str(run_dir / "run.sqlite"))
     try:
         try:
+            # v7 ``verdict_class`` probe — identical shape to
+            # :func:`find_flip_candidate` above so every flip enumerator
+            # in this module applies the same 3-state rule. This one
+            # matters MOST: ``confirm`` (K-repeat spend), F4 ``ablate``
+            # (attribution triples), and ``attest`` (consistency card)
+            # all consume this enumerator, and before 2026-06-11 an
+            # explicitly CONDITIONAL cell (continuous score 0.5 →
+            # legacy-binarised APPROVE) could be screened, re-run, and
+            # attributed as a "flip" the §14 headline metric excluded.
+            judge_cols = {
+                row[1]
+                for row in con.execute(
+                    "PRAGMA table_info(judge_results)"
+                ).fetchall()
+            }
+            has_verdict_class = "verdict_class" in judge_cols
+            select_cols = "variant_id, eval_id, score_value, passed"
+            if has_verdict_class:
+                select_cols += ", verdict_class"
             rows = list(
                 con.execute(
-                    "SELECT variant_id, eval_id, score_value, passed "
+                    f"SELECT {select_cols} "
                     "FROM judge_results "
                     "ORDER BY eval_id, variant_id"
                 )
@@ -221,10 +280,18 @@ def find_all_flip_candidates(
     # Binarise once; only cells whose variant_id is a known manifest
     # hash count (a stray cell under an unknown hash is forensic noise).
     by_eval: dict[str, dict[str, bool]] = defaultdict(dict)
-    for vid, eid, score, passed in rows:
+    for row in rows:
+        vid, eid, score, passed = row[0], row[1], row[2], row[3]
+        vclass = row[4] if has_verdict_class else None
         if vid not in known_hashes:
             continue
-        if passed is not None:
+        # Same 3-state precedence as :func:`find_flip_candidate`.
+        explicit = _verdict_of({"verdict_class": vclass}, threshold)
+        if explicit == "conditional":
+            continue
+        if explicit is not None:
+            verdict = explicit == "approve"
+        elif passed is not None:
             verdict = bool(passed)
         elif score is not None:
             verdict = bool(score >= threshold)

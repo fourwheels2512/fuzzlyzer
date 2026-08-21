@@ -196,6 +196,19 @@ def read_flip_confirmations(
     con = sqlite3.connect(str(db_path))
     con.row_factory = sqlite3.Row
     try:
+        # v7 added a nullable ``verdict_class``. Select it only when the
+        # column exists so a legacy (pre-v7) run.sqlite still reads — the
+        # 3-state ``verdict_stability`` compare falls back to the score
+        # threshold when the key is absent.
+        _flip_cols = {
+            r[1]
+            for r in con.execute(
+                "PRAGMA table_info(flip_confirmations)"
+            ).fetchall()
+        }
+        _vclass_sel = (
+            ", verdict_class" if "verdict_class" in _flip_cols else ""
+        )
         clauses: list[str] = []
         params: list[Any] = []
         if run_id is not None:
@@ -209,7 +222,7 @@ def read_flip_confirmations(
             rows = con.execute(
                 "SELECT run_id, variant_id, eval_id, repeat_idx, role, "
                 "node_outputs_json, judge_kind, score_value, rationale, "
-                "failure_reason, error, cell_cost_usd "
+                "failure_reason, error, cell_cost_usd" + _vclass_sel + " "
                 "FROM flip_confirmations" + where + " "
                 "ORDER BY eval_id, variant_id, repeat_idx",
                 params,
@@ -421,6 +434,18 @@ def _reconstruct_variants(
         # label slip past the IR's hardening. Going through the
         # constructor fires every validator (label normalize + pair
         # collision check + structural integrity + tds_version derive).
+        # Preserve the side-channel ``prompt_builder`` across this
+        # validator-rerun reconstruction. ``load_topology`` attached it via
+        # ``object.__setattr__`` (it is NOT a Pydantic field), so the fresh
+        # ``Topology(...)`` below would drop it — and the order/role/decoding
+        # swaps a few lines down rebuild their variants off THIS object, so
+        # every confirm-pass variant would silently fall back to the bare
+        # ``_default_prompt`` with no domain rules. That is exactly the
+        # F4/F7 regression #4 guards against, reintroduced on the v0.6
+        # rebind branch. Capture before, re-attach after. (RT 2026-05-30.)
+        from topofuzz.loaders import _PROMPT_BUILDER_ATTR, get_prompt_builder
+
+        _preserved_builder = get_prompt_builder(topology)
         try:
             topology = Topology(
                 name=topology.name,
@@ -457,6 +482,10 @@ def _reconstruct_variants(
                 f"verdict_label_false={m_label_false!r}, "
                 f"run_id={manifest.get('run_id')!r}): {e}"
             ) from e
+        if _preserved_builder is not None:
+            object.__setattr__(
+                topology, _PROMPT_BUILDER_ATTR, _preserved_builder
+            )
 
     ord_list = list(order_swap(topology, rng_seed=rng_seed))
     role_list = list(role_swap(topology))
@@ -803,6 +832,21 @@ async def _confirm_async(
     rubric_hash = getattr(judge, "rubric_hash", "")
     judge_renderer = getattr(judge, "render_prompt", None)
 
+    # 2026-05-30 BUG FIX (RT): thread the fixture-exported ``prompt_builder``
+    # into the re-execution, exactly as the F4 ablation does
+    # (ablation.py:1067). Without this, ``run_variant`` defaults to the bare
+    # ``_default_prompt`` and the confirm pass silently re-runs a DIFFERENT,
+    # domain-rule-less pipeline than the kickoff — so its "reproducibility"
+    # measurement was of the wrong pipeline (no lending rules / no verdict
+    # instruction → the agent free-forms a hedged answer regardless of the
+    # variant). The reconstructed variants carry the builder (load_topology
+    # re-attaches it); resolve it per variant, falling back to the default
+    # only when a fixture exports none.
+    from topofuzz.loaders import get_prompt_builder
+    from topofuzz.runner import _default_prompt
+
+    original_builder = get_prompt_builder(original_variant) or _default_prompt
+
     total_cost = 0.0
     reference_repeats_run = 0
     candidate_repeats_run = 0
@@ -843,6 +887,7 @@ async def _confirm_async(
                     rubric_hash=rubric_hash,
                     judge_model_version=judge_model,
                     judge_prompt_renderer=judge_renderer,
+                    prompt_builder=original_builder,
                     model_served_version_resolver=resolver,
                     llm_callable=llm_callable,
                 )
@@ -863,6 +908,7 @@ async def _confirm_async(
                 variant = candidate_variants.get(vid)
                 if variant is None:
                     continue  # unmatched — warned by the caller
+                cand_builder = get_prompt_builder(variant) or _default_prompt
                 eval_row = eval_rows_by_id.get(eid)
                 if eval_row is None:
                     _log.warning(
@@ -885,6 +931,7 @@ async def _confirm_async(
                         rubric_hash=rubric_hash,
                         judge_model_version=judge_model,
                         judge_prompt_renderer=judge_renderer,
+                        prompt_builder=cand_builder,
                         model_served_version_resolver=resolver,
                         llm_callable=llm_callable,
                     )

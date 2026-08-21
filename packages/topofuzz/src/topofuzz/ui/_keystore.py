@@ -1,5 +1,7 @@
 # Copyright (c) 2026 Kiran Nayudu. All rights reserved.
 # Licensed under the Business Source License 1.1.
+# See LICENSE file in the project root for full terms.
+# <!-- PATENT_PENDING_NOTICE_GOES_HERE -->
 
 """Multi-vendor in-browser key storage for the topofuzz UI.
 
@@ -20,6 +22,7 @@ others are optional and only consumed by jury-of-3.
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 from typing import NamedTuple
 
@@ -183,10 +186,37 @@ def set_key(vendor: str, key: str, *, remember: bool) -> None:
     if remember:
         disk.parent.mkdir(parents=True, exist_ok=True)
         disk.write_text(key, encoding="utf-8")
-        try:
-            os.chmod(disk, 0o600)
-        except OSError:
-            pass
+        if os.name == "nt":
+            # POSIX chmod(0o600) below is a silent no-op on Windows —
+            # NTFS access is governed by ACLs, not the POSIX mode bits,
+            # so the "only the owner can read this" claim in SECURITY.md
+            # would otherwise not hold on the project's primary platform.
+            # Reset inheritance (drop whatever the parent dir grants) and
+            # grant Full Control to ONLY the current user via `icacls`.
+            # List-args (no shell=True) avoids shell-quoting hazards from
+            # the path; best-effort + swallowed, mirroring the POSIX
+            # chmod's own `except OSError: pass` — a locked-down
+            # environment where `icacls` itself is blocked must not
+            # crash key-saving.
+            try:
+                subprocess.run(
+                    [
+                        "icacls",
+                        str(disk),
+                        "/inheritance:r",
+                        "/grant:r",
+                        f"{os.environ.get('USERNAME', '%USERNAME%')}:F",
+                    ],
+                    capture_output=True,
+                    check=False,
+                )
+            except OSError:
+                pass
+        else:
+            try:
+                os.chmod(disk, 0o600)
+            except OSError:
+                pass
     else:
         try:
             disk.unlink()

@@ -2,6 +2,8 @@
 
 **Topology Safety Fuzzer for multi-agent LLM systems, plus the verify-path substrate that supports it.**
 
+Source: [github.com/fourwheels2512/fuzzlyzer](https://github.com/fourwheels2512/fuzzlyzer) (BSL 1.1, source-available).
+
 If you swap two agents in your LangGraph pipeline and the final decision flips, your topology is brittle. `topofuzz` finds those flips and prints the receipt. `fuzzeval` ships the shared infrastructure — DSSE attestation, judges (single + jury), statistics, caches, cost estimation — that `topofuzz` and other multi-agent eval tools build on.
 
 ## Packages in this monorepo

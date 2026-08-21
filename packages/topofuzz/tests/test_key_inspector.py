@@ -37,6 +37,20 @@ from topofuzz.key_inspector import (
 )
 
 
+def _combined_output(result) -> str:
+    """Stdout + stderr joined, regardless of Click version (mirrors
+    ``test_cli_audit._combined_output``). Click 8.2's ``CliRunner``
+    captures stderr separately; Click 8.1's default runner mixes it
+    into ``result.output`` and RAISES ``ValueError`` on ``.stderr``.
+    """
+    out = result.output or ""
+    try:
+        err = result.stderr or ""
+    except (AttributeError, ValueError):
+        err = ""  # Click 8.1: stderr already mixed into output.
+    return out + err
+
+
 @pytest.fixture(autouse=True)
 def _clear_vendor_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     """Click's CliRunner ``env=`` parameter MERGES into ``os.environ``
@@ -466,7 +480,7 @@ def test_cli_keys_rejects_reserved_flag() -> None:
     env = {"GEMINI_API_KEY": "AIzaSyTESTKEY01234567890"}
     result = runner.invoke(app, ["keys", "--kms"], env=env)
     assert result.exit_code == 2
-    combined = (result.stdout or "") + (result.stderr or "")
+    combined = _combined_output(result)
     assert "--kms" in combined
 
 
@@ -515,5 +529,5 @@ def test_cli_keys_is_license_gated(monkeypatch: pytest.MonkeyPatch) -> None:
     result = runner.invoke(app, ["keys"], env=env)
     # License gate fires (exit 2 with "license acceptance required").
     assert result.exit_code == 2
-    combined = (result.stdout or "") + (result.stderr or "")
+    combined = _combined_output(result)
     assert "license acceptance required" in combined

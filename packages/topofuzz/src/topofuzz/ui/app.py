@@ -43,6 +43,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from topofuzz import __version__
+from topofuzz.license_check import LICENSE_SUMMARY, is_accepted, record_acceptance
 from topofuzz.ui import _keystore
 from topofuzz.ui.cost import format_dollars, real_dollars
 from topofuzz.ui.presets import (
@@ -288,7 +289,12 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
         *,
         key_error: str | None = None,
         error_vendor: str | None = None,
-        remembered_value: bool = True,
+        # SECURITY (2026-07): memory-only is the default posture — the
+        # "remember this key" checkbox is opt-IN, not opt-out. A form
+        # POST that failed validation re-renders with the user's own
+        # submitted checkbox state (see key_post below); only the
+        # first-load GET / falls back to this default.
+        remembered_value: bool = False,
     ) -> dict[str, Any]:
         """Template context for the landing-page multi-vendor key card."""
         return {
@@ -301,9 +307,38 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
             "jury_ready": len(_keystore.vendors_present()) >= 3,
         }
 
+    def _license_context() -> dict[str, Any]:
+        """Template context for the one-time in-browser license gate.
+
+        ``license_accepted`` drives whether ``landing.html`` shows the
+        BSL notice + "I accept" control or the normal key-entry content
+        (see UX-1). ``license_summary`` is the same short BSL text the
+        CLI prints on first run.
+        """
+        return {
+            "license_accepted": is_accepted(),
+            "license_summary": LICENSE_SUMMARY,
+        }
+
     @app.get("/", response_class=HTMLResponse)
     async def landing(request: Request) -> HTMLResponse:
-        return templates.TemplateResponse(request, "landing.html", _key_context())
+        return templates.TemplateResponse(
+            request, "landing.html", {**_license_context(), **_key_context()}
+        )
+
+    @app.post("/accept-license", response_model=None)
+    async def accept_license_post(request: Request) -> RedirectResponse:
+        """Record the operator's one-time BSL acceptance and return home.
+
+        This is the ONLY way ``is_accepted()`` flips true from the UI —
+        no run can start before it (see the gates on ``/setup`` GET/POST
+        below). Writes to the same ``~/.topofuzz/license-accepted`` file
+        the CLI gate reads, so a browser acceptance also satisfies a
+        later bare ``topofuzz run`` from the same machine.
+        """
+        _csrf_guard(request)
+        record_acceptance()
+        return RedirectResponse(url="/", status_code=303)
 
     @app.post("/key/{vendor}", response_model=None)
     async def key_post(request: Request, vendor: str):  # noqa: ANN202
@@ -318,11 +353,14 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
             return templates.TemplateResponse(
                 request,
                 "landing.html",
-                _key_context(
-                    key_error=err,
-                    error_vendor=vendor,
-                    remembered_value=remember,
-                ),
+                {
+                    **_license_context(),
+                    **_key_context(
+                        key_error=err,
+                        error_vendor=vendor,
+                        remembered_value=remember,
+                    ),
+                },
                 status_code=400,
             )
         _keystore.set_key(vendor, raw, remember=remember)
@@ -342,6 +380,10 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
         workflow: str = DEFAULT_WORKFLOW,
         thoroughness: str = DEFAULT_THOROUGHNESS,
     ) -> HTMLResponse:
+        if not is_accepted():
+            # UX-1: no run can be configured, let alone launched, before
+            # the operator has clicked "I accept" on the landing page.
+            return RedirectResponse(url="/", status_code=303)
         if not _gemini_key_present():
             return RedirectResponse(url="/", status_code=303)
         all_workflows = _all_workflows_for_setup()
@@ -389,6 +431,11 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
     @app.post("/setup", response_model=None)
     async def setup_post(request: Request):  # noqa: ANN202 — union response
         _csrf_guard(request)
+        if not is_accepted():
+            # UX-1: this is THE run-starting action — never spawn the
+            # subprocess before acceptance is on record. Route back to
+            # the landing page's accept gate instead.
+            return RedirectResponse(url="/", status_code=303)
         form = await request.form()
         workflow_key = (form.get("workflow") or DEFAULT_WORKFLOW).strip()
         thoroughness_key = (form.get("thoroughness") or DEFAULT_THOROUGHNESS).strip()
