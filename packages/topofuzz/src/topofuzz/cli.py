@@ -784,7 +784,11 @@ def scan(ctx: typer.Context, fixture: str) -> None:
     # followed by the heuristic-only disclaimer and the next-step nudge.
     # Wrap is implicit on terminal; we do NOT pre-wrap because terminal
     # widths vary and `rich`/`textwrap` is overkill for ~3 lines.
-    typer.echo(f"{result.badge} RISK — {result.rationale}", err=True)
+    # The rationale already opens with "<BADGE> risk — …" (it is embedded
+    # verbatim in scan.json), so drop that lead-in here rather than
+    # printing the badge twice ("HIGH RISK — HIGH risk — …").
+    headline = result.rationale.removeprefix(f"{result.badge} risk — ")
+    typer.echo(f"{result.badge} RISK — {headline}", err=True)
     typer.echo(
         "Heuristic only — false positives and false negatives both exist. "
         f"Run `topofuzz run {fixture} --eval <file>` to measure actual "
@@ -837,7 +841,7 @@ def run(
         None,
         "--max-cost-usd",
         min=0.0,
-        help="Soft-warn at 80%%, hard-stop at 100%%. None = uncapped.",
+        help="Soft-warn at 80%, hard-stop at 100%. None = uncapped.",
     ),
     judge_model: str = typer.Option(
         _DEFAULT_JUDGE_MODEL,
@@ -1751,7 +1755,7 @@ def report(ctx: typer.Context, run_dir: str) -> None:
     * 0 — report written.
     * 2 — usage error (run_dir not a directory; manifest.json or
       run.sqlite missing; sqlite has zero / multiple runs;
-      matplotlib / numpy / jinja2 missing — install ``topofuzz[full]``).
+      matplotlib / numpy / jinja2 missing — install ``topofuzz\\[full]``).
     """
     _reject_reserved_flags(list(ctx.args))
     _reject_unknown_extras(list(ctx.args))
@@ -2156,9 +2160,9 @@ def publish(
     * 2 — usage error (run_dir is not a directory, or neither --pdf nor
       --ceo-card supplied).
 
-    Requires the ``[pdf]`` install extra::
+    Requires the ``pdf`` install extra::
 
-        pip install 'topofuzz[pdf]'
+        pip install 'topofuzz\\[pdf]'
         playwright install chromium
     """
     _reject_reserved_flags(list(ctx.args))
@@ -2269,7 +2273,7 @@ def confirm(
         "--max-cost-usd",
         min=0.0,
         help=(
-            "Soft-warn at 80%%, hard-stop at 100%%. None = uncapped. "
+            "Soft-warn at 80%, hard-stop at 100%. None = uncapped. "
             "Must be positive — a cap of 0 is a usage error (it would "
             "hard-stop before the first repeat)."
         ),
@@ -2411,7 +2415,7 @@ def ablate(
         "--max-cost-usd",
         min=0.0,
         help=(
-            "Soft-warn at 80%%, hard-stop at 100%%. None = uncapped. "
+            "Soft-warn at 80%, hard-stop at 100%. None = uncapped. "
             "A cap of 0 is rejected — it would trip before the first "
             "ablation point ran."
         ),
@@ -2709,7 +2713,7 @@ def audit(
         "--max-cost-usd",
         min=0.0,
         help=(
-            "Soft-warn at 80%%, hard-stop at 100%%. None = uncapped. "
+            "Soft-warn at 80%, hard-stop at 100%. None = uncapped. "
             "A cap of 0 is rejected — it would trip before the first "
             "counterfactual cell ran."
         ),

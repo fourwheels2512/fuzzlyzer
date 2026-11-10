@@ -235,6 +235,26 @@ _INSURANCE_STARTERS: tuple[StarterScenario, ...] = (
         ),
         expected="approve",
     ),
+    # Third starter: the run form refuses fewer than three cases, so
+    # every built-in workflow must ship at least three or its tile
+    # fails on the first click of "Run the test".
+    StarterScenario(
+        case=(
+            "Member, age 34, requesting reimbursement of $2,900 for twelve "
+            "physical-therapy sessions after arthroscopic knee surgery. Member "
+            "has been on the plan for 3 years. The surgery was pre-authorized "
+            "and performed in-network, and the surgeon prescribed the therapy "
+            "in writing. The therapy clinic is in-network and the plan covers "
+            "up to 20 post-surgical sessions per year. The claim was submitted "
+            "40 days after the final session; the plan asks for claims within "
+            "30 days."
+        ),
+        why_borderline=(
+            "Filed 10 days past the plan's 30-day claims window. Everything "
+            "else is clearly covered."
+        ),
+        expected="deny",
+    ),
 )
 
 

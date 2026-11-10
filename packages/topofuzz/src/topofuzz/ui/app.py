@@ -208,6 +208,9 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
         # Defensive — if `WORKFLOWS` ever changes, fall back to default.
         if workflow_key not in WORKFLOWS:
             workflow_key = DEFAULT_WORKFLOW
+        # Blank cards are dropped before a run (see _scenarios_from_form),
+        # so callers pass the count of FILLED cases; clamp for safety.
+        n_scenarios = max(0, n_scenarios)
         scale = max(1, n_scenarios) / 10.0
         real_cap = real_dollars(thoroughness.raw_cost_cap_usd) * scale
         return {
@@ -401,10 +404,12 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
             starters.append(
                 StarterScenario(case="", why_borderline="", expected="deny")
             )
+        # Count only the filled cards: the blank padding cards are
+        # dropped at submit, so pricing them would overstate the run.
         cost = _cost_preview(
             workflow_key=workflow_obj.key,
             thoroughness_key=thoroughness_obj.key,
-            n_scenarios=len(starters),
+            n_scenarios=sum(1 for s in starters if s.case.strip()),
         )
         active = registry.active_run()
         return templates.TemplateResponse(
@@ -471,7 +476,7 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
                 "cost": _cost_preview(
                     workflow_key=workflow_obj.key,
                     thoroughness_key=thoroughness_obj.key,
-                    n_scenarios=max(len(scenarios), 1),
+                    n_scenarios=len(scenarios),
                 ),
                 "form_error": form_error,
                 "active_run_id": active_run_id,
@@ -534,7 +539,7 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
             n_scenarios=n_scenarios,
         )
         return templates.TemplateResponse(
-            request, "fragments/cost_row.html", {"cost": cost}
+            request, "fragments/cost_row.html", {"cost": cost, "oob_note": True}
         )
 
     @app.get("/setup/example", response_class=HTMLResponse)

@@ -7,6 +7,12 @@
   <div>
     <p class="cost-label">Estimated time</p>
     <p class="cost-value">~{{ cost.minutes_typical }} min</p>
-    <p class="cost-finer">{{ cost.n_scenarios }} scenario(s) queued</p>
+    <p class="cost-finer">{{ cost.n_scenarios }} case{{ "" if cost.n_scenarios == 1 else "s" }} queued</p>
   </div>
 </div>
+{# The HTMX cost-preview response also refreshes the note beside the Run
+   button (out-of-band), so the two cost figures on the page never
+   disagree after the user changes thoroughness or edits the cases. #}
+{% if oob_note %}
+<span id="run-cost-note" class="muted" hx-swap-oob="true">{% include "fragments/cost_note.html" %}</span>
+{% endif %}

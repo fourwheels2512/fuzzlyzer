@@ -174,6 +174,11 @@
   (function () {
     var list = document.getElementById('agent-list');
     var verdictSel = document.getElementById('verdict_agent_id');
+    // True only once the user changes the verdict <select> by hand.
+    var userPicked = false;
+    if (verdictSel) {
+      verdictSel.addEventListener('change', function () { userPicked = true; });
+    }
 
     function renumber() {
       var rows = document.querySelectorAll('#agent-list .agent-row');
@@ -191,10 +196,15 @@
         var v = (inp.value || '').trim();
         if (v) ids.push(v);
       });
-      // Default selection: keep prior pick if still present, else last (the
-      // valid choice for a linear chain). The validator falls back to the
-      // last agent if the user submits blank, so an empty list is fine.
-      var nextSel = ids.indexOf(prev) >= 0 ? prev : (ids.length ? ids[ids.length - 1] : '');
+      // Default selection: the LAST agent (the valid choice for a linear
+      // chain), unless the user picked one themselves and it still
+      // exists. Without the userPicked check the select latched onto the
+      // first agent typed — it was the only option at that moment, so it
+      // counted as the "prior pick" forever — and a normally filled-in
+      // form was rejected on save. The validator falls back to the last
+      // agent if the user submits blank, so an empty list is fine.
+      var last = ids.length ? ids[ids.length - 1] : '';
+      var nextSel = (userPicked && ids.indexOf(prev) >= 0) ? prev : last;
       verdictSel.innerHTML = '';
       ids.forEach(function (id) {
         var opt = document.createElement('option');

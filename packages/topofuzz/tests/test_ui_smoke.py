@@ -93,6 +93,14 @@ class TestPresets:
     def test_default_thoroughness_exists(self) -> None:
         assert DEFAULT_THOROUGHNESS in THOROUGHNESS
 
+    def test_every_builtin_workflow_ships_enough_starters_to_run(self) -> None:
+        # POST /setup refuses fewer than three cases. A built-in tile
+        # with only two starters fails the first time someone picks it
+        # and clicks "Run the test" without typing anything.
+        for key, workflow in WORKFLOWS.items():
+            filled = [s for s in workflow.starters if s.case.strip()]
+            assert len(filled) >= 3, f"{key} ships only {len(filled)} starter case(s)"
+
     def test_balanced_uses_pro_judge(self) -> None:
         # The balanced preset is the sellable-demo configuration —
         # promoting it away from Pro silently would tank demo quality.
@@ -615,6 +623,28 @@ class TestRoutes:
         )
         assert r.status_code == 200
         assert "Estimated real cost" in r.text
+
+    def test_cost_preview_also_refreshes_run_button_note(
+        self, client: TestClient
+    ) -> None:
+        # The note beside "Run the test" repeats the cost; the fragment
+        # must update it out-of-band or the page shows two different
+        # prices after the user changes thoroughness.
+        r = client.get(
+            "/setup/cost-preview",
+            params={"workflow": "loan-approval", "thoroughness": "quick", "n_scenarios": 3},
+        )
+        assert 'id="run-cost-note"' in r.text
+        assert 'hx-swap-oob="true"' in r.text
+        assert "3 cases queued" in r.text
+
+    def test_setup_cost_counts_only_filled_cases(self, client: TestClient) -> None:
+        # The form pads to five cards, but blank cards are dropped at
+        # submit — the estimate must price the three starters, not five.
+        r = client.get("/setup")
+        assert r.status_code == 200
+        assert "3 cases queued" in r.text
+        assert "5 cases queued" not in r.text
 
     def test_add_scenario_card(self, client: TestClient) -> None:
         r = client.post("/setup/scenario")
@@ -1875,3 +1905,36 @@ class TestDegradedRunResultsBanners:
             "degraded report.json should NOT show 'Completed with "
             "warnings'."
         )
+
+
+# ---------------------------------------------------------------------------
+# Vendored htmx — the UI must load no third-party script
+# ---------------------------------------------------------------------------
+
+
+def test_ui_pages_load_htmx_from_local_static_only(client_no_key: TestClient) -> None:
+    """The UI is a local-only tool (SECURITY.md network-egress list): its
+    pages must not pull a script from a CDN, or the UI breaks offline and
+    the browser makes a third-party request on every page load."""
+    import re
+
+    html = client_no_key.get("/").text
+    srcs = re.findall(r'<script[^>]*\bsrc="([^"]+)"', html)
+    assert srcs == ["/static/htmx.min.js"]
+
+
+def test_vendored_htmx_matches_pinned_integrity_hash(client_no_key: TestClient) -> None:
+    """The served file must be the exact upstream htmx 1.9.12 build the
+    ``integrity`` attribute in base.html names — a silently edited or
+    swapped copy would otherwise be refused by the browser at demo time."""
+    import base64
+    import hashlib
+    import re
+
+    html = client_no_key.get("/").text
+    m = re.search(r'src="/static/htmx\.min\.js"\s+integrity="sha384-([^"]+)"', html)
+    assert m, "base.html must keep the integrity attribute on the htmx script"
+    r = client_no_key.get("/static/htmx.min.js")
+    assert r.status_code == 200
+    digest = base64.b64encode(hashlib.sha384(r.content).digest()).decode("ascii")
+    assert digest == m.group(1)

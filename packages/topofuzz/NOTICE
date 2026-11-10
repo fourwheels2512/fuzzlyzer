@@ -23,6 +23,11 @@ Acknowledgments
   The topofuzz/rekor.py client is a clean-room urllib implementation against
   the public schema; no code is copied from sigstore-python.
 
+- htmx 1.9.12 (Big Sky Software), Zero-Clause BSD license.
+  https://github.com/bigskysoftware/htmx
+  Shipped unmodified as src/topofuzz/ui/static/htmx.min.js and served by
+  `topofuzz ui` from localhost, so the web UI loads no third-party script.
+
 This project is independent of and not endorsed by the Linux Foundation,
 Sigstore, Anthropic, OpenAI, Google, or any other third party referenced in
 its source code or documentation.

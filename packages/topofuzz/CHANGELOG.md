@@ -85,6 +85,31 @@ clear from any installed wheel. The fixes themselves are committed on
   `-e packages/fuzzeval -e "packages/topofuzz[full,ui]"` (neither
   package is on PyPI yet, so plain pip cannot resolve `fuzzeval`), and
   the Quickstart's `cd topofuzz` is corrected to `cd fuzzlyzer`.
+- **Web UI: "Insurance claim triage" failed on the first click of Run.**
+  The preset shipped two starter cases but the run form requires three,
+  so the untouched tile returned a 400. A third starter is added and a
+  test pins every built-in workflow to at least three.
+- **Web UI: custom workflow form rejected a normally filled-in chain.**
+  The verdict-agent select latched onto the first agent typed (the only
+  option at that moment) instead of defaulting to the last, which the
+  linear-chain validator requires. It now defaults to the last agent
+  unless the user picks one by hand.
+- **Web UI: cost estimate overstated and out of sync.** The estimate
+  priced the two blank padding cards (5 cases instead of 3), and the
+  note beside "Run the test" kept the page-load figure after the
+  estimate box updated. Both now count filled cases only and refresh
+  together, including when cases are edited, added or removed.
+- **Web UI: htmx is vendored.** `base.html` loaded htmx 1.9.12 from
+  unpkg.com, so the UI's interactive parts failed offline or behind a
+  restrictive firewall and every page load made a third-party request.
+  The identical file (same SRI hash) now ships in `ui/static/`;
+  `unpkg.com` is removed from the SECURITY.md egress list.
+- **CLI output polish.** `scan` printed the badge twice
+  ("HIGH RISK — HIGH risk — …"); `--max-cost-usd` help showed a literal
+  `80%%`; `publish --help` and `report --help` lost the `[pdf]` /
+  `[full]` extras names to Rich markup; and `run --simulate` logged a
+  false "provider served a different model" warning per model because
+  the offline stub echoed the request as a served-model id.
 
 ### Added
 

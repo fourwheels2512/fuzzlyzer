@@ -167,7 +167,12 @@ async def _dry_run_llm_callable(**kwargs: Any) -> dict[str, Any]:
         "choices": [
             {"message": {"content": _DRY_RUN_STUB_RESPONSE_TEXT}}
         ],
-        "model": str(kwargs.get("model", "")),
+        # No provider served this call, so report no served-model id.
+        # Echoing the request ("google/gemini-2.5-flash") made the
+        # runner compare it to the resolver's bare prediction
+        # ("gemini-2.5-flash") and log a false "provider served a
+        # different model" warning on every offline run.
+        "model": "",
         "usage": {"prompt_tokens": 0, "completion_tokens": 0},
     }
 
