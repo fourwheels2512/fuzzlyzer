@@ -1528,3 +1528,51 @@ def test_inspect_falls_back_to_defaults_on_cyrillic_homoglyph_label(tmp_path):
     # The Cyrillic А byte must not leak into the HTML.
     assert "А" not in html
     assert ">DEFER<" not in html
+
+
+# ---------------------------------------------------------------------------
+# Flip labelling — say what the variant changed, not always "Reordered"
+# ---------------------------------------------------------------------------
+
+
+def _outs(roles):
+    return [{"node_id": f"n{i}", "role": r} for i, r in enumerate(roles)]
+
+
+def test_describe_variant_change_order_swap():
+    from topofuzz.inspect import _describe_variant_change
+
+    c = _describe_variant_change(
+        ["a", "b", "c"], ["b", "a", "c"], _outs(["ra", "rb", "rc"]), _outs(["rb", "ra", "rc"])
+    )
+    assert c["kind"] == "order"
+    assert c["label"] == "Reordered (flipping)"
+    assert "Two different orderings" in c["subhead"]
+
+
+def test_describe_variant_change_role_swap_marks_the_moved_slots():
+    """A role_swap keeps the node sequence, so the two chains used to
+    render identically under a "two different orderings" headline."""
+    from topofuzz.inspect import _describe_variant_change
+
+    c = _describe_variant_change(
+        ["a", "b", "c"], ["a", "b", "c"], _outs(["ra", "rb", "rc"]), _outs(["rb", "ra", "rc"])
+    )
+    assert c["kind"] == "roles"
+    assert [s["acting_as"] for s in c["steps"]] == ["rb", "ra", None]
+    assert "a and b traded roles" in c["note"]
+    assert "orderings" not in c["subhead"]
+
+
+def test_describe_variant_change_setting_only_is_not_called_a_reorder():
+    """decoding_param_swap changes neither order nor roles; calling its
+    flip "Reordered" misstates what the reader is looking at."""
+    from topofuzz.inspect import _describe_variant_change
+
+    c = _describe_variant_change(
+        ["a", "b"], ["a", "b"], _outs(["ra", "rb"]), _outs(["ra", "rb"])
+    )
+    assert c["kind"] == "setting"
+    assert "Reordered" not in c["label"]
+    assert "temperature" in c["note"]
+    assert all(s["acting_as"] is None for s in c["steps"])

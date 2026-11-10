@@ -96,10 +96,10 @@ class _ParsedProgress:
     current_variant: int = 0
     variants_total: int = 0
     raw_spend_usd: float = 0.0
-    # When set, the snapshot uses this directly and bypasses the
-    # raw→real cost divisor. Populated post-run from report.json's
-    # ``headline.total_cost_usd`` which is the authentic measured spend
-    # — already in real dollars, not topofuzz's exaggerated raw meter.
+    # When set, the snapshot uses this directly. Populated post-run from
+    # report.json's ``headline.total_cost_usd`` AFTER converting it with
+    # :func:`real_dollars` — that total is the sum of the runner's raw
+    # cost meter, so it carries the same ~2.75x inflation as the cap.
     real_spend_usd_override: float | None = None
     error_class: str = ""  # "" | "rate_limit" | "auth"
 
@@ -243,10 +243,10 @@ class Run:
         Returns a plain dict — JSON-serializable, no shared mutable state.
         """
         with self._lock:
-            # Prefer the post-run override (sourced from report.json's
-            # authentic measured spend — already in real dollars). Fall
-            # back to dividing the regex-parsed raw spend by the topofuzz
-            # cost-meter calibration ratio.
+            # Prefer the post-run override (report.json's measured
+            # total, already converted to real dollars at hydrate time).
+            # Fall back to dividing the regex-parsed raw spend by the
+            # topofuzz cost-meter calibration ratio.
             if self.parsed.real_spend_usd_override is not None:
                 real_spend = self.parsed.real_spend_usd_override
             else:
@@ -368,6 +368,12 @@ class RunRegistry:
         self._runs: dict[str, Run] = {}
         self._lock = threading.Lock()
         self._reader_threads: list[threading.Thread] = []
+        # Past runs live on disk; reload them so "Past tests" survives a
+        # restart of the UI process (the registry was memory-only, so a
+        # test run before a demo vanished from History once the app was
+        # closed and reopened).
+        for run in _load_persisted_runs(runs_root):
+            self._runs[run.run_id] = run
 
     @property
     def runs_root(self) -> Path:
@@ -476,6 +482,7 @@ class RunRegistry:
         )
         with self._lock:
             self._runs[run_id] = run
+        _persist_run(run)
 
         # Background thread drains stdout into the ring buffer and waits
         # for the subprocess. Daemon so the UI shutdown doesn't block.
@@ -699,6 +706,98 @@ def _drain_subprocess(run: Run) -> None:
         # the per-line stdout regex misses topofuzz's summary line format.
         # report.json's ``headline.total_cost_usd`` is authoritative.
         _hydrate_cost_from_report_json(run)
+        _persist_run(run)
+
+
+_RUN_SIDECAR_NAME = "ui_run.json"
+
+
+def _persist_run(run: Run) -> None:
+    """Write the run's UI-side record next to its output (best effort).
+
+    ``topofuzz run`` writes the results; this sidecar holds the few
+    fields only the UI knows (which tile, which thoroughness, status,
+    timing) so :func:`_load_persisted_runs` can rebuild History after a
+    restart. A write failure is logged to the run's own log and never
+    raised — losing the sidecar only costs the History entry.
+    """
+    with run._lock:
+        record = {
+            "schema": 1,
+            "run_id": run.run_id,
+            "workflow_key": run.workflow_key,
+            "thoroughness_key": run.thoroughness_key,
+            "fixture_path": str(run.fixture_path),
+            "eval_csv_path": str(run.eval_csv_path),
+            "rubric_path": str(run.rubric_path),
+            "raw_cost_cap_usd": run.raw_cost_cap_usd,
+            "started_at": run.started_at,
+            "finished_at": run.finished_at,
+            "status": run.status,
+            "exit_code": run.exit_code,
+            "failure_reason": run.failure_reason,
+        }
+    try:
+        target = run.out_dir / _RUN_SIDECAR_NAME
+        tmp = target.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(record, indent=2), encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError as e:
+        run.append_log(f"topofuzz-ui: could not save run record: {e}")
+
+
+def _load_persisted_runs(runs_root: Path) -> list[Run]:
+    """Rebuild finished runs from their ``ui_run.json`` sidecars.
+
+    Unreadable or malformed sidecars are skipped. A record still marked
+    ``running`` belongs to a UI process that is gone: it becomes
+    ``succeeded`` if a complete report is on disk, otherwise ``failed``
+    with an honest reason — never left as a phantom in-flight run that
+    would block new runs (one active run at a time).
+    """
+    runs: list[Run] = []
+    try:
+        candidates = sorted(runs_root.glob(f"*/{_RUN_SIDECAR_NAME}"))
+    except OSError:
+        return runs
+    for sidecar in candidates:
+        try:
+            rec = json.loads(sidecar.read_text(encoding="utf-8"))
+            run = Run(
+                run_id=str(rec["run_id"]),
+                workflow_key=str(rec["workflow_key"]),
+                thoroughness_key=str(rec["thoroughness_key"]),
+                out_dir=sidecar.parent,
+                fixture_path=Path(str(rec["fixture_path"])),
+                eval_csv_path=Path(str(rec["eval_csv_path"])),
+                rubric_path=Path(str(rec["rubric_path"])),
+                raw_cost_cap_usd=float(rec["raw_cost_cap_usd"]),
+                started_at=float(rec["started_at"]),
+                status=str(rec.get("status") or "failed"),
+                exit_code=rec.get("exit_code"),
+                failure_reason=str(rec.get("failure_reason") or ""),
+                finished_at=rec.get("finished_at"),
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        # The directory name is the id the routes look runs up by; refuse
+        # a sidecar that claims a different one.
+        if run.run_id != sidecar.parent.name:
+            continue
+        if run.status == "running":
+            if _has_completed_report(run):
+                run.status = "succeeded"
+            else:
+                run.status = "failed"
+                run.failure_reason = (
+                    "The app was closed before this test finished, so it "
+                    "has no result."
+                )
+            if run.finished_at is None:
+                run.finished_at = run.started_at
+        _hydrate_cost_from_report_json(run)
+        runs.append(run)
+    return runs
 
 
 def _hydrate_cost_from_report_json(run: Run) -> None:
@@ -710,12 +809,15 @@ def _hydrate_cost_from_report_json(run: Run) -> None:
     authoritative ``headline.total_cost_usd`` value so the results page
     shows the real spend instead of $0.00.
 
-    NOTE: ``total_cost_usd`` is the AUTHENTIC measured spend already in
-    real dollars (per :mod:`topofuzz.cost` accounting in the runner),
-    so we write it to the override field that :meth:`Run.snapshot`
-    surfaces without re-applying the raw→real divisor. Writing to
-    ``raw_spend_usd`` instead would double-divide and show ~36% of the
-    real cost on the results page.
+    NOTE: ``total_cost_usd`` is the sum of the runner's per-call cost
+    meter (``fuzzeval.costest`` blended static rates) — the SAME raw
+    units as ``--max-cost-usd``, which run ~2.75x hot for Gemini. It is
+    converted with :func:`real_dollars` here so the results and history
+    pages agree with the estimate on the setup page and the cap on the
+    live page, which are both shown in real dollars. Verified on a real
+    run (2026-11): 6 cells metered at $0.6257 priced out at $0.2274 from
+    their token counts at list rates — a ratio of exactly 2.75. Showing
+    the raw total made a "$0.24" estimate look like a "$0.63" bill.
     """
     summary = run.read_summary()
     if not summary:
@@ -726,7 +828,7 @@ def _hydrate_cost_from_report_json(run: Run) -> None:
     total = headline.get("total_cost_usd")
     if isinstance(total, (int, float)) and total >= 0:
         with run._lock:
-            run.parsed.real_spend_usd_override = float(total)
+            run.parsed.real_spend_usd_override = real_dollars(float(total))
 
 
 def _was_cancelled(exit_code: int) -> bool:

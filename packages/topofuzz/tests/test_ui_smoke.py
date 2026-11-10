@@ -896,6 +896,36 @@ class TestSnapshot:
         assert snap["real_spend_usd"] == pytest.approx(5.50 / 2.75, rel=1e-3)
         assert snap["real_cap_usd"] == pytest.approx(8.0 / 2.75, rel=1e-3)
 
+    def test_post_run_cost_from_report_json_is_also_divided(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """report.json's ``headline.total_cost_usd`` is the runner's raw
+        meter total — the same units as the cap. The results page must
+        convert it, or a "$0.24" estimate is followed by a "$0.63" bill
+        for a run that really cost about $0.23."""
+        import time as _time
+
+        from topofuzz.ui.runs import _hydrate_cost_from_report_json
+
+        run = Run(
+            run_id="t2",
+            workflow_key="loan-approval",
+            thoroughness_key="quick",
+            out_dir=tmp_path,
+            fixture_path=tmp_path / "f.py",
+            eval_csv_path=tmp_path / "e.csv",
+            rubric_path=tmp_path / "r.txt",
+            raw_cost_cap_usd=2.2,
+            started_at=_time.time(),
+        )
+        monkeypatch.setattr(
+            run, "read_summary", lambda: {"headline": {"total_cost_usd": 0.62571}}
+        )
+        _hydrate_cost_from_report_json(run)
+        snap = run.snapshot()
+        assert snap["real_spend_usd"] == pytest.approx(0.62571 / 2.75, rel=1e-3)
+        assert snap["real_spend_usd"] <= snap["real_cap_usd"]
+
 
 class TestErrorClassification:
     def test_auth_failure_detected_from_log_line(self, tmp_path: Path) -> None:
@@ -1938,3 +1968,72 @@ def test_vendored_htmx_matches_pinned_integrity_hash(client_no_key: TestClient) 
     assert r.status_code == 200
     digest = base64.b64encode(hashlib.sha384(r.content).digest()).decode("ascii")
     assert digest == m.group(1)
+
+
+# ---------------------------------------------------------------------------
+# History survives a restart of the UI process
+# ---------------------------------------------------------------------------
+
+
+def _persisted_run(runs_root: Path, run_id: str, *, status: str) -> Run:
+    import time as _time
+
+    from topofuzz.ui.runs import _persist_run
+
+    out_dir = runs_root / run_id
+    out_dir.mkdir(parents=True)
+    run = Run(
+        run_id=run_id,
+        workflow_key="loan-approval",
+        thoroughness_key="quick",
+        out_dir=out_dir,
+        fixture_path=out_dir / "f.py",
+        eval_csv_path=out_dir / "eval.csv",
+        rubric_path=out_dir / "r.txt",
+        raw_cost_cap_usd=2.2,
+        started_at=_time.time(),
+        status=status,
+    )
+    _persist_run(run)
+    return run
+
+
+def test_registry_reloads_finished_runs_from_disk(tmp_path: Path) -> None:
+    """The registry was memory-only: a test run before a demo vanished
+    from "Past tests" as soon as the app was closed and reopened."""
+    _persisted_run(tmp_path, "20260101T000000-aaaaaaaa", status="succeeded")
+    reg = RunRegistry(runs_root=tmp_path)
+    runs = reg.list_runs()
+    assert [r.run_id for r in runs] == ["20260101T000000-aaaaaaaa"]
+    assert runs[0].status == "succeeded"
+    assert runs[0].workflow_key == "loan-approval"
+    assert reg.get("20260101T000000-aaaaaaaa") is runs[0]
+
+
+def test_registry_does_not_resurrect_an_interrupted_run_as_running(
+    tmp_path: Path,
+) -> None:
+    """A record left at "running" belongs to a dead process. Reloading it
+    as running would block every new run (one active run at a time)."""
+    _persisted_run(tmp_path, "20260101T000000-bbbbbbbb", status="running")
+    reg = RunRegistry(runs_root=tmp_path)
+    assert reg.active_run() is None
+    run = reg.get("20260101T000000-bbbbbbbb")
+    assert run.status == "failed"
+    assert "closed before this test finished" in run.failure_reason
+
+
+def test_registry_skips_unreadable_or_mismatched_run_records(tmp_path: Path) -> None:
+    (tmp_path / "junk").mkdir()
+    (tmp_path / "junk" / "ui_run.json").write_text("{not json", encoding="utf-8")
+    _persisted_run(tmp_path, "20260101T000000-cccccccc", status="succeeded")
+    # A sidecar copied into a differently named directory is ignored.
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "ui_run.json").write_text(
+        (tmp_path / "20260101T000000-cccccccc" / "ui_run.json").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    reg = RunRegistry(runs_root=tmp_path)
+    assert [r.run_id for r in reg.list_runs()] == ["20260101T000000-cccccccc"]

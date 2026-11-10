@@ -3043,7 +3043,11 @@ def _build_ceo_card_context(
     """
     topology_name = str(manifest.get("topology_name") or "(unknown)")
     n_variants = manifest.get("n_variants")
+    # The orchestrator writes ``n_eval_rows``; fall back so the card does
+    # not render ``Evals: —`` on a real run.
     n_evals = manifest.get("n_evals")
+    if not isinstance(n_evals, int) or isinstance(n_evals, bool):
+        n_evals = manifest.get("n_eval_rows")
     cost_actual = manifest.get("cost_actual_usd")
 
     flip_rate, n_pairs, n_flips = _extract_flip_counts(verdict_flip_rate)
@@ -3089,7 +3093,11 @@ def _build_ceo_card_context(
             "Reply to this email — repro is free."
         )
 
-    headline_title, headline_lede = _format_headline(topology_name, flip_rate, n_flips)
+    cli_args = manifest.get("cli_args")
+    jury_of_3 = isinstance(cli_args, dict) and cli_args.get("jury_of_3") is True
+    headline_title, headline_lede = _format_headline(
+        topology_name, flip_rate, n_flips, jury_of_3=jury_of_3
+    )
 
     flip_card = _build_flip_card(run_dir, manifest, threshold)
 
@@ -3206,17 +3214,33 @@ def _extract_wilson_bounds(
 
 
 def _format_headline(
-    topology_name: str, flip_rate: float | None, n_flips: int | None
+    topology_name: str,
+    flip_rate: float | None,
+    n_flips: int | None,
+    *,
+    jury_of_3: bool = True,
 ) -> tuple[str, str]:
-    """Headline + lede tuned to the run shape."""
+    """Headline + lede tuned to the run shape.
+
+    ``jury_of_3`` must reflect how the source run was actually judged:
+    the card is a buyer-facing artifact, and a single-judge run must not
+    claim it was "measured under a jury-of-3".
+    """
     pretty_name = topology_name.replace("_", " ").replace("-", " ")
     if flip_rate is not None and n_flips and n_flips > 0:
         title = f"This {pretty_name} pipeline flips its verdict under re-ordering."
-        lede = (
-            "Same model, same prompts, same eval. Reorder the agents and "
-            "the answer changes — measured under a jury-of-3, not a "
-            "single judge."
-        )
+        if jury_of_3:
+            lede = (
+                "Same model, same prompts, same eval. Reorder the agents and "
+                "the answer changes — measured under a jury-of-3, not a "
+                "single judge."
+            )
+        else:
+            lede = (
+                "Same model, same prompts, same eval. Reorder the agents and "
+                "the answer changes — measured with a single AI judge; "
+                "re-run with a jury-of-3 to rule out judge noise."
+            )
     else:
         title = f"This {pretty_name} pipeline held its verdict."
         lede = (
@@ -3291,6 +3315,10 @@ def _build_flip_card(
             eval_prompt = row[0] if row and isinstance(row[0], str) else ""
         except sqlite3.DatabaseError:
             eval_prompt = ""
+        if not eval_prompt:
+            # run.sqlite has no ``evals`` table in current schemas — the
+            # case text lives in the eval file the run was launched with.
+            eval_prompt = _eval_input_from_eval_file(manifest, run_dir, eid)
         # All rows for this eval, then pick canonical + first variant
         # that flipped against it.
         rows = list(
@@ -3476,6 +3504,10 @@ def _build_flip_card(
         "variant_class": "deny" if canonical_verdict else "approve",
         "canonical_ordering": canonical_ordering,
         "variant_ordering": variant_ordering,
+        "variant_badge": _variant_badge(
+            canonical_row[0] if canonical_row else None,
+            variant_row[0] if variant_row else None,
+        ),
         "canonical_excerpt": _truncate(
             canonical_excerpt, _CEO_CARD_VERDICT_EXCERPT_LIMIT
         ),
@@ -3483,6 +3515,59 @@ def _build_flip_card(
             variant_excerpt, _CEO_CARD_VERDICT_EXCERPT_LIMIT
         ),
     }
+
+
+def _eval_input_from_eval_file(
+    manifest: dict[str, Any], run_dir: Path, eval_id: str
+) -> str:
+    """Best-effort: the ``input`` text of ``eval_id`` from the run's eval file.
+
+    Returns ``""`` when the file can't be located or parsed — the caller
+    then renders its "(eval prompt unavailable)" placeholder. Never
+    raises: the excerpt is decoration, not evidence.
+    """
+    cli_args = manifest.get("cli_args")
+    raw = cli_args.get("eval") if isinstance(cli_args, dict) else None
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    path = Path(raw)
+    candidates = [path] if path.is_absolute() else [
+        run_dir / path, run_dir.parent / path, Path.cwd() / path
+    ]
+    try:
+        from topofuzz.loaders import load_eval_rows
+
+        for cand in candidates:
+            if cand.is_file():
+                for row in load_eval_rows(cand):
+                    if str(row.get("id")) == str(eval_id):
+                        text = row.get("input")
+                        return text if isinstance(text, str) else ""
+                return ""
+    except Exception:  # noqa: BLE001 — decoration only; never fail the card
+        _log.debug("publish: could not read eval input for %s", eval_id)
+    return ""
+
+
+def _variant_badge(canonical_json: str | None, variant_json: str | None) -> str:
+    """Name what the flipping variant changed, for the flip-card badge.
+
+    Mirrors :func:`topofuzz.inspect._describe_variant_change`: only an
+    order_swap is a re-ordering; a role_swap keeps the slots and trades
+    two agents' roles; a decoding_param_swap changes neither.
+    """
+    try:
+        c = json.loads(canonical_json) if canonical_json else []
+        v = json.loads(variant_json) if variant_json else []
+        c_ids = [o.get("node_id") for o in c]
+        v_ids = [o.get("node_id") for o in v]
+        if c_ids != v_ids:
+            return "Re-ordered"
+        if [o.get("role") for o in c] != [o.get("role") for o in v]:
+            return "Agents swapped"
+        return "Same order, model setting changed"
+    except (ValueError, TypeError, AttributeError):
+        return "Re-ordered"
 
 
 def _excerpt_terminal_output(

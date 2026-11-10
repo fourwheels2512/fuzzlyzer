@@ -706,11 +706,14 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
         )
 
     @app.get("/runs/{run_id}/inspect")
-    async def run_inspect(run_id: str) -> Response:
+    async def run_inspect(run_id: str, eval: str | None = None) -> Response:
         """Render + serve the side-by-side flip inspector for one eval.
 
-        Picks the first flipping eval deterministically (lex-order),
-        writes ``inspect_<eid>.html`` into the run dir on demand, and
+        ``?eval=<id>`` picks a specific case. Otherwise the first case
+        whose flip came from agents trading places is preferred (the
+        clearest example for a first-time reader), falling back to the
+        first flipping eval in lex-order. Deterministic either way.
+        Writes ``inspect_<eid>.html`` into the run dir on demand, and
         serves it with the same strict CSP as ``/report``. When there
         are no flips to inspect we return a friendly 200 HTML "nothing
         to inspect" page rather than a 404 — a clean run is not an
@@ -728,10 +731,15 @@ def build_app(*, runs_root: Path | None = None) -> FastAPI:
         # Lazy import — inspect.py pulls jinja2/markupsafe (from the
         # ``[full]`` extra). Keeps the UI module importable in a verify-
         # only install.
-        from topofuzz.inspect import InspectError, write_inspect_html
+        from topofuzz.inspect import (
+            InspectError,
+            pick_showcase_eval,
+            write_inspect_html,
+        )
 
         try:
-            target = write_inspect_html(inner)
+            eval_id = eval if eval else pick_showcase_eval(inner)
+            target = write_inspect_html(inner, eval_id=eval_id)
         except InspectError:
             # Not a failure mode — the run had no verdict flips to show.
             return HTMLResponse(_NO_FLIPS_HTML, headers=_INSPECT_HEADERS)
@@ -1219,7 +1227,7 @@ def _build_headline(
                 "title": (
                     f"Out of {n_total} {_plural(workflow.domain_noun, n_total)}, "
                     f"your AI pipeline changed its mind on {confirmed_count} of them "
-                    f"when we shuffled the order of its steps."
+                    f"when we swapped its agents around or nudged a model setting."
                 ),
                 "subtitle": (
                     "This is the noise-checked count — apparent flips that "
@@ -1241,12 +1249,12 @@ def _build_headline(
                 "title": (
                     f"Out of {n_total} {_plural(workflow.domain_noun, n_total)}, "
                     f"your AI pipeline changed its mind on about {raw_count} of them "
-                    f"when we shuffled the order of its steps."
+                    f"when we swapped its agents around or nudged a model setting."
                 ),
                 "subtitle": (
                     "We haven't run the optional noise check — some flips could "
                     "be the AI second-guessing itself rather than real "
-                    "order-sensitivity." + caveat + raw_wilson_sentence
+                    "sensitivity to the change." + caveat + raw_wilson_sentence
                 ),
                 "flip_count": raw_count,
                 "n_total": n_total,

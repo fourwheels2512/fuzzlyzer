@@ -903,6 +903,131 @@ def _ablation_view(
     }
 
 
+def _describe_variant_change(
+    canonical_ordering: list[str],
+    flipping_ordering: list[str],
+    canonical_outputs: list[dict[str, Any]],
+    flipping_outputs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Say what the flipping variant actually changed versus the original.
+
+    The three §6 generators change different things, and only one of them
+    changes the agent order:
+
+    * ``order_swap`` — the node sequence itself differs.
+    * ``role_swap`` — same slots, but two agents trade roles (each now
+      does the other's job). On a strict linear chain this is the only
+      structural variant: the chain has a single valid ordering.
+    * ``decoding_param_swap`` — same order and roles; one agent's
+      sampling temperature is lifted from 0.0 to 0.3.
+
+    The inspector used to label every flipping variant "Reordered", so a
+    role-swap or temperature variant rendered two identical agent chains
+    under a "two different orderings" headline. The labels below state
+    which kind of change the reader is looking at; ``steps`` annotates
+    the slots whose role moved so a role swap is visible in the chain.
+    """
+    canonical_roles = [o.get("role") for o in canonical_outputs]
+    flipping_roles = [o.get("role") for o in flipping_outputs]
+    steps: list[dict[str, Any]] = [
+        {"node_id": nid, "acting_as": None} for nid in flipping_ordering
+    ]
+    if canonical_ordering != flipping_ordering:
+        return {
+            "kind": "order",
+            "label": "Reordered (flipping)",
+            "eyebrow": "Reordered \u00b7 verdict flipped",
+            "subhead": (
+                "Same agents. Same input. Two different orderings \u2014 and "
+                "two different verdicts."
+            ),
+            "note": None,
+            "steps": steps,
+        }
+    moved = [
+        i
+        for i, (a, b) in enumerate(zip(canonical_roles, flipping_roles))
+        if a != b and b is not None
+    ]
+    if moved and len(flipping_roles) == len(flipping_ordering):
+        for i in moved:
+            steps[i]["acting_as"] = flipping_roles[i]
+        names = [flipping_ordering[i] for i in moved]
+        who = " and ".join(names) if len(names) <= 2 else ", ".join(names)
+        return {
+            "kind": "roles",
+            "label": "Roles swapped (flipping)",
+            "eyebrow": "Agents swapped \u00b7 verdict flipped",
+            "subhead": (
+                "Same agents. Same input. Two of the agents traded places "
+                "\u2014 and the verdict changed."
+            ),
+            "note": (
+                f"{who} traded roles: each now does the other\u2019s job, "
+                "so the work reaches the final decision in a different "
+                "order."
+            ),
+            "steps": steps,
+        }
+    return {
+        "kind": "setting",
+        "label": "Same order, one setting changed (flipping)",
+        "eyebrow": "Same order \u00b7 model setting changed \u00b7 verdict flipped",
+        "subhead": (
+            "Same agents. Same input. Same order. One agent\u2019s model "
+            "setting was nudged \u2014 and the verdict changed."
+        ),
+        "note": (
+            "This variant keeps the agent order and roles. It raises one "
+            "agent\u2019s sampling temperature from 0.0 to 0.3, so the flip "
+            "shows sensitivity to small randomness, not to ordering."
+        ),
+        "steps": steps,
+    }
+
+
+def pick_showcase_eval(
+    run_dir: Path, *, threshold: float = DEFAULT_VERDICT_THRESHOLD
+) -> str | None:
+    """Return the first eval whose flip comes from a STRUCTURAL variant.
+
+    :func:`find_inspect_pair`'s default (lexically-first flipping eval)
+    is kept for the CLI's determinism contract, but the flip it lands on
+    may be a temperature-only variant. The web UI's "See an example that
+    changed" link uses this instead, so the example a first-time reader
+    opens shows agents trading places whenever the run has such a flip.
+
+    Scans eval ids in lexicographic order and returns the first one whose
+    selected pair is an order or role change. Returns ``None`` when the
+    run has no such flip (callers fall back to the default selection) or
+    the run cannot be read.
+    """
+    run_dir = Path(run_dir)
+    try:
+        manifest = _load_manifest(run_dir)
+        hashes = manifest["variant_canonical_hashes"]
+        orderings = manifest.get("variant_orderings", [])
+        eval_ids = sorted(str(e) for e in manifest.get("eval_ids", []))
+    except (InspectError, KeyError, TypeError):
+        return None
+    for eid in eval_ids:
+        try:
+            _, c_idx, f_idx = find_inspect_pair(
+                run_dir, eval_id=eid, threshold=threshold
+            )
+            change = _describe_variant_change(
+                list(orderings[c_idx]),
+                list(orderings[f_idx]),
+                _load_cell(run_dir, hashes[c_idx], eid)["node_outputs"],
+                _load_cell(run_dir, hashes[f_idx], eid)["node_outputs"],
+            )
+        except (InspectError, IndexError, KeyError, TypeError):
+            continue
+        if change["kind"] != "setting":
+            return eid
+    return None
+
+
 def build_inspect_html(
     run_dir: Path,
     *,
@@ -989,10 +1114,22 @@ def build_inspect_html(
         _agent_view(o, escape) for o in flipping_cell["node_outputs"]
     ]
 
+    change = _describe_variant_change(
+        canonical_ordering,
+        flipping_ordering,
+        canonical_cell["node_outputs"],
+        flipping_cell["node_outputs"],
+    )
+
     canonical_panel = {
         "label": "Original ordering",
         "short_hash": canonical_hash[:8],
         "ordering": canonical_ordering,
+        "eyebrow": "Original ordering \u00b7 baseline",
+        "note": None,
+        "steps": [
+            {"node_id": nid, "acting_as": None} for nid in canonical_ordering
+        ],
         "verdict": _verdict_label(
             canonical_cell["judge_passed"],
             canonical_cell["judge_score"],
@@ -1023,9 +1160,12 @@ def build_inspect_html(
         "error": canonical_cell["error"],
     }
     flipping_panel = {
-        "label": "Reordered (flipping)",
+        "label": change["label"],
         "short_hash": flipping_hash[:8],
         "ordering": flipping_ordering,
+        "eyebrow": change["eyebrow"],
+        "note": change["note"],
+        "steps": change["steps"],
         "verdict": _verdict_label(
             flipping_cell["judge_passed"],
             flipping_cell["judge_score"],
@@ -1111,6 +1251,7 @@ def build_inspect_html(
         threshold=threshold,
         canonical=canonical_panel,
         flipping=flipping_panel,
+        subhead=change["subhead"],
         ablation=ablation_panel,
         ablation_corrupt_msg=ablation_corrupt_msg,
     )

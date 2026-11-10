@@ -259,7 +259,7 @@
       <div class="verdict-text">{{ flip_card.canonical_excerpt }}</div>
     </div>
     <div class="flip-cell {{ flip_card.variant_class }}">
-      <div class="badge">Re-ordered &middot; {{ flip_card.variant_verdict }}</div>
+      <div class="badge">{{ flip_card.variant_badge | default("Re-ordered") }} &middot; {{ flip_card.variant_verdict }}</div>
       <div class="ordering">{{ flip_card.variant_ordering }}</div>
       <div class="verdict-text">{{ flip_card.variant_excerpt }}</div>
     </div>

@@ -110,6 +110,30 @@ clear from any installed wheel. The fixes themselves are committed on
   `[full]` extras names to Rich markup; and `run --simulate` logged a
   false "provider served a different model" warning per model because
   the offline stub echoed the request as a served-model id.
+- **Web UI: results and history showed the raw cost meter.** The setup
+  estimate and live cap are converted to real dollars (the meter runs
+  2.75x hot), but the post-run total from `report.json` was shown
+  unconverted, so a "$0.24" estimate was followed by a "$0.63" bill.
+  Verified on a real Gemini run: 6 cells metered at $0.6257 price out
+  at $0.2274 from their token counts. The total is now converted too.
+- **Web UI: History was lost when the app restarted.** Runs were held
+  in memory only. Each run now writes a small `ui_run.json` record and
+  the registry reloads finished runs at startup; a record left at
+  "running" by a closed app is shown as failed, not as an active run.
+- **Flip inspector called every variant "Reordered".** On a linear
+  chain there is one valid ordering, so the variants are role swaps and
+  temperature lifts; both rendered two identical agent chains under a
+  "two different orderings" headline. The inspector now says what the
+  variant changed (re-ordered / roles swapped, with the moved slots
+  marked / same order with one model setting changed). The web UI's
+  "See an example that changed" link prefers an agents-swapped flip and
+  accepts `?eval=<id>`; the CLI default selection is unchanged. The UI
+  results headline no longer attributes every flip to a re-ordering.
+- **CEO card misdescribed single-judge runs.** It stated "measured
+  under a jury-of-3, not a single judge" regardless of the run, printed
+  `Evals: —` (manifest key is `n_eval_rows`) and "(eval prompt
+  unavailable)" (run.sqlite has no `evals` table), and badged every
+  flip "Re-ordered". All four now reflect the source run.
 
 ### Added
 
