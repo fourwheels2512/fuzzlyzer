@@ -2396,6 +2396,86 @@ def confirm(
             "Cost cap tripped; results are PARTIAL — re-run "
             "`topofuzz confirm` to complete the remaining repeats."
         )
+    typer.echo(_reattest_after_confirm(run_dir_path))
+
+
+def _reattest_after_confirm(run_dir: Path) -> str:
+    """Re-sign the run after a confirm pass; return a one-line status.
+
+    ``topofuzz confirm`` appends its repeats to ``run.sqlite`` and writes
+    ``confirm.json``, but the signed bundle was emitted when the run
+    finished: its ``run_sqlite_sha256`` no longer matches (``topofuzz
+    verify`` FAILs) and its headline still has the noise-floor metrics
+    at null, so the confirm results reach neither ``report.json`` nor
+    the report. Re-emit the attestation from the same inputs the run
+    used — taken from the existing ``report.json`` headline — so the
+    noise-corrected metrics are computed and the bundle verifies again.
+
+    Never raises: an unsigned or unreadable run is reported, not fatal,
+    because the confirm repeats themselves are already safely on disk.
+    """
+    import json
+
+    try:
+        from fuzzeval.attestation import Ed25519Signer
+        from fuzzeval.keys import (
+            KeyNotFoundError,
+            default_dev_priv_path,
+            load_private_key,
+        )
+
+        from topofuzz.attest import emit_run_attestation
+    except ImportError as e:
+        return f"Run not re-signed (attestation imports unavailable: {e})."
+
+    try:
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+        headline = report["headline"]
+        run_id = str(manifest["run_id"])
+        kwargs = {
+            "status": str(headline["status"]),
+            "successful_cells": int(headline["n_successful_cells"]),
+            "total_cells": int(headline["n_total_cells"]),
+            "n_variants": int(headline["n_variants"]),
+            "n_evals": int(headline["n_evals"]),
+            "total_cost_usd": float(headline["total_cost_usd"]),
+            "elapsed_s": float(headline["elapsed_s"]),
+        }
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return (
+            "Run not re-signed: this run has no readable signed report to "
+            f"update ({type(e).__name__}: {e}). The confirm repeats are saved."
+        )
+
+    priv_path = default_dev_priv_path()
+    try:
+        signer = Ed25519Signer(load_private_key(priv_path))
+    except KeyNotFoundError:
+        return (
+            f"Run not re-signed: no signing key at {priv_path} (run "
+            "`topofuzz keygen`). `topofuzz verify` will FAIL on this run "
+            "until it is re-signed, because confirm changed run.sqlite."
+        )
+    except (ValueError, OSError) as e:
+        return f"Run not re-signed: signing key could not be loaded ({e})."
+
+    try:
+        emit_run_attestation(
+            run_dir=run_dir,
+            run_id=run_id,
+            manifest=manifest,
+            signer=signer,
+            judge_failure_rate=headline.get("judge_failure_rate"),
+            judge_independence=headline.get("judge_independence"),
+            **kwargs,
+        )
+    except (OSError, ValueError, TypeError) as e:
+        return f"Run not re-signed: attestation emit failed ({e})."
+    return (
+        "Re-signed the run with the noise-check results. Run "
+        f"`topofuzz report {run_dir}` to refresh report.html."
+    )
 
 
 @app.command(

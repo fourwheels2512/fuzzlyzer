@@ -2432,3 +2432,20 @@ def test_noise_floor_refuses_when_buckets_dont_sum(tmp_path, monkeypatch):
     )
     assert stability is None and confirmed is None and floor is None
     assert note is not None and "do not sum" in note
+
+
+# ---------------------------------------------------------------------------
+# confirm re-signs the run (CLI helper)
+# ---------------------------------------------------------------------------
+
+
+def test_reattest_after_confirm_reports_instead_of_raising(tmp_path):
+    """A run dir with no readable report must yield a status line, not a
+    traceback — the confirm repeats are already safely on disk."""
+    from topofuzz.cli import _reattest_after_confirm
+
+    msg = _reattest_after_confirm(tmp_path)
+    assert msg.startswith("Run not re-signed")
+    (tmp_path / "manifest.json").write_text('{"run_id": "r"}', encoding="utf-8")
+    (tmp_path / "report.json").write_text('{"headline": {}}', encoding="utf-8")
+    assert _reattest_after_confirm(tmp_path).startswith("Run not re-signed")

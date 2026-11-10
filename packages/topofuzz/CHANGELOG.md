@@ -134,6 +134,13 @@ clear from any installed wheel. The fixes themselves are committed on
   `Evals: —` (manifest key is `n_eval_rows`) and "(eval prompt
   unavailable)" (run.sqlite has no `evals` table), and badged every
   flip "Re-ordered". All four now reflect the source run.
+- **`topofuzz confirm` left the run unverifiable and its results
+  unused.** The pass appends repeats to `run.sqlite` and writes
+  `confirm.json`, but nothing re-emitted the attestation: `topofuzz
+  verify` then FAILed on `run_sqlite_sha256_match`, and the
+  noise-corrected headline metrics stayed null in `report.json`.
+  `confirm` now re-signs the run from the existing headline inputs when
+  it finishes (and says so, or says why it could not).
 
 ### Added
 
