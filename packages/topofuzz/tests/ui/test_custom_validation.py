@@ -19,7 +19,11 @@ from __future__ import annotations
 
 import pytest
 
-from topofuzz.ui.custom_validation import (
+# topofuzz.ui imports the FastAPI app eagerly; without the `ui` extra
+# skip the module instead of erroring at collection.
+pytest.importorskip("fastapi")
+
+from topofuzz.ui.custom_validation import (  # noqa: E402
     CustomFormError,
     validate_custom_workflow_form,
 )

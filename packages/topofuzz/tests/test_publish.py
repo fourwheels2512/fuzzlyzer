@@ -3194,6 +3194,9 @@ def test_stage_a_build_pdf_e2e_reads_ablation_json(tmp_path):
     and use it for the headline. Doesn't render Chromium (would require
     playwright); just confirms the context-build path picks it up by
     monkey-patching the renderer."""
+    # pypdf builds the stub PDF below and backs the page-count check;
+    # it ships in topofuzz[pdf], so skip (not error) without it.
+    pytest.importorskip("pypdf")
     import json as _json
     from unittest.mock import patch
     from topofuzz.publish import build_consistency_card_pdf

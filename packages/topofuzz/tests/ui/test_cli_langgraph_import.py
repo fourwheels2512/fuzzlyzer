@@ -21,9 +21,14 @@ import textwrap
 from pathlib import Path
 
 import pytest
-from typer.testing import CliRunner
 
-from topofuzz.cli import app
+# `topofuzz langgraph-import` loads topofuzz.ui, which imports the
+# FastAPI app eagerly; without the `ui` extra skip instead of failing.
+pytest.importorskip("fastapi")
+
+from typer.testing import CliRunner  # noqa: E402
+
+from topofuzz.cli import app  # noqa: E402
 
 
 # Rubric long enough to satisfy MIN_RUBRIC_LEN (50 chars).

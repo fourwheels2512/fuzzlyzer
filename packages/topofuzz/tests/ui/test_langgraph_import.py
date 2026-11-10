@@ -23,16 +23,21 @@ from pathlib import Path
 from typing import TypedDict
 
 import pytest
-from langgraph.graph import END, START, StateGraph
 
-from topofuzz.ir import LLMConfig
-from topofuzz.ui.custom_validation import CustomFormError
-from topofuzz.ui.langgraph_import import (
+# topofuzz.ui imports the FastAPI app eagerly; without the `ui` extra
+# skip the module instead of erroring at collection.
+pytest.importorskip("fastapi")
+
+from langgraph.graph import END, START, StateGraph  # noqa: E402
+
+from topofuzz.ir import LLMConfig  # noqa: E402
+from topofuzz.ui.custom_validation import CustomFormError  # noqa: E402
+from topofuzz.ui.langgraph_import import (  # noqa: E402
     LangGraphImportError,
     custom_workflow_from_langgraph,
     custom_workflow_from_module_spec,
 )
-from topofuzz.ui.presets import CustomWorkflow
+from topofuzz.ui.presets import CustomWorkflow  # noqa: E402
 
 
 # A reusable rubric of 50+ chars — the validator enforces MIN_RUBRIC_LEN.

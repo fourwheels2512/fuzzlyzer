@@ -70,8 +70,10 @@ jobs:
 
       - name: Sync workspace (dev + topofuzz[full] + fuzzeval[stats,cache])
         # `uv sync` reads root pyproject.toml `[dependency-groups].dev`,
-        # which already pulls langgraph. We additionally pull the heavy
-        # extras so the runner (step 5+) has its deps available in CI.
+        # which already pulls langgraph and the topofuzz[ui] web stack
+        # (fastapi / uvicorn / python-multipart) the UI tests import. We
+        # additionally pull the heavy extras so the runner (step 5+) has
+        # its deps available in CI.
         run: |
           uv sync --python ${{ matrix.python-version }} \
             --extra full --package topofuzz \

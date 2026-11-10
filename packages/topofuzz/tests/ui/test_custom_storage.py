@@ -21,7 +21,11 @@ from pathlib import Path
 
 import pytest
 
-from topofuzz.ui.custom_storage import (
+# topofuzz.ui imports the FastAPI app eagerly; without the `ui` extra
+# skip the module instead of erroring at collection.
+pytest.importorskip("fastapi")
+
+from topofuzz.ui.custom_storage import (  # noqa: E402
     custom_workflows_root,
     delete_custom_workflow,
     is_valid_workflow_id,
@@ -32,7 +36,7 @@ from topofuzz.ui.custom_storage import (
     serialize_meta,
     workflow_dir,
 )
-from topofuzz.ui.presets import CustomAgent, CustomWorkflow, StarterScenario
+from topofuzz.ui.presets import CustomAgent, CustomWorkflow, StarterScenario  # noqa: E402
 
 
 @pytest.fixture()

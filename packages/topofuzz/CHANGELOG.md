@@ -63,6 +63,28 @@ clear from any installed wheel. The fixes themselves are committed on
   `pip install topofuzz[full]` resolves. Surfaced by RT-specialist
   audit 2026-05-17. v1.0.1 patch release must rebuild + republish the
   wheel.
+- **Test suite no longer aborts at collection on the CI install.** Five
+  `tests/ui/` modules imported `topofuzz.ui` (which loads FastAPI
+  eagerly) with no guard, so a `topofuzz[full]`-only environment — the
+  exact one `ci.yml` syncs — hit 4 collection errors and ran zero
+  tests. The root dev dependency group now mirrors the `ui` extra plus
+  `pypdf`, so a bare `uv sync && uv run pytest` runs the UI suite, and
+  the modules `importorskip("fastapi")` / `importorskip("pypdf")` so
+  an install without those extras skips instead of erroring.
+- **Two host-dependent test assertions.**
+  `test_resolve_eval_path_absolute_no_duplicate_tries` counted the path
+  across the whole error message, which also echoes it via `eval=…!r`
+  — a double match on POSIX (Windows' doubled backslashes hid it); it
+  now counts only the `tried` list. The counterfactual-card legal-caveat
+  test collapses whitespace before matching, because where Chromium
+  wraps the paragraph depends on the fonts installed on the host.
+- **Install docs matched to the extras.** The root README Quick start
+  told users to `pip install topofuzz` and run `topofuzz ui`, which
+  exits with a missing-dependency error: the UI needs the `ui` extra
+  and runs need `full`. Both READMEs now install from a clone with
+  `-e packages/fuzzeval -e "packages/topofuzz[full,ui]"` (neither
+  package is on PyPI yet, so plain pip cannot resolve `fuzzeval`), and
+  the Quickstart's `cd topofuzz` is corrected to `cd fuzzlyzer`.
 
 ### Added
 

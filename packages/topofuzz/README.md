@@ -104,6 +104,10 @@ this package.
 # Full install: LangGraph adapter + LLM SDKs + plotting + signing (~400 MB).
 pip install "topofuzz[full]"
 
+# Full install plus the browser UI (`topofuzz ui` needs the `ui` extra:
+# FastAPI + uvicorn are kept out of `full` so CLI-only users skip them).
+pip install "topofuzz[full,ui]"
+
 # Verify-only install: cryptography + rfc8785 only — no LLM stack (~15 MB).
 pip install topofuzz
 ```
@@ -129,8 +133,10 @@ Clone the repo to run the Quickstart:
 
 ```bash
 git clone https://github.com/fourwheels2512/fuzzlyzer.git
-cd topofuzz
-pip install -e "packages/topofuzz[full]"
+cd fuzzlyzer
+# fuzzeval is installed from the clone too — it is not on PyPI yet, so
+# pip cannot resolve topofuzz's `fuzzeval` dependency on its own.
+pip install -e packages/fuzzeval -e "packages/topofuzz[full]"
 ```
 
 ### First run: license acceptance

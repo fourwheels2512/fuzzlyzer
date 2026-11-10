@@ -10,7 +10,7 @@ If you swap two agents in your LangGraph pipeline and the final decision flips, 
 
 | Package | What it is | Install |
 |---|---|---|
-| [`packages/topofuzz`](packages/topofuzz/) | The full fuzzer: orchestrator, variants, jury-of-3, ablation, report.html, CEO PDF, repro, inspect, BYOP, langgraph-import. | `pip install topofuzz` |
+| [`packages/topofuzz`](packages/topofuzz/) | The full fuzzer: orchestrator, variants, jury-of-3, ablation, report.html, CEO PDF, repro, inspect, BYOP, langgraph-import. | `pip install "topofuzz[full]"` (add `ui` for the browser UI; bare `topofuzz` is the ~15 MB verify-only install) |
 | [`packages/fuzzeval`](packages/fuzzeval/) | Verify-path substrate: judges, statistics, attestation, cache, cost estimation. No LangGraph or LLM-SDK dependency at import time. | `pip install fuzzeval` (or comes bundled with `topofuzz`) |
 
 See each package's own `README.md` for full feature lists, install instructions, and status.
@@ -47,11 +47,17 @@ PRIVACY.md            no-telemetry statement
 
 ## Quick start
 
+Neither package is on PyPI yet (pre-launch), so install from a clone:
+
 ```bash
-pip install topofuzz
+git clone https://github.com/fourwheels2512/fuzzlyzer.git
+cd fuzzlyzer
+pip install -e packages/fuzzeval -e "packages/topofuzz[full,ui]"
 export GEMINI_API_KEY=...
 python -m topofuzz ui              # browser UI on http://localhost:8765
 # or: topofuzz scan <fixture>      # CLI
 ```
+
+The `full` extra pulls the LangGraph adapter and LLM SDKs that `run` / `scan` / `report` need; the `ui` extra adds the web framework behind `topofuzz ui`. Once published, the same extras apply: `pip install "topofuzz[full,ui]"`.
 
 See [`packages/topofuzz/README.md`](packages/topofuzz/README.md) for the full CLI surface and fixture authoring guide.

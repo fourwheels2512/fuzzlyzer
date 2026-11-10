@@ -25,8 +25,12 @@ from pathlib import Path
 
 import pytest
 
-from topofuzz.ui.custom_templates import render_fixture_py, render_rubric_txt
-from topofuzz.ui.presets import (
+# topofuzz.ui imports the FastAPI app eagerly; without the `ui` extra
+# skip the module instead of erroring at collection.
+pytest.importorskip("fastapi")
+
+from topofuzz.ui.custom_templates import render_fixture_py, render_rubric_txt  # noqa: E402
+from topofuzz.ui.presets import (  # noqa: E402
     CustomAgent,
     CustomWorkflow,
     StarterScenario,

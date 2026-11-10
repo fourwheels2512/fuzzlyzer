@@ -2072,8 +2072,13 @@ def test_resolve_eval_path_absolute_no_duplicate_tries(tmp_path):
     missing_abs = (tmp_path / "nope.csv").resolve()
     with pytest.raises(ConfirmError) as ei:
         _resolve_eval_path({"eval": str(missing_abs)}, run_dir)
-    # The absolute path appears exactly once in "tried ...".
-    assert ei.value.args[0].count(str(missing_abs)) == 1
+    # The absolute path appears exactly once in "tried ...". Count only
+    # the tried-list: the message also echoes the manifest value via
+    # ``eval=...!r``, which matches a second time on POSIX (on Windows
+    # the repr doubles the backslashes, so it never matched there).
+    head, sep, tried = ei.value.args[0].partition("; tried ")
+    assert sep, ei.value.args[0]
+    assert tried.count(str(missing_abs)) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -29,6 +29,19 @@ dev = [
     # — test_import_guard.py pins that contract.
     "matplotlib>=3.8",
     "jinja2>=3.1",
+    # Required by the topofuzz.ui tests (tests/ui/ + test_ui_smoke.py).
+    # These live in topofuzz[ui] for end-users; the dev group mirrors
+    # them so a bare `uv sync && uv run pytest` runs the UI suite rather
+    # than skipping it. httpx backs `fastapi.testclient.TestClient`.
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "httpx>=0.27",
+    # Required by the topofuzz.publish PDF-assembly tests. Lives in
+    # topofuzz[pdf] for end-users; ~1 MB pure-Python, so mirrored here.
+    # Playwright + Chromium (the other half of [pdf]) stay opt-in: the
+    # end-to-end render tests skip cleanly when they are absent.
+    "pypdf>=4",
 ]
 
 [tool.pytest.ini_options]

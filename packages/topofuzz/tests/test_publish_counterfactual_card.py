@@ -512,7 +512,11 @@ def test_build_counterfactual_card_pdf_contains_legal_caveat_in_pdf_text(tmp_pat
     build_counterfactual_card_pdf(run_dir, out_path=out, target="Acme Bank")
     reader = pypdf.PdfReader(str(out))
     full_text = "\n".join(p.extract_text() or "" for p in reader.pages)
-    # The full phrase is the exact wording the spec demands.
+    # The full phrase is the exact wording the spec demands. Collapse
+    # whitespace first: where Chromium wraps the paragraph depends on
+    # the fonts installed on the host, and a line break inside the
+    # phrase ("follow-up\naudit") must not read as the caveat missing.
+    full_text = " ".join(full_text.split())
     assert "candidate disparate-impact signal worth a follow-up audit" in full_text, (
         "F7 legal-term-of-art caveat MISSING from rendered PDF text. "
         "Re-check counterfactual_card.html.j2."
