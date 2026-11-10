@@ -595,7 +595,9 @@ def test_dry_run_llm_callable_is_litellm_shaped_and_costless():
     text, served = _extract_text_and_served(resp)
     in_toks, out_toks = _extract_usage(resp)
     assert text == _DRY_RUN_STUB_RESPONSE_TEXT
-    assert served == "google/gemini-2.5-flash"
+    # Falsy served id: nothing was served, so callers fall back to the
+    # resolver's prediction instead of flagging a resolver mismatch.
+    assert not served
     assert in_toks == 0
     assert out_toks == 0
 

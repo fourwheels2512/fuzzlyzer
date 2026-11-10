@@ -76,10 +76,10 @@
       more money.
     </p>
     <div class="tile-group"
-         hx-trigger="change from:input[name=thoroughness]"
+         hx-trigger="change from:input[name=thoroughness], change from:#scenario-list, click from:#scenario-list delay:50ms, htmx:afterSettle from:#scenario-list"
          hx-get="/setup/cost-preview"
-         hx-include="[name=workflow],[name=thoroughness],input[name='scenario_case']"
-         hx-vals='js:{n_scenarios: document.querySelectorAll(".scenario-card").length}'
+         hx-include="[name=workflow],[name=thoroughness]"
+         hx-vals='js:{n_scenarios: Array.from(document.querySelectorAll("textarea[name=scenario_case]")).filter(function (t) { return t.value.trim(); }).length}'
          hx-target="#cost-row"
          hx-swap="outerHTML">
       {% for t in thoroughnesses %}
@@ -142,7 +142,7 @@
 
   <div class="btn-row" style="margin-top: 28px;">
     <button type="submit" class="btn large">Run the test</button>
-    <span class="muted">About {{ cost.minutes_typical }} minute(s) · about {{ cost.real_cap_fmt }} in Google AI charges</span>
+    <span id="run-cost-note" class="muted">{% include "fragments/cost_note.html" %}</span>
   </div>
 </form>
 

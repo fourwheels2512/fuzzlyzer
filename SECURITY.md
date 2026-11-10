@@ -42,7 +42,6 @@ Topofuzz makes outbound HTTPS requests **only** to the following endpoints, and 
 - `api.anthropic.com` (Anthropic) — vendor LLM API
 - `api.deepseek.com` (DeepSeek) — vendor LLM API
 - `rekor.sigstore.dev` (Sigstore Rekor transparency log) — **only when `--rekor` is explicitly passed**; never on the default path
-- `unpkg.com` (HTMX library CDN, `htmx.org@1.9.12`) — **only when `topofuzz ui` is invoked**; the request is issued by the user's browser when loading the served HTML page, not by the Python process. Vendoring HTMX locally ships in v0.6.
 - `aistudio.google.com` (Google AI Studio key-issuance page) — **only when `topofuzz ui` is invoked and the user clicks the "Get a Gemini key" link** rendered by the no-key page; this is a user-initiated browser navigation, not an automatic request.
 
 No telemetry, no analytics, no crash reporting, no auto-update checks. The Python process does **not** phone home on the default path.

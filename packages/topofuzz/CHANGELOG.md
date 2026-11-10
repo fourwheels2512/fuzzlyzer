@@ -63,6 +63,84 @@ clear from any installed wheel. The fixes themselves are committed on
   `pip install topofuzz[full]` resolves. Surfaced by RT-specialist
   audit 2026-05-17. v1.0.1 patch release must rebuild + republish the
   wheel.
+- **Test suite no longer aborts at collection on the CI install.** Five
+  `tests/ui/` modules imported `topofuzz.ui` (which loads FastAPI
+  eagerly) with no guard, so a `topofuzz[full]`-only environment — the
+  exact one `ci.yml` syncs — hit 4 collection errors and ran zero
+  tests. The root dev dependency group now mirrors the `ui` extra plus
+  `pypdf`, so a bare `uv sync && uv run pytest` runs the UI suite, and
+  the modules `importorskip("fastapi")` / `importorskip("pypdf")` so
+  an install without those extras skips instead of erroring.
+- **Two host-dependent test assertions.**
+  `test_resolve_eval_path_absolute_no_duplicate_tries` counted the path
+  across the whole error message, which also echoes it via `eval=…!r`
+  — a double match on POSIX (Windows' doubled backslashes hid it); it
+  now counts only the `tried` list. The counterfactual-card legal-caveat
+  test collapses whitespace before matching, because where Chromium
+  wraps the paragraph depends on the fonts installed on the host.
+- **Install docs matched to the extras.** The root README Quick start
+  told users to `pip install topofuzz` and run `topofuzz ui`, which
+  exits with a missing-dependency error: the UI needs the `ui` extra
+  and runs need `full`. Both READMEs now install from a clone with
+  `-e packages/fuzzeval -e "packages/topofuzz[full,ui]"` (neither
+  package is on PyPI yet, so plain pip cannot resolve `fuzzeval`), and
+  the Quickstart's `cd topofuzz` is corrected to `cd fuzzlyzer`.
+- **Web UI: "Insurance claim triage" failed on the first click of Run.**
+  The preset shipped two starter cases but the run form requires three,
+  so the untouched tile returned a 400. A third starter is added and a
+  test pins every built-in workflow to at least three.
+- **Web UI: custom workflow form rejected a normally filled-in chain.**
+  The verdict-agent select latched onto the first agent typed (the only
+  option at that moment) instead of defaulting to the last, which the
+  linear-chain validator requires. It now defaults to the last agent
+  unless the user picks one by hand.
+- **Web UI: cost estimate overstated and out of sync.** The estimate
+  priced the two blank padding cards (5 cases instead of 3), and the
+  note beside "Run the test" kept the page-load figure after the
+  estimate box updated. Both now count filled cases only and refresh
+  together, including when cases are edited, added or removed.
+- **Web UI: htmx is vendored.** `base.html` loaded htmx 1.9.12 from
+  unpkg.com, so the UI's interactive parts failed offline or behind a
+  restrictive firewall and every page load made a third-party request.
+  The identical file (same SRI hash) now ships in `ui/static/`;
+  `unpkg.com` is removed from the SECURITY.md egress list.
+- **CLI output polish.** `scan` printed the badge twice
+  ("HIGH RISK — HIGH risk — …"); `--max-cost-usd` help showed a literal
+  `80%%`; `publish --help` and `report --help` lost the `[pdf]` /
+  `[full]` extras names to Rich markup; and `run --simulate` logged a
+  false "provider served a different model" warning per model because
+  the offline stub echoed the request as a served-model id.
+- **Web UI: results and history showed the raw cost meter.** The setup
+  estimate and live cap are converted to real dollars (the meter runs
+  2.75x hot), but the post-run total from `report.json` was shown
+  unconverted, so a "$0.24" estimate was followed by a "$0.63" bill.
+  Verified on a real Gemini run: 6 cells metered at $0.6257 price out
+  at $0.2274 from their token counts. The total is now converted too.
+- **Web UI: History was lost when the app restarted.** Runs were held
+  in memory only. Each run now writes a small `ui_run.json` record and
+  the registry reloads finished runs at startup; a record left at
+  "running" by a closed app is shown as failed, not as an active run.
+- **Flip inspector called every variant "Reordered".** On a linear
+  chain there is one valid ordering, so the variants are role swaps and
+  temperature lifts; both rendered two identical agent chains under a
+  "two different orderings" headline. The inspector now says what the
+  variant changed (re-ordered / roles swapped, with the moved slots
+  marked / same order with one model setting changed). The web UI's
+  "See an example that changed" link prefers an agents-swapped flip and
+  accepts `?eval=<id>`; the CLI default selection is unchanged. The UI
+  results headline no longer attributes every flip to a re-ordering.
+- **CEO card misdescribed single-judge runs.** It stated "measured
+  under a jury-of-3, not a single judge" regardless of the run, printed
+  `Evals: —` (manifest key is `n_eval_rows`) and "(eval prompt
+  unavailable)" (run.sqlite has no `evals` table), and badged every
+  flip "Re-ordered". All four now reflect the source run.
+- **`topofuzz confirm` left the run unverifiable and its results
+  unused.** The pass appends repeats to `run.sqlite` and writes
+  `confirm.json`, but nothing re-emitted the attestation: `topofuzz
+  verify` then FAILed on `run_sqlite_sha256_match`, and the
+  noise-corrected headline metrics stayed null in `report.json`.
+  `confirm` now re-signs the run from the existing headline inputs when
+  it finishes (and says so, or says why it could not).
 
 ### Added
 

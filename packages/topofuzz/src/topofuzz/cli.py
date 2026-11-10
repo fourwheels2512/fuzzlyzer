@@ -784,7 +784,11 @@ def scan(ctx: typer.Context, fixture: str) -> None:
     # followed by the heuristic-only disclaimer and the next-step nudge.
     # Wrap is implicit on terminal; we do NOT pre-wrap because terminal
     # widths vary and `rich`/`textwrap` is overkill for ~3 lines.
-    typer.echo(f"{result.badge} RISK — {result.rationale}", err=True)
+    # The rationale already opens with "<BADGE> risk — …" (it is embedded
+    # verbatim in scan.json), so drop that lead-in here rather than
+    # printing the badge twice ("HIGH RISK — HIGH risk — …").
+    headline = result.rationale.removeprefix(f"{result.badge} risk — ")
+    typer.echo(f"{result.badge} RISK — {headline}", err=True)
     typer.echo(
         "Heuristic only — false positives and false negatives both exist. "
         f"Run `topofuzz run {fixture} --eval <file>` to measure actual "
@@ -837,7 +841,7 @@ def run(
         None,
         "--max-cost-usd",
         min=0.0,
-        help="Soft-warn at 80%%, hard-stop at 100%%. None = uncapped.",
+        help="Soft-warn at 80%, hard-stop at 100%. None = uncapped.",
     ),
     judge_model: str = typer.Option(
         _DEFAULT_JUDGE_MODEL,
@@ -1751,7 +1755,7 @@ def report(ctx: typer.Context, run_dir: str) -> None:
     * 0 — report written.
     * 2 — usage error (run_dir not a directory; manifest.json or
       run.sqlite missing; sqlite has zero / multiple runs;
-      matplotlib / numpy / jinja2 missing — install ``topofuzz[full]``).
+      matplotlib / numpy / jinja2 missing — install ``topofuzz\\[full]``).
     """
     _reject_reserved_flags(list(ctx.args))
     _reject_unknown_extras(list(ctx.args))
@@ -2156,9 +2160,9 @@ def publish(
     * 2 — usage error (run_dir is not a directory, or neither --pdf nor
       --ceo-card supplied).
 
-    Requires the ``[pdf]`` install extra::
+    Requires the ``pdf`` install extra::
 
-        pip install 'topofuzz[pdf]'
+        pip install 'topofuzz\\[pdf]'
         playwright install chromium
     """
     _reject_reserved_flags(list(ctx.args))
@@ -2269,7 +2273,7 @@ def confirm(
         "--max-cost-usd",
         min=0.0,
         help=(
-            "Soft-warn at 80%%, hard-stop at 100%%. None = uncapped. "
+            "Soft-warn at 80%, hard-stop at 100%. None = uncapped. "
             "Must be positive — a cap of 0 is a usage error (it would "
             "hard-stop before the first repeat)."
         ),
@@ -2392,6 +2396,86 @@ def confirm(
             "Cost cap tripped; results are PARTIAL — re-run "
             "`topofuzz confirm` to complete the remaining repeats."
         )
+    typer.echo(_reattest_after_confirm(run_dir_path))
+
+
+def _reattest_after_confirm(run_dir: Path) -> str:
+    """Re-sign the run after a confirm pass; return a one-line status.
+
+    ``topofuzz confirm`` appends its repeats to ``run.sqlite`` and writes
+    ``confirm.json``, but the signed bundle was emitted when the run
+    finished: its ``run_sqlite_sha256`` no longer matches (``topofuzz
+    verify`` FAILs) and its headline still has the noise-floor metrics
+    at null, so the confirm results reach neither ``report.json`` nor
+    the report. Re-emit the attestation from the same inputs the run
+    used — taken from the existing ``report.json`` headline — so the
+    noise-corrected metrics are computed and the bundle verifies again.
+
+    Never raises: an unsigned or unreadable run is reported, not fatal,
+    because the confirm repeats themselves are already safely on disk.
+    """
+    import json
+
+    try:
+        from fuzzeval.attestation import Ed25519Signer
+        from fuzzeval.keys import (
+            KeyNotFoundError,
+            default_dev_priv_path,
+            load_private_key,
+        )
+
+        from topofuzz.attest import emit_run_attestation
+    except ImportError as e:
+        return f"Run not re-signed (attestation imports unavailable: {e})."
+
+    try:
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+        headline = report["headline"]
+        run_id = str(manifest["run_id"])
+        kwargs = {
+            "status": str(headline["status"]),
+            "successful_cells": int(headline["n_successful_cells"]),
+            "total_cells": int(headline["n_total_cells"]),
+            "n_variants": int(headline["n_variants"]),
+            "n_evals": int(headline["n_evals"]),
+            "total_cost_usd": float(headline["total_cost_usd"]),
+            "elapsed_s": float(headline["elapsed_s"]),
+        }
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return (
+            "Run not re-signed: this run has no readable signed report to "
+            f"update ({type(e).__name__}: {e}). The confirm repeats are saved."
+        )
+
+    priv_path = default_dev_priv_path()
+    try:
+        signer = Ed25519Signer(load_private_key(priv_path))
+    except KeyNotFoundError:
+        return (
+            f"Run not re-signed: no signing key at {priv_path} (run "
+            "`topofuzz keygen`). `topofuzz verify` will FAIL on this run "
+            "until it is re-signed, because confirm changed run.sqlite."
+        )
+    except (ValueError, OSError) as e:
+        return f"Run not re-signed: signing key could not be loaded ({e})."
+
+    try:
+        emit_run_attestation(
+            run_dir=run_dir,
+            run_id=run_id,
+            manifest=manifest,
+            signer=signer,
+            judge_failure_rate=headline.get("judge_failure_rate"),
+            judge_independence=headline.get("judge_independence"),
+            **kwargs,
+        )
+    except (OSError, ValueError, TypeError) as e:
+        return f"Run not re-signed: attestation emit failed ({e})."
+    return (
+        "Re-signed the run with the noise-check results. Run "
+        f"`topofuzz report {run_dir}` to refresh report.html."
+    )
 
 
 @app.command(
@@ -2411,7 +2495,7 @@ def ablate(
         "--max-cost-usd",
         min=0.0,
         help=(
-            "Soft-warn at 80%%, hard-stop at 100%%. None = uncapped. "
+            "Soft-warn at 80%, hard-stop at 100%. None = uncapped. "
             "A cap of 0 is rejected — it would trip before the first "
             "ablation point ran."
         ),
@@ -2709,7 +2793,7 @@ def audit(
         "--max-cost-usd",
         min=0.0,
         help=(
-            "Soft-warn at 80%%, hard-stop at 100%%. None = uncapped. "
+            "Soft-warn at 80%, hard-stop at 100%. None = uncapped. "
             "A cap of 0 is rejected — it would trip before the first "
             "counterfactual cell ran."
         ),

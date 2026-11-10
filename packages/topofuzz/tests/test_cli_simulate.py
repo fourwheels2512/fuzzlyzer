@@ -54,7 +54,10 @@ def test_offline_stub_llm_callable_is_litellm_shaped() -> None:
         )
     )
     assert resp["choices"][0]["message"]["content"] == _DRY_RUN_STUB_RESPONSE_TEXT
-    assert resp["model"] == "google/gemini-2.5-flash"
+    # No provider served the call, so the stub reports no served-model
+    # id; the runner then falls back to the resolver's prediction rather
+    # than logging a false "provider served a different model" warning.
+    assert resp["model"] == ""
     assert resp["usage"] == {"prompt_tokens": 0, "completion_tokens": 0}
 
 

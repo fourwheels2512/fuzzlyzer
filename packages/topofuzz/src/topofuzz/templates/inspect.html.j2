@@ -508,14 +508,15 @@
   @media (max-width: 1000px) {
     .grid { grid-template-columns: 1fr; }
   }
+  .acting-as { font-style: normal; opacity: 0.75; }
+  .change-note { margin: 10px 0 0; font-size: 13px; line-height: 1.45; }
 </style>
 </head>
 <body>
 <div class="container">
   <h1>Where did the AIs diverge?</h1>
   <p class="subhead">
-    Same agents. Same input. Two different orderings &mdash; and two
-    different verdicts. Read the responses agent-by-agent to see exactly
+    {{ subhead }} Read the responses agent-by-agent to see exactly
     which step changed its mind.
   </p>
   <div class="meta">
@@ -529,18 +530,19 @@
     <section class="panel {{ 'canonical' if loop.first else 'flipping' }}">
       <header>
         <div class="panel-eyebrow">
-          {% if loop.first %}Original ordering &middot; baseline{% else %}Reordered &middot; verdict flipped{% endif %}
+          {{ side.eyebrow }}
         </div>
         <h2>{{ side.label }}
           <span class="verdict {{ side.verdict_class }}">{{ side.verdict }}</span>
         </h2>
         <div class="panel-hash">Variant <code>{{ side.short_hash }}</code></div>
         <div class="ordering">
-          {% for node_id in side.ordering -%}
-            <span class="step">{{ node_id }}</span>
+          {% for step in side.steps -%}
+            <span class="step">{{ step.node_id }}{% if step.acting_as %} <em class="acting-as">as {{ step.acting_as }}</em>{% endif %}</span>
             {%- if not loop.last %}<span class="arrow">&rarr;</span>{% endif -%}
           {%- endfor %}
         </div>
+        {% if side.note %}<p class="change-note">{{ side.note }}</p>{% endif %}
       </header>
       <div class="panel-body">
         {% if side.error %}

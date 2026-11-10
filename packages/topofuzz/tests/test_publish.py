@@ -3194,6 +3194,9 @@ def test_stage_a_build_pdf_e2e_reads_ablation_json(tmp_path):
     and use it for the headline. Doesn't render Chromium (would require
     playwright); just confirms the context-build path picks it up by
     monkey-patching the renderer."""
+    # pypdf builds the stub PDF below and backs the page-count check;
+    # it ships in topofuzz[pdf], so skip (not error) without it.
+    pytest.importorskip("pypdf")
     import json as _json
     from unittest.mock import patch
     from topofuzz.publish import build_consistency_card_pdf
@@ -3512,3 +3515,56 @@ def test_stage_a_pass2_extract_skips_zero_denominator_rows():
     })
     names = [r["name"] for r in rows]
     assert names == ["good"]
+
+
+# ---------------------------------------------------------------------------
+# CEO card must describe the run it was built from
+# ---------------------------------------------------------------------------
+
+
+def test_format_headline_single_judge_does_not_claim_a_jury():
+    """A single-judge run rendered "measured under a jury-of-3, not a
+    single judge" on a buyer-facing card — a false statement."""
+    from topofuzz.publish import _format_headline
+
+    _, lede = _format_headline("lending-4role", 0.38, 3, jury_of_3=False)
+    assert "single AI judge" in lede
+    assert "under a jury-of-3" not in lede
+    _, lede_jury = _format_headline("lending-4role", 0.38, 3, jury_of_3=True)
+    assert "under a jury-of-3" in lede_jury
+
+
+def test_variant_badge_names_what_changed():
+    import json as _json
+
+    from topofuzz.publish import _variant_badge
+
+    base = [{"node_id": "a", "role": "ra"}, {"node_id": "b", "role": "rb"}]
+    reordered = [base[1], base[0]]
+    swapped = [{"node_id": "a", "role": "rb"}, {"node_id": "b", "role": "ra"}]
+    d = _json.dumps
+    assert _variant_badge(d(base), d(reordered)) == "Re-ordered"
+    assert _variant_badge(d(base), d(swapped)) == "Agents swapped"
+    assert _variant_badge(d(base), d(base)) == "Same order, model setting changed"
+    # Unreadable input keeps the legacy label rather than raising.
+    assert _variant_badge("not json", d(base)) == "Re-ordered"
+
+
+def test_eval_input_from_eval_file_reads_case_text(tmp_path):
+    """run.sqlite has no ``evals`` table, so the card printed
+    "(eval prompt unavailable)" on every real run."""
+    from topofuzz.publish import _eval_input_from_eval_file
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    csv_path = tmp_path / "eval.csv"
+    csv_path.write_text(
+        "id,input,ground_truth_decision\nscn_001,Applicant asks for a loan.,deny\n",
+        encoding="utf-8",
+    )
+    manifest = {"cli_args": {"eval": str(csv_path)}}
+    assert _eval_input_from_eval_file(manifest, run_dir, "scn_001") == (
+        "Applicant asks for a loan."
+    )
+    assert _eval_input_from_eval_file(manifest, run_dir, "nope") == ""
+    assert _eval_input_from_eval_file({}, run_dir, "scn_001") == ""

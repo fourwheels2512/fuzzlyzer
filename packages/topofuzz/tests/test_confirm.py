@@ -2072,8 +2072,13 @@ def test_resolve_eval_path_absolute_no_duplicate_tries(tmp_path):
     missing_abs = (tmp_path / "nope.csv").resolve()
     with pytest.raises(ConfirmError) as ei:
         _resolve_eval_path({"eval": str(missing_abs)}, run_dir)
-    # The absolute path appears exactly once in "tried ...".
-    assert ei.value.args[0].count(str(missing_abs)) == 1
+    # The absolute path appears exactly once in "tried ...". Count only
+    # the tried-list: the message also echoes the manifest value via
+    # ``eval=...!r``, which matches a second time on POSIX (on Windows
+    # the repr doubles the backslashes, so it never matched there).
+    head, sep, tried = ei.value.args[0].partition("; tried ")
+    assert sep, ei.value.args[0]
+    assert tried.count(str(missing_abs)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2427,3 +2432,20 @@ def test_noise_floor_refuses_when_buckets_dont_sum(tmp_path, monkeypatch):
     )
     assert stability is None and confirmed is None and floor is None
     assert note is not None and "do not sum" in note
+
+
+# ---------------------------------------------------------------------------
+# confirm re-signs the run (CLI helper)
+# ---------------------------------------------------------------------------
+
+
+def test_reattest_after_confirm_reports_instead_of_raising(tmp_path):
+    """A run dir with no readable report must yield a status line, not a
+    traceback — the confirm repeats are already safely on disk."""
+    from topofuzz.cli import _reattest_after_confirm
+
+    msg = _reattest_after_confirm(tmp_path)
+    assert msg.startswith("Run not re-signed")
+    (tmp_path / "manifest.json").write_text('{"run_id": "r"}', encoding="utf-8")
+    (tmp_path / "report.json").write_text('{"headline": {}}', encoding="utf-8")
+    assert _reattest_after_confirm(tmp_path).startswith("Run not re-signed")
